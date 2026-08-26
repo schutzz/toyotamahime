@@ -10,7 +10,7 @@ Reproduction kit. Everything needed to re-run the experiment and compare against
 
 ## 1. Before anything else — the two rules that make this kit meaningful
 
-**The apparatus is frozen, and you must not fix it.** Two known defects will show up. Neither is a reproduction failure and neither is to be repaired:
+**The apparatus is frozen, and you must not fix it.** Two known defects are shipped unfixed. How they behave in your reproduction is **observed, not assumed** — see §6.3. Neither is to be repaired:
 
 - `scripts/study01_score.py` writes its record with a Windows-native newline call, so a scoring record is content-identical but not byte-identical to a fresh-clone rescoring. See [`claims/limitations.md`](./claims/limitations.md) §3.
 - The Range B rule-stage query does not record which index it searched. That is why the study's headline hypothesis is *Inconclusive*, and it is reproduced as-is. See [`claims/h-j1-judgment.md`](./claims/h-j1-judgment.md).
@@ -166,7 +166,7 @@ So, in this order:
 
 Timestamps, T0 and the derived window, container and network identifiers, interface ordinals, Elasticsearch document ids, capture frame counts and frame numbers, pcap digests, and the exact nanosecond correlation deltas — provided each stays inside the frozen ±1,000,000 ns bound. **This is not a byte-for-byte replay and is not evaluated as one.**
 
-The CRLF defect from §1 is expected to show up as a scoring record that is content-identical but not byte-identical to a fresh-clone rescoring. That is not a failure.
+**The CRLF defect from §1 is not assumed to recur.** If it does — your scoring record is content-identical but not byte-identical to a fresh-clone rescoring — retain that as evidence that the behaviour reproduces outside the original execution host. Its presence is **not** a reproduction failure. If it does not recur, retain that as an unenumerated difference and evaluate it under the outcome rules in §7. Do not repair either result, and do not explain either away.
 
 ## 7. When something does not match
 

@@ -15,7 +15,7 @@ Each study lives in its own directory and is self-contained: apparatus, protocol
 
 **If you want to know what Study 01 concluded** without running it → [`Study01/claims/claim-wording.md`](./Study01/claims/claim-wording.md). It states nine claims: six things the study establishes and three it explicitly does not. The negative ones are part of the claim, not disclaimers appended to it.
 
-**If you want the evidence behind a specific conclusion** → the four hypothesis judgments in [`Study01/claims/`](./Study01/claims/), each naming the artifacts it reads.
+**If you want the judgment and artifact references behind a specific conclusion** → the four hypothesis judgments in [`Study01/claims/`](./Study01/claims/), each naming the artifacts it read. The accepted runs' evidence trees are deliberately not published — they are the outputs you are asked to reproduce — so the judgments cite artifacts you regenerate rather than ones you can open here.
 
 ## What this repository is not
 
