@@ -1,0 +1,577 @@
+{
+  "digest_basis": "committed bytes (git show HEAD:), never working-tree bytes",
+  "extracted_from": "schutzz/kakuriyo-cyber-range-research",
+  "file_count": 71,
+  "files": [
+    {
+      "blob": "0f70e75f66d37c0947e5b5c9663eb0e787af0587",
+      "bytes": 23116,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/results/main/k7/claim-wording.md",
+      "sha256": "fcb2c29ebb6473fb52a16db5fc8e34f8bd1a363323d149d45ff9b08615b8b8a4",
+      "toyotamahime": "Study01/claims/claim-wording.md"
+    },
+    {
+      "blob": "8b9eb185855fce9851830f5f6c2be4d1392d09ff",
+      "bytes": 11138,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/results/main/k7/h-j1-judgment.md",
+      "sha256": "22069e9ef06476e93fa739ae107091e89c5eaae1947cc4951974906b2c0dffa3",
+      "toyotamahime": "Study01/claims/h-j1-judgment.md"
+    },
+    {
+      "blob": "341b97ff19d9fee938b32ee15950161371b466c5",
+      "bytes": 12424,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/results/main/k7/h-j2-judgment.md",
+      "sha256": "21d25c3e27b57053be14b31d2ea5eb40294e991fddd2f1f36496f1bc04bd559d",
+      "toyotamahime": "Study01/claims/h-j2-judgment.md"
+    },
+    {
+      "blob": "2b9415f98363b91e0648150a3eb8feecb17c2e4e",
+      "bytes": 13619,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/results/main/k7/h-j3-judgment.md",
+      "sha256": "d4f86e587330059d01b63ea41b60c67acf1d5e699c7be7a649874ff7dbab7a37",
+      "toyotamahime": "Study01/claims/h-j3-judgment.md"
+    },
+    {
+      "blob": "de0bba3c54fd9abac2d9fcc787dafa718ae89e72",
+      "bytes": 15961,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/results/main/k7/h-j4-judgment.md",
+      "sha256": "0cedf2c36b517962e497146c047263539b04112b0e60335ecf7efd001db1bac3",
+      "toyotamahime": "Study01/claims/h-j4-judgment.md"
+    },
+    {
+      "blob": "6123dd3bf9e048ac4bd7ef2d09b56d886e96d4d1",
+      "bytes": 19897,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/results/main/k7/limitations.md",
+      "sha256": "29f41f70948c45103605e305d605bad72c371316f494324c001f19c1cd36587c",
+      "toyotamahime": "Study01/claims/limitations.md"
+    },
+    {
+      "blob": "d9794064108cade1c58c14c067a3b7fd8731094e",
+      "bytes": 14509,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/results/main/k7/rq-synthesis.md",
+      "sha256": "ccc122be4805903dee77ae075595f834765e63f19350befe38647ad88ec80f00",
+      "toyotamahime": "Study01/claims/rq-synthesis.md"
+    },
+    {
+      "blob": "1f1a6a4f2ee68637f06c4038eab10fc280d1766d",
+      "bytes": 3474,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/evidence/main-runs/range-a/k6-range-a-20260825-004/hashes.sha256",
+      "sha256": "b408b684c7a8bd35e8c332599cb2edffd10b192345172eb588706ab69b47d7ef",
+      "toyotamahime": "Study01/expected/range-a/hashes.sha256"
+    },
+    {
+      "blob": "1289b53e2b3b6ed5ed0c8e8b67f1c6c83429c252",
+      "bytes": 453,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/results/main/range-a/k6-range-a-20260825-004/scoring-input.json",
+      "sha256": "4d3aa3ac8544c8b0e31d35f8627cba829159d332fae2ed7387b09d0015cb6a30",
+      "toyotamahime": "Study01/expected/range-a/scoring-input.json"
+    },
+    {
+      "blob": "930d1bbc0b6f8d6d7a3f502ff8e9220d397bdafe",
+      "bytes": 255,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/results/main/range-a/k6-range-a-20260825-004/scoring-record.json",
+      "sha256": "1c895f0608ca1015e798f8f4e7633fad91a8e647b75940fb6d1eb486d59be247",
+      "toyotamahime": "Study01/expected/range-a/scoring-record.json"
+    },
+    {
+      "blob": "54018475821e1e8eb5fd993d29428f85b80c77ca",
+      "bytes": 4565,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/evidence/main-runs/range-b/k6-range-b-20260825-004/hashes.sha256",
+      "sha256": "912ef6bd3c02774efa993a8ddbe8f90aca551b1c7006e68877b047f5eb4dda1e",
+      "toyotamahime": "Study01/expected/range-b/hashes.sha256"
+    },
+    {
+      "blob": "3d2f09e31beffa9d74ecd828699b9744b41e474e",
+      "bytes": 503,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/results/main/range-b/k6-range-b-20260825-004/scoring-input.json",
+      "sha256": "ee444a7155298b990ae543aba7f85a2dd1589ff86f9992746e89807ab7d54e1c",
+      "toyotamahime": "Study01/expected/range-b/scoring-input.json"
+    },
+    {
+      "blob": "252fa57c8eb5d3f63994d2273a9023407c654985",
+      "bytes": 259,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/results/main/range-b/k6-range-b-20260825-004/scoring-record.json",
+      "sha256": "f2d455d4cb0182670a43fb6b0333d0dfaa55cc23bd3dd7f197aee3c22a4a0c4f",
+      "toyotamahime": "Study01/expected/range-b/scoring-record.json"
+    },
+    {
+      "blob": "f4a1192e66c20bff61d4eb5cc26c63eb2c014bde",
+      "bytes": 1119,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/evidence/static-validations/range-c/k6-range-c-20260825-001/deviations.md",
+      "sha256": "daf7e366440912653f9a0ee2483280133f6d1971ceba789ac350afdd0264066a",
+      "toyotamahime": "Study01/expected/range-c/deviations.md"
+    },
+    {
+      "blob": "0f187bf1935499808fde47ae5f301e87c6e678ef",
+      "bytes": 351,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/evidence/static-validations/range-c/k6-range-c-20260825-001/environment/versions.json",
+      "sha256": "616042c3c498f3f74c7ffe70ac6bb4c6180990495eb1bf5e259ee44bcfb4a243",
+      "toyotamahime": "Study01/expected/range-c/environment/versions.json"
+    },
+    {
+      "blob": "63b19981371aa583d28cf8eb47d68144c4babec9",
+      "bytes": 866,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/evidence/static-validations/range-c/k6-range-c-20260825-001/hashes.sha256",
+      "sha256": "a9de581b5e5d8d30e51fef0ef53d995533520d1c328e7a0f43f9c33efd98ff74",
+      "toyotamahime": "Study01/expected/range-c/hashes.sha256"
+    },
+    {
+      "blob": "49b49fafbe57c433a292d32ede4a22104431eada",
+      "bytes": 3046,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/evidence/static-validations/range-c/k6-range-c-20260825-001/metadata.md",
+      "sha256": "ecbf9b694654e23fd4ddf28fc0cd0019b3479d02a5ecc78196c5c5c8004cc019",
+      "toyotamahime": "Study01/expected/range-c/metadata.md"
+    },
+    {
+      "blob": "7ac7d55611eb34aa64181a91e9d2159676c80d39",
+      "bytes": 27009,
+      "crlf": true,
+      "kakuriyo": "studies/study-01-negative-result/evidence/static-validations/range-c/k6-range-c-20260825-001/negative-manifest/power-grid-reference.range-c-negative.yaml",
+      "sha256": "60f9c43e7af171077b6999c8005dff2a1da6e2ff4c7a54ba811e857d78c228a3",
+      "toyotamahime": "Study01/expected/range-c/negative-manifest/power-grid-reference.range-c-negative.yaml"
+    },
+    {
+      "blob": "08bf678a4da33bc8e40872d4dc5aea3caafe581b",
+      "bytes": 776,
+      "crlf": true,
+      "kakuriyo": "studies/study-01-negative-result/evidence/static-validations/range-c/k6-range-c-20260825-001/negative-manifest/range-c-derived.patch",
+      "sha256": "d73cba40a934becee8921f85d52706167c9af5528f6b7bcf333be10d9b3081ee",
+      "toyotamahime": "Study01/expected/range-c/negative-manifest/range-c-derived.patch"
+    },
+    {
+      "blob": "bcd685e22d39f82052019c4d9261916fb849dfff",
+      "bytes": 1257,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/evidence/static-validations/range-c/k6-range-c-20260825-001/validation-command.md",
+      "sha256": "722cc7beb9554ac165a69d621c5c8b3429639d0b99a99f0c04022c775ac5b15f",
+      "toyotamahime": "Study01/expected/range-c/validation-command.md"
+    },
+    {
+      "blob": "d00491fd7e5bb6fa28c517a0bb32b8b506539d4d",
+      "bytes": 2,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/evidence/static-validations/range-c/k6-range-c-20260825-001/validator-output/exit-code.txt",
+      "sha256": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865",
+      "toyotamahime": "Study01/expected/range-c/validator-output/exit-code.txt"
+    },
+    {
+      "blob": "2e3241d863a84cfd1beb62d38d5b19fc2e31130b",
+      "bytes": 447,
+      "crlf": true,
+      "kakuriyo": "studies/study-01-negative-result/evidence/static-validations/range-c/k6-range-c-20260825-001/validator-output/validate.stderr",
+      "sha256": "166340b10d3be58923921ed30bf398a46f85f69d3a31a50c2da4857ddeaae8da",
+      "toyotamahime": "Study01/expected/range-c/validator-output/validate.stderr"
+    },
+    {
+      "blob": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "bytes": 0,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/evidence/static-validations/range-c/k6-range-c-20260825-001/validator-output/validate.stdout",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "toyotamahime": "Study01/expected/range-c/validator-output/validate.stdout"
+    },
+    {
+      "blob": "482d9ddc113c85a6d7c688459dca7171b30546c1",
+      "bytes": 2523,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/experiments/range-c-negative-manifest/README.md",
+      "sha256": "7eae3d97964eed525e8f98d8d3397f01f6ea8e8e5a9fb424473e320d86651f49",
+      "toyotamahime": "Study01/studies/study-01-negative-result/experiments/range-c-negative-manifest/README.md"
+    },
+    {
+      "blob": "230396523094ecda9a96499730a1b3fce7ccb11e",
+      "bytes": 760,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/experiments/range-c-negative-manifest/power-grid-reference.range-c-negative.patch",
+      "sha256": "fa1c87dab3858b68bd80d7c4603b0802999b17f2391a02d7008f65397d31f9ad",
+      "toyotamahime": "Study01/studies/study-01-negative-result/experiments/range-c-negative-manifest/power-grid-reference.range-c-negative.patch"
+    },
+    {
+      "blob": "f7397df93da10521f86a235ec250d4fa29e7215e",
+      "bytes": 3034,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/experiments/shared/traffic/send_direct_operate.py",
+      "sha256": "093fefd5f1f36d715aae4d7ab91dbad2d7a93bfe212705d721c95b356a7c053b",
+      "toyotamahime": "Study01/studies/study-01-negative-result/experiments/shared/traffic/send_direct_operate.py"
+    },
+    {
+      "blob": "8b137891791fe96927ad78e64b0aad7bded08bdc",
+      "bytes": 1,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/.gitkeep",
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/.gitkeep"
+    },
+    {
+      "blob": "09aaae6bca0d69350e88427aee885d9681b89b9e",
+      "bytes": 10996,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/amendments.md",
+      "sha256": "678e88f545c6d09d3908b1c513083529722e1bd9ce5fd1a1c11a2e4c494dcfe5",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/amendments.md"
+    },
+    {
+      "blob": "99716ce6530d6b4e4992208c9f5c5a9cb2032c1b",
+      "bytes": 8185,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/c1-modbus-step1-pilot.md",
+      "sha256": "515b8ff7d017486a041eda1ec4b95ea6bb53011c185cde5a89e7a63fce8cbd25",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/c1-modbus-step1-pilot.md"
+    },
+    {
+      "blob": "750374f0e61ad40eb6a5c7f0e1a114243f9ca368",
+      "bytes": 4577,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/c1-modbus-step2-pilot.md",
+      "sha256": "0bc8fe35da3edeeb118063e17a2b4e54b69668538792409433d1281ba9ac9b20",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/c1-modbus-step2-pilot.md"
+    },
+    {
+      "blob": "c90bdefb46bf1fa442b31034ae5ef9cb9cd99e41",
+      "bytes": 14073,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/c2-dnp3-capture-procedure.md",
+      "sha256": "54cf70c6329e71356b394ac4829818eaa8b5c44db49c5c852cb386326c69b80e",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/c2-dnp3-capture-procedure.md"
+    },
+    {
+      "blob": "0a35bb5ad945af6a220ee6c270366d4fdd055456",
+      "bytes": 7448,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/c2-dnp3-image-inventory.md",
+      "sha256": "9a306601c326f15f8b6d7e80ba2d7933037be322eedb125c546ecb7ef6a35b98",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/c2-dnp3-image-inventory.md"
+    },
+    {
+      "blob": "5635d5137baa9e8b709e1fb41fa9e2eeb4bfac98",
+      "bytes": 11673,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md",
+      "sha256": "ded5e1ea4019e800567b7de3b13215be9f80be5e15e83da83cc6715be24a8fe2",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md"
+    },
+    {
+      "blob": "44c5bd150cc4d6ffc9b53c64f63d212db981c46c",
+      "bytes": 5998,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/c2-dnp3-scenario-draft.md",
+      "sha256": "f7258dfae59c811849c2e3f6cea04bca767a3f563164c72f6375d99e52eee510",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/c2-dnp3-scenario-draft.md"
+    },
+    {
+      "blob": "366976267916f8ab1885d64f9f4e5baf65698cff",
+      "bytes": 11128,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/c2-dnp3-sender-procedure.md",
+      "sha256": "35b47f7d31973f84273a0283209def0b071614799ba362ee6b3fd105c0799683",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/c2-dnp3-sender-procedure.md"
+    },
+    {
+      "blob": "a51ccc5a594e7c5b8343155e449d7602e42864b1",
+      "bytes": 4065,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/c2-dnp3-step1-pilot.md",
+      "sha256": "e763bf47e8f9e6afd8faf96c1ce437a0b877462bc51acbb4e5da63d8c2334f05",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/c2-dnp3-step1-pilot.md"
+    },
+    {
+      "blob": "7cb82bb141ed68f5dfbbea5ee054252a8168c2e0",
+      "bytes": 2113,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/c2-dnp3-step2-pilot.md",
+      "sha256": "1f5e6da3df34c5623429c641e1158c8e8e9c740dea8b9ad2ff6bbfa946902f96",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/c2-dnp3-step2-pilot.md"
+    },
+    {
+      "blob": "0c24e5586b1a62985cadad1ca3a4573740bf7389",
+      "bytes": 3222,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/c2-dnp3-step2-retry-pilot.md",
+      "sha256": "b38e53376dbdb0514743a4dd6fe4cc51452877723e41c8767b940e322a105e40",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/c2-dnp3-step2-retry-pilot.md"
+    },
+    {
+      "blob": "b62e3235328c1e6c8a60b80abbe8fb74b7068c9c",
+      "bytes": 3953,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/c2-dnp3-step3-pilot.md",
+      "sha256": "cd8ee32680cdfa4bdaa949a6d7e69ccec2088cce06490ed49f5eb97fe0f2cfb0",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/c2-dnp3-step3-pilot.md"
+    },
+    {
+      "blob": "bd9125dfadba7e777c7a201ed32d7c17f61a90de",
+      "bytes": 5934,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/c2-dnp3-step4-range-b-fault-pilot.md",
+      "sha256": "563e664ddde408a2136019b8dffe0ca911f5f144e2407aa1dbc15188a4e70d0c",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/c2-dnp3-step4-range-b-fault-pilot.md"
+    },
+    {
+      "blob": "3b2aae7e4362bb21bae305aa0e54bfa6fd0dc5fd",
+      "bytes": 4543,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/c2-dnp3-step5-range-c-static-correspondence.md",
+      "sha256": "7ad3f59ec869f0c2ec0a611e4b08f27b690f7941b36ef8db91940b90bec244a1",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/c2-dnp3-step5-range-c-static-correspondence.md"
+    },
+    {
+      "blob": "b0f02ad2c463617314f747a1aa3418c8a6192f1f",
+      "bytes": 6745,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/candidate-validation-common-procedure.md",
+      "sha256": "c2024da28a7782bc72bff1a9f88fe7ada2d39b4c67f748cbb9ba32df0a272c67",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/candidate-validation-common-procedure.md"
+    },
+    {
+      "blob": "f128581be83d94d624988edd38d1807e39cf44b1",
+      "bytes": 13382,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/candidate-validation-plan.md",
+      "sha256": "1a0e9a8bf9f27e297aa55af83b647d8509684204887cb6fee88e752093a260ce",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/candidate-validation-plan.md"
+    },
+    {
+      "blob": "7a3ddda5bf92b4c17248550e2561454e572edece",
+      "bytes": 8407,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/cross-document-consistency-review.md",
+      "sha256": "cfd4ae721917a96805d6ebc730616f5f96566def63098dec94003c87c68c3a70",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/cross-document-consistency-review.md"
+    },
+    {
+      "blob": "031eb5c8908e0a3ecf62d775158b98a2bb50fb7f",
+      "bytes": 11376,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/dependencies.md",
+      "sha256": "d37c605c711a8ea366ad44e69c9db353c43f5392f47e4c890974760087fb68a2",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/dependencies.md"
+    },
+    {
+      "blob": "70c7b06d10667630ce4b990485e321cdde0bd3c3",
+      "bytes": 3816,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/evidence-schema.md",
+      "sha256": "b0c670734f9bab9d925e1591173f1fbe7f85209f84d315e08d5bcd2250f51137",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/evidence-schema.md"
+    },
+    {
+      "blob": "41eda1688bf1821a7b60c0a1db0343080378dd64",
+      "bytes": 29239,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/experiment-protocol.md",
+      "sha256": "8db4854e40c833ca8a6d6a363b5a6f400387318cdd725f05c9059b8f2f265ffe",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/experiment-protocol.md"
+    },
+    {
+      "blob": "51f1fa2daded9704c912de04fce2b808b6b0e4e4",
+      "bytes": 10299,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/freeze-decision-table.md",
+      "sha256": "f90e687275dc0098e4de11377fe7f2ce46eadb494bcc1e1e913a8daf0977801d",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/freeze-decision-table.md"
+    },
+    {
+      "blob": "673aea675a748600e04d05ecbc6978acd3001b5c",
+      "bytes": 4220,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/invariant-specification.md",
+      "sha256": "3a8daac1519dcb8fd827115e1a4b58d4813cd41ef3a663204567976a78a6b6f8",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/invariant-specification.md"
+    },
+    {
+      "blob": "4a581039908e94a76e53e3e20715f5c263e67da5",
+      "bytes": 8372,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md",
+      "sha256": "ea657a995535414167ecb16c62d6f1897147f1f77745a13d1b52b137fd17a84b",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md"
+    },
+    {
+      "blob": "23a7457cf633f44911f69de1af1e95fac01d5795",
+      "bytes": 10652,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/scenario-selection.md",
+      "sha256": "39100e1824aaa740796bc12d925b4ea9bee23cc04c30a6bf1c802b868bd6ae3e",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/scenario-selection.md"
+    },
+    {
+      "blob": "125f720eb37997d76934481e4b15f1de6c733394",
+      "bytes": 2806,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/scoring-semantics-cross-review.md",
+      "sha256": "30f96a5d7e5dcc31748440f5343fc422e654f2799619cb55d4ef756ad84d7a08",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/scoring-semantics-cross-review.md"
+    },
+    {
+      "blob": "191c1dcf6c507a17b7dc82911f1a047aa441dc88",
+      "bytes": 3675,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/protocol/scoring.md",
+      "sha256": "8b336341752ee7b064574b5967724651c200a264c44b3c5449c071aed5239504",
+      "toyotamahime": "Study01/studies/study-01-negative-result/protocol/scoring.md"
+    },
+    {
+      "blob": "e43d80c436dda9a580467da69ee2d499d2478420",
+      "bytes": 79,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01/__init__.py",
+      "sha256": "049ec5a5b83d0f1e0d1d50bb903dbb5bcaf17c3265eb7123049e543885532f4a",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/__init__.py"
+    },
+    {
+      "blob": "c6e97c3d2ec60f295bbca796a144858131a24d91",
+      "bytes": 6123,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01/capture_context.py",
+      "sha256": "f86664f9ad0d9c778819d9ae05b728318306a15fef5716a889067e0fd550f4ba",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/capture_context.py"
+    },
+    {
+      "blob": "3199a3d3351c675835aaf13be444d2fe2d752c3a",
+      "bytes": 13075,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01/capture_lifecycle.py",
+      "sha256": "22abe87ec36618d6ad87c6004a03b4f4fa96b27b8343146a7d623c25b6f2fb99",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/capture_lifecycle.py"
+    },
+    {
+      "blob": "2ce037ff55ab6a0290069b8289ac8327039db203",
+      "bytes": 1119,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01/evidence_io.py",
+      "sha256": "74ba060099ef5cbda74945f148bd8f61a86c82b1fa90a13211a1cc64482045eb",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/evidence_io.py"
+    },
+    {
+      "blob": "893dfd77450d28fdf4207cda6a291965ea9145aa",
+      "bytes": 617,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01/evidence_tree.py",
+      "sha256": "04e02a7640d3ada94ad56b77d4dfd036083b78bc94226289e75d6f98e61ababc",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/evidence_tree.py"
+    },
+    {
+      "blob": "e531f4d99eb5aaaa2161c7652ccbcc9f38ebc294",
+      "bytes": 56,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01/frozen/__init__.py",
+      "sha256": "ac79100c8aa33a593701afa55d76aec59083bdb60a3dfe5eed274c088e27b923",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/frozen/__init__.py"
+    },
+    {
+      "blob": "d40c8708fdfee807a2f93a49ae3db6595ea3718e",
+      "bytes": 3019,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01/frozen/apparatus.py",
+      "sha256": "0cbd0675576dbb09c1095ae9b2ec2b47344a9bd6f2676692e193794c8214ebd6",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/frozen/apparatus.py"
+    },
+    {
+      "blob": "4ae5f1f892df83b7911c9b958d2dcf79be6ffce9",
+      "bytes": 555,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01/frozen/semantics.py",
+      "sha256": "a3f6ccba59acc30b80cf91d10d989d44c06e7c731f31cf53a0bb3db280adc2f2",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/frozen/semantics.py"
+    },
+    {
+      "blob": "0999aa8736aa65bd85f979778d6da7af4b046b98",
+      "bytes": 11822,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01/preflight.py",
+      "sha256": "aec113df660e5683303872b2c266ec9e13f67f6b0ead37d13c874bfdbf786b60",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/preflight.py"
+    },
+    {
+      "blob": "92bca65059358a28cd99d0d206fedc5e37776794",
+      "bytes": 4520,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01/procedure_conformance.py",
+      "sha256": "fa2f386264524d60b4aa6190fe893fb95d094561a1e8c07d31e5f06e3703c41a",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/procedure_conformance.py"
+    },
+    {
+      "blob": "1a1132e6906c70dadff6f9bb590f38775f2f6733",
+      "bytes": 3414,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01/scorer.py",
+      "sha256": "1aa648e6126cd58c722e8e0dc4a829f2684a2754f80917813fef1b6bf88e4468",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/scorer.py"
+    },
+    {
+      "blob": "fc250abbe91c70ed98c40a5956ab5f46a937e2cf",
+      "bytes": 7504,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01_capture.py",
+      "sha256": "362a09d90e453ca1980e94d4809894a32d02ac857bc6b1a65334599fb063b4b8",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01_capture.py"
+    },
+    {
+      "blob": "0627894693a8eb337895fca071b23fe8a2ef5fcb",
+      "bytes": 5822,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01_collect.py",
+      "sha256": "1b51f68f65efea82fce49215df797829a177758b49aa217744e27fff9e7a27b1",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01_collect.py"
+    },
+    {
+      "blob": "6a53b55e781033059cb9bf05669623d37ff75397",
+      "bytes": 2371,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01_preflight.py",
+      "sha256": "29173b1b176868fa16c91d995a648f2e33c41ec969b91d33d68d2c2e4bbd4244",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01_preflight.py"
+    },
+    {
+      "blob": "9531e21093f8f0c914d9f4d138a793101685e557",
+      "bytes": 1037,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01_procedure.py",
+      "sha256": "f06c96c602af746bfa136f9eac2f0cfa8463d371864c11563cdd4ced8c62f43e",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01_procedure.py"
+    },
+    {
+      "blob": "1fae715ec142d5c1649974d96f41782f27e9af46",
+      "bytes": 1328,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01_score.py",
+      "sha256": "5bae78e32efbf213201a73a9923fba7f33230d2b21bd5f15c9d67f5351afc06b",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01_score.py"
+    },
+    {
+      "blob": "af18db6f95088be8e6b7a45ec0d1b1a58044eaed",
+      "bytes": 3843,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/study01_sender.py",
+      "sha256": "674f7da01c5f8d52ed3d2a11d35ae3d6566996dc62f008adc9ea863af68c46b0",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01_sender.py"
+    },
+    {
+      "blob": "6c7a2e9324c28f4b42331abe491ab6548841398e",
+      "bytes": 53319,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/tests/test_phase1.py",
+      "sha256": "2d352d9a26bf9c42226f429b2204351b6854930756a680033dd264dbe9b911fe",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/tests/test_phase1.py"
+    }
+  ],
+  "kakuriyo_commit": "f0df3e1f7ddf76e5a7e394628337f1b578801859",
+  "study_root": "studies/study-01-negative-result"
+}

@@ -1,0 +1,12 @@
+{
+  "experiment_classification": "Valid detection result",
+  "procedure_invalid": false,
+  "range": "A",
+  "rule_output": "Alert",
+  "runtime_contract": "Pass",
+  "stages": {
+    "collector": "Pass",
+    "ground_truth": "Pass",
+    "sensor": "Pass"
+  }
+}

@@ -1,0 +1,18 @@
+--- a/manifests/power-grid-reference.yaml
++++ b/manifests/power-grid-reference.range-c-negative.yaml
+@@ -352,7 +352,14 @@
+   # Phase2決定事項#28: オプトアウト方式。exclude:[]なので、topology.segments
+   # の全セグメント(mirror_link自身を除く)が自動的に観測対象になる。
+   mirror_to: mirror_link
+-  exclude: []
++  exclude: [sub_a_l2_lan]
++
++# Generic Observability Contract declaration (Amenonuboco v0.13.0 schema:
++# observability_contract.required_segments: list[str]). Contradicts
++# instrumentation.exclude above; v0.13.0 validate must reject it.
++observability_contract:
++  required_segments:
++    - sub_a_l2_lan
+ 
+ structuring:
+   # 【Phase9決定事項#140で訂正】旧コメントは「es_enrich_refresherが

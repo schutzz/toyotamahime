@@ -1,0 +1,14 @@
+{
+  "range": "B",
+  "stages": {"ground_truth": "Pass", "sensor": "Fail", "collector": "Fail"},
+  "rule_output": "No alert",
+  "runtime_contract": "Fail",
+  "r_obs_05": "Pass",
+  "target_observation_absent": true,
+  "evidence_correlatable": true,
+  "procedure_conformance": {
+    "invalid_reasons": [], "invocation_count": 1, "procedure_invalid": false,
+    "same_run_retry": false, "schema_version": 2,
+    "sender_invocations": [{"exit_code": 0, "timestamp": "2026-08-25T11:01:31.726192+00:00"}]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "range": "A",
+  "stages": {"ground_truth": "Pass", "sensor": "Pass", "collector": "Pass"},
+  "rule_output": "Alert",
+  "runtime_contract": "Pass",
+  "evidence_correlatable": true,
+  "procedure_conformance": {
+    "invalid_reasons": [],
+    "invocation_count": 1,
+    "procedure_invalid": false,
+    "same_run_retry": false,
+    "schema_version": 2,
+    "sender_invocations": [{"exit_code": 0, "timestamp": "2026-08-25T10:24:14.527147+00:00"}]
+  }
+}

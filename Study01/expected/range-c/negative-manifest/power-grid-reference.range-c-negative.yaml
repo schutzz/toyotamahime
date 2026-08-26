@@ -1,0 +1,462 @@
+# 前身プロジェクト `ot-ids-verum` の電力網ラボのトポロジ層を1枚に凝縮した
+# リファレンススライス。docs/manifest-schema-guide.md §8 の完全な例に対応
+# (instrumentation/structuring/detection/attack は Phase 1のスコープ外の
+# ため未検証のまま保持される)。Phase 1の等価性検証(Phase1-Provisioner.md
+# §1)にそのまま使う。
+#
+# 命名注記: ファイル名・metadata.name はドメイン(電力網ラボ)を表す名前とし、
+# 前身プロジェクト名("verum")を識別子として名乗らない。本プロジェクト
+# (Amenonuboco)のリポジトリ内で前身の名前がファイル名に出ると、閲覧者が
+# どちらのプロジェクトの資産か混同しうるため。
+apiVersion: amenonuboco/v1alpha1
+kind: CyberRange
+metadata:
+  name: power-grid-reference
+  description: 前身プロジェクト ot-ids-verum の電力網ラボの代表要素を1枚に凝縮したリファレンススライス
+
+topology:
+  segments:
+    - { name: cc_lan,       cidr: 10.1.10.0/24,  kind: it-core }
+    - { name: wan_link,     cidr: 172.18.0.0/24, kind: wan-edge }
+    - { name: sub_b_lan,    cidr: 10.1.30.0/24,  kind: ot-lan }
+    - { name: sub_a_l2_lan, cidr: 10.1.20.0/24,  kind: ot-l2 }
+    - { name: mirror_link,  cidr: 10.1.99.0/24,  kind: observation }
+    # Phase7決定事項#106: 電力の濃縮(変電所2→4)。sub_cはsub_bと同型(DNP3系)、
+    # sub_dはsub_aと同型(GOOSE系)の独立変電所として追加する
+    # (Phase7-draft-DeepDive-Power.md §2.1)。
+    - { name: sub_c_lan,    cidr: 10.1.40.0/24,  kind: ot-lan }
+    - { name: sub_d_l2_lan, cidr: 10.1.50.0/24,  kind: ot-l2 }
+  routing:
+    gateway: wan_router
+  assets:
+    - name: wan_router
+      role: l3-router
+      image: debian:bullseye-slim
+      networks:
+        - { segment: cc_lan,       ip: 10.1.10.254 }
+        - { segment: wan_link,     ip: 172.18.0.254 }
+        - { segment: sub_b_lan,    ip: 10.1.30.254 }
+        - { segment: sub_a_l2_lan, ip: 10.1.20.254 }
+        - { segment: mirror_link,  ip: 10.1.99.254 }
+        - { segment: sub_c_lan,    ip: 10.1.40.254 }
+        - { segment: sub_d_l2_lan, ip: 10.1.50.254 }
+
+    - name: cc_scada_master
+      # 【Phase9決定事項#138で訂正・格上げ】Phase1〜5時点のコメントは
+      # 「python標準ライブラリのhttp.serverはHTTPとして解釈できなくても
+      # 実際のTCPペイロードはワイヤに乗るため、tsharkのポートベースのDNP3
+      # 判定には十分」と主張していたが、これは誤りだった。Phase9 Stage6の
+      # 実機確認で、ポート20000上のプレーンなHTTPペイロードに対し
+      # `tshark -Y dnp3` が0件になることを確認した——tsharkのDNP3
+      # dissectorはポート番号だけでなく開始バイト列(0x0564)とフレーム構造
+      # そのものを検査するため、DNP3として妥当な形をしていないペイロードは
+      # port-based heuristicでも拾われない(罠#033と同系統: 「tsharkがこう
+      # 振る舞うはず」という未検証の前提)。
+      #
+      # 実際にzone_violationが検知していたDNP3は、常にdnp3_zone_attack.py
+      # (本物のDNP3フレーム、正しいCRCを持つ)が送るものだった。つまり
+      # ALLOWED_DNP3_SOURCES=10.1.10.10(このノード)からの正当なDNP3が
+      # 一度も流れておらず、許可リストの「許可される側」の枝が実データで
+      # 検証されないまま残っていた——Signal1は「不正アクセスを検知する」
+      # ことだけを実証しており、「正当なアクセスを誤検知しない」ことは
+      # 実証していなかった。
+      #
+      # protocol-images/dnp3(Phase9 Stage2で実機確認済み)へ差し替え、
+      # 二重の役割を持たせる。①DNP3アウトステーションとして20000番で
+      # 待ち受け、既存のdnp3_zone_attack.pyの手組みフレームをそのまま
+      # 解釈・応答する(攻撃実演との後方互換を保つ)。②同時にDNP3マスタ
+      # として sub_c_rtu へ周期的なIntegrity Pollを送る(実際のSCADA
+      # マスタが行う定常運用そのもの)。②で生成されるDNP3パケットの
+      # 送信元は常にこのノード自身(10.1.10.10=ALLOWED_DNP3_SOURCES)で
+      # あり、zone_violationが正しく沈黙し続けることを、攻撃の有無に
+      # 依存しない形で実データにより裏付ける。
+      role: ot-asset
+      image: ../protocol-images/dnp3
+      networks:
+        - { segment: cc_lan, ip: 10.1.10.10 }
+      overrides:
+        # 2プロセスを1コンテナで同時に走らせる(既存の「( cmd & wait )」
+        # 型の拡張)。アウトステーション役はポート20000を待ち受けるのみで
+        # 送信ソケットを持たないため、マスタ役(こちらはTARGETへの発信の
+        # みでリッスンしない)とポートが衝突しない。
+        command: |
+          ( MODE=outstation DEVICE_ID=10 LABEL=cc_scada_master_rx python3 /app/run.py &
+            MODE=master TARGET=10.1.40.10 DEVICE_ID=1 PEER_ID=20 INTERVAL=8 LABEL=cc_scada_master_poll python3 /app/run.py &
+            wait )
+
+    - name: sub_b_rtu_hmi
+      # Alpine系イメージ(apk)。ルーティング生成のapk経路を検証する対象でもある
+      # (Phase1決定事項#21)。
+      role: ot-asset
+      image: nodered/node-red:3.1.0
+      networks:
+        - { segment: sub_b_lan, ip: 10.1.30.10 }
+      overrides:
+        ports: [ "18800:1880" ]
+        command: "/usr/src/node-red/entrypoint.sh"
+
+    - name: sub_b_process_points
+      # Phase9決定事項#151: historianがOPC UAクライアントとして集約対象に
+      # するプロセス値公開点(OPC UAサーバ役)。中央のhistorian(cc_lan)とは
+      # 別セグメント(sub_b_lan)に置くことで、両者間の通信がゲートウェイを
+      # 経由し実際にミラーされる(決定事項#137)。
+      role: ot-asset
+      image: ../protocol-images/opcua
+      networks:
+        - { segment: sub_b_lan, ip: 10.1.30.15 }
+      overrides:
+        command: "python3 /app/run.py"
+        environment:
+          - "MODE=server"
+          - "LABEL=sub_b_process_points"
+
+    - name: sub_a_ied_02
+      # 同上、攻撃スクリプト(send_goose_poison.py)の再現もPhase 1のスコープ外。
+      role: attacker-insider
+      image: python:3.10-slim
+      networks:
+        - { segment: sub_a_l2_lan, ip: 10.1.20.11 }
+      overrides:
+        command: "tail -f /dev/null"
+
+    - name: sub_c_rtu
+      # 【Phase9決定事項#138で訂正・格上げ】変電所C(DNP3系、sub_bと同型だが
+      # 独立資産)のRTU。旧コメントは「tsharkのポートベースDNP3判定には
+      # 十分」と主張していたが誤りだった(cc_scada_masterの同じ位置の
+      # コメントを参照)。protocol-images/dnp3のアウトステーションへ差し替え、
+      # cc_scada_masterからの周期的なIntegrity Pollを実際に受けて応答する。
+      role: ot-asset
+      image: ../protocol-images/dnp3
+      networks:
+        - { segment: sub_c_lan, ip: 10.1.40.10 }
+      overrides:
+        command: "python3 /app/run.py"
+        environment:
+          - "MODE=outstation"
+          - "LABEL=sub_c_rtu"
+          - "DEVICE_ID=20"
+          - "POINTS=4"
+
+    - name: sub_c_hmi
+      # 変電所Cの監視員向けHMI。sub_b_rtu_hmiと同型(Node-RED)。1変電所内に
+      # 複数資産を持たせることで、水道・製造業ドラフトの濃さと揃える。
+      role: ot-asset
+      image: nodered/node-red:3.1.0
+      networks:
+        - { segment: sub_c_lan, ip: 10.1.40.11 }
+      overrides:
+        ports: [ "18801:1880" ]
+        command: "/usr/src/node-red/entrypoint.sh"
+
+    - name: ups_attacker
+      # Phase7決定事項#108: cc_upsのSNMP管理インターフェースへの不正アクセスを
+      # 模す。2022年CISA/FBI/DOE注意喚起の「インターネットに露出したUPS管理
+      # インターフェース」を再現するため、wan_link(外部境界相当)に配置する。
+      role: attacker-external
+      image: python:3.10-slim
+      networks:
+        - { segment: wan_link, ip: 172.18.0.50 }
+      overrides:
+        command: |
+          apt-get update -qq && apt-get install -y -qq snmp >/dev/null 2>&1 &&
+          ( for i in 1 2 3 4 5 6; do
+              sleep 15
+              snmpset -v2c -c public -t 5 -r 2 10.1.10.95:161 1.3.6.1.2.1.1.6.0 s 'UNAUTHORIZED_SHUTDOWN_COMMAND_INJECTED' 2>&1
+            done
+            wait
+          )
+
+    - name: sub_d_ied_01
+      # 変電所D(GOOSE系、sub_aと同型)のIED。sub_a_ied_02とは異なり侵害されて
+      # いない正規資産(対照群)。role=ot-assetとし、attacker-insiderは
+      # sub_a_ied_02のみに残す。GOOSE構造化はPhase3決定事項#42の例外ルート
+      # (spicy-sidecar)の対象で、生成ロジック自体は未実装のため、前身
+      # ot-ids-verumのgoose_spicy_sidecar.py資産を手動配線する方式を
+      # 暫定的に採る(決定事項#107、詳細はPhase7-InfraExpansion.md参照)。
+      role: ot-asset
+      image: python:3.10-slim
+      networks:
+        - { segment: sub_d_l2_lan, ip: 10.1.50.11 }
+      overrides:
+        command: "tail -f /dev/null"
+
+    - name: vector
+      role: detection-infra
+      image: timberio/vector:0.46.0-alpine
+      networks:
+        - { segment: cc_lan, ip: 10.1.10.35 }
+
+    - name: elasticsearch
+      # xpack.security.enabled=false・discovery.type=single-nodeが無いと、
+      # ES8系は既定でTLS必須(HTTPSのみ)起動になり、es_enrich_refresher/
+      # log_structurerいずれのプレーンHTTPリクエストも到達できない
+      # (Phase3決定事項#48、罠ログ#011。前身ot-ids-verumのdocker-compose.yml
+      # が最初からこの3変数を設定していた設計をそのまま踏襲する)。
+      role: detection-infra
+      image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+      networks:
+        - { segment: cc_lan, ip: 10.1.10.40 }
+      overrides:
+        environment:
+          - "discovery.type=single-node"
+          - "xpack.security.enabled=false"
+          - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+
+    - name: es_enrich_refresher
+      # Alpine系(busybox)イメージ。ports/entrypointを持たない検知sidecarの例。
+      role: detection-infra
+      image: curlimages/curl:latest
+      networks:
+        - { segment: cc_lan }   # IP動的割当
+      overrides:
+        command: "while true; do curl -s -X POST http://elasticsearch:9200/_enrich/policy/detection_lookup_policy/_execute; sleep 60; done"
+
+    - name: tap_observer
+      # Phase2: mirror_linkへの単一接続の観測ノード。tcpdumpでミラーされた
+      # トラフィックを直接確認する(前身ot-ids-verumのzeek_tap相当)。IPは動的割当。
+      role: observer
+      image: debian:bullseye-slim
+      networks:
+        - { segment: mirror_link }
+      overrides:
+        command: "apt-get update -qq && apt-get install -y -qq tcpdump >/dev/null 2>&1 && tcpdump -i eth0 -nn"
+
+    - name: log_structurer
+      # Phase3: 構造化パイプライン(tshark+バルクローダー)実行ノード。
+      # observerとは責務分離(Phase3決定事項#41)。mirror_link(観測)+
+      # cc_lan(Elasticsearchへの書き込み)へのマルチホーム接続を持つ。
+      # tsharkのapt-getインストールが非対話モードを要するため、Debian系
+      # イメージのみを対象とする(Phase3決定事項#44の既知の制約)。
+      role: structurer
+      image: debian:bullseye-slim
+      networks:
+        - { segment: mirror_link, ip: 10.1.99.60 }
+        - { segment: cc_lan,      ip: 10.1.10.60 }
+
+    - name: killchain_detector
+      # Phase4: 検知プラグイン(Signal6キルチェーン相関)を載せるホスト資産。
+      # 前身ot-ids-verumのkillchain_eql_pollerと同じく、Elasticsearchを
+      # EQLでポーリングして_bulkへ書き戻すだけなので、cc_lan単独接続でよい
+      # (パケット観測に依存しない=ミラーリングの境界越え制約の影響を受けない、
+      # Phase4完了条件1で最初の実証対象に選んだ理由)。
+      role: detection-infra
+      image: python:3.11-slim
+      networks:
+        - { segment: cc_lan, ip: 10.1.10.80 }
+
+    - name: zone_detector
+      # Phase5: 検知プラグイン(Signal1ゾーン逸脱)を載せるホスト資産。
+      # killchain_detectorと同型(cc_lan単独接続、パケット観測に依存しない)。
+      role: detection-infra
+      image: python:3.11-slim
+      networks:
+        - { segment: cc_lan, ip: 10.1.10.81 }
+
+    - name: eval_harness
+      # Phase5: 評価ハーネス(正解ラベルの記録・突き合わせ)を実行する専用資産。
+      # 攻撃者ノード(sub_a_ied_02、sub_a_l2_lan接続)はcc_lan上の
+      # elasticsearchへ名前解決できず、そもそも攻撃者ノード自身が正解ラベルを
+      # 書き込む設計は前身のOOB自己申告(oob_redis/oob_webdis)と同じ構図に
+      # なってしまうと実装時に判明した(罠ログ#017)。演習を実行した側
+      # (オペレータ)が独立に記録できるよう、cc_lan接続の専用資産として分離
+      # する(Phase0決定事項#13で予告した「載せる口」の実体、Phase5決定事項#69)。
+      role: eval-harness
+      image: python:3.11-slim
+      networks:
+        - { segment: cc_lan, ip: 10.1.10.90 }
+      overrides:
+        command: "tail -f /dev/null"
+
+    - name: caldera_server
+      # Phase4: 攻撃エミュレーションエンジン(Caldera server)。攻撃層は
+      # engine.caldera.hostでこの資産を名前参照する(決定事項#53の一元化)。
+      role: attack-engine
+      image: python:3.11-slim
+      networks:
+        - { segment: cc_lan, ip: 10.1.10.70 }
+      overrides:
+        # Phase4検証では実際のCalderaイメージは起動せず、外部Ability/Adversaryの
+        # マウントと配線が成立することの確認に留める(実際のCalderaサーバー起動は
+        # イメージが重く、Phase4のスコープ=差し込み口の実証には過剰)。マウント
+        # された資産を確認して常駐する軽量な代替コマンドで実証する。
+        command: "ls -la /app/caldera_assets/abilities /app/caldera_assets/adversaries && tail -f /dev/null"
+
+    - name: grafana_server
+      # Phase6: 可視化エンジン(Grafana)。visualization.hostでこの資産を名前
+      # 参照する(決定事項#83、attack.engine.caldera.hostと同じ一元化パターン)。
+      role: visualization-engine
+      image: grafana/grafana:11.1.0
+      networks:
+        - { segment: cc_lan, ip: 10.1.10.72 }
+
+    - name: historian
+      # 【Phase9決定事項#151で訂正・格上げ】Phase7決定事項#106時点のコメントは
+      # 「全変電所のプロセス値を集約する歴史データサーバ、OPC UAでの接続を
+      # 想定」としながら、実装はcc_lan単独接続でポート4840を開くだけの
+      # http.serverだった。「集約する」と書きながら実際には誰からも
+      # 接続されず、`structuring.protocols`のopcuaエントリは決定事項#140で
+      # 発見したhttpエントリと同じ構造の「宣言だけあってトラフィックが
+      # 存在しない」状態だった(実機確認: tap_observerの生キャプチャで
+      # port 4840宛ては0件)。
+      #
+      # protocol-images/opcua(Phase9 Stage2で実機確認済み)へ差し替える。
+      # 「集約する」という役割上、historian自身をOPC UAクライアント役
+      # (MODE=client)にし、変電所側に新設したOPC UAサーバ役
+      # (sub_b_process_points、決定事項#137のとおり別セグメントに配置)を
+      # 定期的にポーリングする構成にした。historianがcc_lan、ポーリング先が
+      # sub_b_lanと別セグメントのため、ゲートウェイを経由し実際にミラー
+      # されることを実機確認済み。
+      role: ot-asset
+      image: ../protocol-images/opcua
+      networks:
+        - { segment: cc_lan, ip: 10.1.10.15 }
+      overrides:
+        command: "python3 /app/run.py"
+        environment:
+          - "MODE=client"
+          - "TARGET=10.1.30.15"
+          - "INTERVAL=10"
+          - "LABEL=historian"
+
+    - name: cc_ups
+      # Phase7決定事項#106・#97・#108: 中央制御室のUPS(無停電電源装置)。
+      # 実際のnet-snmp(snmpd)をSNMPv2c・community "public"(既定認証情報のまま
+      # 露出、CISA/FBI/DOE 2022年共同注意喚起のモデル)で起動する。検知は
+      # 「localhost以外からのSNMPアクセス自体」を許可リスト方式で見る
+      # (Signal1のzone_violation.py=ALLOWED_DNP3_SOURCESと同じ思想、決定事項#68
+      # 参照)。当初はsysLocationへの書き込み成功を検知条件にしていたが、実機
+      # 検証でこのsnmpdビルドがsysLocoation.0のSET自体をnotWritableで拒否する
+      # ことが判明したため、書き込み成否に依存しないアクセス検知へ設計変更した
+      # (決定事項#109)。
+      role: ot-asset
+      image: python:3.10-slim
+      networks:
+        - { segment: cc_lan, ip: 10.1.10.95 }
+      overrides:
+        command: |
+          apt-get update -qq && apt-get install -y -qq snmpd snmp >/dev/null 2>&1 &&
+          printf 'rwcommunity public\nsysLocation Central Control Room UPS (normal)\n' > /etc/snmp/snmpd.conf &&
+          ( snmpd -f -Lf /var/log/snmpd.log &
+            sleep 3
+            tail -F /var/log/snmpd.log | while read LINE; do
+              case $LINE in
+                *'Connection from UDP'*127.0.0.1*127.0.0.1*) : ;;
+                *'Connection from UDP'*)
+                  echo '[cc_ups] !!! UNAUTHORIZED SNMP ACCESS FROM NON-LOCAL SOURCE DETECTED -- SIMULATING UPS SHUTDOWN (AVAILABILITY LOSS) !!!' ;;
+              esac
+            done
+            wait
+          )
+
+instrumentation:
+  # Phase2決定事項#28: オプトアウト方式。exclude:[]なので、topology.segments
+  # の全セグメント(mirror_link自身を除く)が自動的に観測対象になる。
+  mirror_to: mirror_link
+  exclude: [sub_a_l2_lan]
+
+# Generic Observability Contract declaration (Amenonuboco v0.13.0 schema:
+# observability_contract.required_segments: list[str]). Contradicts
+# instrumentation.exclude above; v0.13.0 validate must reject it.
+observability_contract:
+  required_segments:
+    - sub_a_l2_lan
+
+structuring:
+  # 【Phase9決定事項#140で訂正】旧コメントは「es_enrich_refresherが
+  # cc_lan内で生成するHTTP POST(elasticsearchへの定期curl)は、cc_lanが
+  # 観測対象セグメントであるためmirror_linkへミラーされる」と主張して
+  # いたが、これは誤りだった。ミラーリングはゲートウェイの各セグメント
+  # 向けインターフェース上でtc ingressとして設定される(generators/
+  # mirroring.py)ため、**ゲートウェイを経由しない通信(同一セグメント内
+  # の2ノード間、L2で直接スイッチされる)はそもそもゲートウェイの
+  # インターフェースを一度も通過せず、原理的にミラーされ得ない**。
+  # es_enrich_refresherとelasticsearchは共にcc_lan上にあり、両者間の
+  # HTTP POSTはこのケースに該当する。この構造上の制約はPhase9
+  # Stage3・決定事項#137(プロトコル資産のサーバ役とクライアント役を
+  # 別セグメントに置く理由)と同じものであり、実機確認(tap_observerの
+  # 生キャプチャ550パケット中、elasticsearch:9200宛ては0件。
+  # 10分以上・複数回のcurl実行後も`ot-logs-http-*`は0件のまま)で
+  # 裏付けた。cc_scada_master/sub_c_rtu(決定事項#138)と異なり、
+  # es_enrich_refresherの役割上、別セグメントへ移すことは意味を持たない
+  # (Elasticsearchへの内部的な補助リクエストであり、OTプロトコルの
+  # 模擬対象ではない)ため、位置は変更せず、宣言を撤回する。この
+  # index自体は電力の主軸実演(SNMP/DNP3)に不要であり、宣言し続ける
+  # ことは「動かないものを動くように見せる」ことになる(決定事項#128の
+  # 逆)。manufacturing-plant/water-utilityの既存プレースホルダ宣言
+  # (実トラフィック無しと明記済み)とは異なり、こちらは「実際に通信は
+  # 発生しているが構造的に観測不可能」という別種のため、宣言そのものを
+  # 削除する判断とした。
+  engine: tshark
+  protocols:
+    - { name: dnp3,  output_index: ot-logs-dnp3-* }   # Phase5: Signal1(ゾーン逸脱)の実証対象。sub_c_rtuも同一index(1プロトコル=1index、決定事項#39)。Phase9決定事項#138でcc_scada_master/sub_c_rtuを実DNP3化し、許可された送信元からの正当なDNP3(周期Poll)も同じindexへ実際に流れるようになった
+    - { name: opcua, output_index: ot-logs-opcua-* }  # Phase9決定事項#151でhistorianを実OPC UA化(sub_b_process_pointsをクライアントとしてポーリング)。tshark組み込みdissectorで実機確認済み(Phase9 Stage2)
+    - { name: snmp,  output_index: ot-logs-snmp-* }   # Phase7決定事項#106: cc_ups管理。SNMPは最も成熟したtshark対応
+
+detection:
+  # Phase4: 前身ot-ids-verumのSignal6(キルチェーン相関)を、環境定義に一切
+  # 手を入れずに「1シナリオ」として差し込む(Phase4完了条件1)。プラグイン本体
+  # (source)はマニフェスト外のシナリオ資産であり、プラットフォームは中身を
+  # 一切解釈しない(Phase0決定事項#1)。
+  plugins:
+    - name: signal-6-killchain
+      type: sidecar                 # Phase4はsidecarのみ実装(決定事項#55)
+      host: killchain_detector      # topology.assetsの資産を名前参照(決定事項#54)
+      source: ../scenarios/legacy-power-grid-signals/killchain_eql_poller.py
+      requires: [ requests ]        # 生のpip installは書かない(決定事項#56)
+      config:                       # 環境変数として注入される(決定事項#57)
+        ES_URL: http://elasticsearch:9200
+    - name: signal-1-zone-violation
+      # Phase5: 前身の判定ロジック(Vector VRL内のallowlistルックアップ)を
+      # sidecarへ書き直したもの(決定事項#68)。前身のot_allowlist.csvは
+      # 「許可された送信元IP1件のみ」の単純な許可リストであり、Phase5計画時に
+      # 想定していたセグメント間フロー方式(決定事項#64案A当初案)より単純
+      # だったため、実装時にALLOWED_DNP3_SOURCESという素直なIP許可リストへ
+      # 補正した(前身の実データへの忠実さを優先)。
+      #
+      # 【Phase9決定事項#138で1件→2件へ訂正】cc_scada_masterを実DNP3化
+      # した直後の実機確認で、sub_c_rtu(正当なアウトステーション、応答元
+      # 10.1.40.10)の周期Poll応答が毎回「unauthorized DNP3 source」として
+      # 誤検知され続けることを発見した。原因は単純: DNP3はマスタ→
+      # アウトステーションの要求とアウトステーション→マスタの応答という
+      # 双方向通信であり、応答パケットの送信元IPはアウトステーション自身
+      # (sub_c_rtu)になる。旧来の許可リストは「マスタ1件」しか想定して
+      # おらず、実際に双方向の正当な通信が流れて初めて露呈した抜けだった
+      # (前身ot_allowlist.csvの単一エントリを前提に据えたことの副作用でも
+      # ある——前身は片方向のみの模擬トラフィックしか扱っていなかった)。
+      # sub_c_rtu(10.1.40.10)を許可リストへ追加して解消。この2件は
+      # 「このゾーンでDNP3を話してよい正規の参加者(マスタとその配下の
+      # アウトステーション)」を表しており、リストを緩めたのではなく、
+      # 単一方向の想定を実態(双方向の通信)に合わせて補正したもの。
+      # 修正後、正当な周期Pollの往復では誤検知が発生せず、
+      # dnp3_zone_attack.py(第三のIPから送信)は引き続き検知することを
+      # 実機確認済み。
+      type: sidecar
+      host: zone_detector
+      source: ../scenarios/legacy-power-grid-signals/zone_violation.py
+      requires: [ requests ]
+      config:
+        ES_URL: http://elasticsearch:9200
+        ALLOWED_DNP3_SOURCES: "10.1.10.10,10.1.40.10"   # cc_scada_master(マスタ)とsub_c_rtu(アウトステーション、応答元)
+  # 評価ハーネスは detection の専用フィールドではなく、eval-harnessロールの
+  # 資産(topology.assets の eval_harness)として表現する(決定事項#77)。
+  # 正解ラベルの記録・突き合わせは、その資産へ載せたシナリオスクリプト
+  # (record_ground_truth.py/evaluate_signal1.py)がオペレータ操作で担う。
+
+attack:
+  # Phase4: Caldera統合の最低ライン(Phase0決定事項#3)。engine.caldera自体が
+  # 任意であり、宣言が無ければ攻撃関連の生成は一切行われない(決定事項#58)。
+  engine:
+    caldera:
+      host: caldera_server          # topology.assetsのattack-engine資産を参照
+      abilities_path: ../attack-assets/caldera/abilities
+      adversaries_path: ../attack-assets/caldera/adversaries
+
+visualization:
+  # Phase6: Signal1(ゾーン逸脱)のアラートを時系列ダッシュボードで可視化する。
+  # datasourcesは省略し自動生成に任せる(決定事項#81): structuring.protocols[].
+  # output_index(ot-logs-http-*, ot-logs-dnp3-*)と ot-signals-* 規約
+  # (決定事項#86)を束ねた1つのElasticsearchデータソースになる。
+  engine: grafana
+  host: grafana_server           # topology.assetsのvisualization-engine資産を参照
+  dashboards:
+    - ../scenarios/legacy-power-grid-signals/dashboards/signal1_zone.json

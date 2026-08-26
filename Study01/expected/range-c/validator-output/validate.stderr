@@ -1,0 +1,4 @@
+error: manifest manifests\power-grid-reference.range-c-negative.yaml failed validation:
+1 validation error for Manifest
+  Value error, observability_contract.required_segments requires segment 'sub_a_l2_lan', but it is not in the computed observed-segment set [type=value_error, input_value={'apiVersion': 'amenonubo...ds/signal1_zone.json']}}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.12/v/value_error

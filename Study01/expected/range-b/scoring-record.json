@@ -1,0 +1,12 @@
+{
+  "experiment_classification": "Invalid negative result",
+  "procedure_invalid": false,
+  "range": "B",
+  "rule_output": "No alert",
+  "runtime_contract": "Fail",
+  "stages": {
+    "collector": "Fail",
+    "ground_truth": "Pass",
+    "sensor": "Fail"
+  }
+}

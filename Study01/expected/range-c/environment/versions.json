@@ -1,0 +1,15 @@
+{
+  "argv": [
+    "platform/cli.py",
+    "validate",
+    "manifests/power-grid-reference.range-c-negative.yaml"
+  ],
+  "versions": {
+    "git": "git version 2.51.0.windows.2",
+    "pydantic": "2.12.5",
+    "python": "Python 3.10.11",
+    "pyyaml": "6.0.3"
+  },
+  "worktree_clean": false,
+  "worktree_head": "0378f8a32701b481e030f3db3d5f66ea471a4675"
+}

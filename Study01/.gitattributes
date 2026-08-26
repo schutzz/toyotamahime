@@ -1,0 +1,24 @@
+# Study01/ is the repository root as far as the frozen apparatus is concerned:
+# `study01/frozen/apparatus.py` pins the sender asset as a path relative to a
+# repo root, and `scripts/tests/test_phase1.py` reads this file from that same
+# location to prove that finalized hashes survive a real commit and a fresh
+# clone. Keep this file here, not only at the Toyotamahime root.
+
+# Keep research documentation and source text stable across Windows and Unix.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Retained capture evidence is binary and must never be EOL-normalized.
+# `text=auto` decides by heuristic; evidence integrity must not depend on one.
+*.pcap -text
+
+# The K6 Range C comparison targets are the exact bytes the pinned validator
+# read and produced, and their SHA-256 values are cited in the expected
+# results. They are CRLF as written on the K6 execution host, so no EOL
+# heuristic may touch them between hashing and commit. `-diff` as well as
+# `-text`: they are hashed byte sequences, not reviewable prose, and a
+# line-oriented diff reports every CR as trailing whitespace.
+expected/range-c/negative-manifest/** -text -diff
+expected/range-c/validator-output/** -text -diff
