@@ -4,10 +4,12 @@ Public research repository for a programme on **whether experimental results fro
 
 Each study lives in its own directory and is self-contained: apparatus, protocol, expected results, claims, and instructions for reproducing it.
 
+Study 01 uses **[Amenonuboco](https://github.com/schutzz/ot-range-amenonuboco)**, a reproducible OT/ICS cyber-range platform, as its reference implementation and execution environment. The research question is broader than Amenonuboco: the study asks what evidence has to exist before a detection experiment's negative result can be interpreted at all. Amenonuboco is how the experiment is built and re-built; it is not what the experiment is about.
+
 | Directory | Study | State |
 | --- | --- | --- |
 | [`Study01/`](./Study01/) | **Negative-result validity in an OT/ICS cyber range.** One frozen DNP3 event, an observation-valid range and a fault-injected one, and a static contract-violation manifest. | claims frozen; reproduction kit published |
-| `Study02/` | planned | not yet present |
+| [`Study02/`](./Study02/) | planned — will extend the question to a second protocol and to the gaps Study 01 could not close | placeholder only; not part of Study 01 or its reproduction |
 
 ## Where to start
 

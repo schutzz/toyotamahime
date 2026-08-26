@@ -42,7 +42,11 @@ Study01/
    └─ experiments/                            <- the sender asset and the Range C patch
 ```
 
-## 3. Prerequisites
+## 3. Execution platform and prerequisites
+
+**Execution platform.** Study 01 is reproduced using the public [Amenonuboco](https://github.com/schutzz/ot-range-amenonuboco) repository at the pinned commits in §4.1. Ranges A and B use it for range generation and execution; Range C uses its pinned validator for pre-deployment contract validation and provisions nothing. Both roles are pinned to specific commits, and neither is a moving dependency.
+
+### 3.1 Prerequisites
 
 | Requirement | Value used by the original runs |
 | --- | --- |
