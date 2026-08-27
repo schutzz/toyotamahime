@@ -58,15 +58,75 @@ Study01/
 
 Record your own versions before you start; the original runs used Python 3.10.11, pydantic 2.12.5, PyYAML 6.0.3.
 
-Install `pytest`, then confirm the apparatus is intact before using it:
+Install `pytest`, then confirm the apparatus is intact before using it. **You are already at `Study01/`** per §2 — do not prefix the path below with `Study01/` again:
 
 ```powershell
 python -m pip install pytest
-cd Study01/studies/study-01-negative-result/scripts
+cd studies/study-01-negative-result/scripts
 python -m pytest tests -q
 ```
 
-69 tests should pass. If they do not, stop and record the failure; do not continue.
+69 tests should pass. If they do not, stop and record the failure; do not continue. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically:
+
+```powershell
+.\Study01\tools\Invoke-K8Step.ps1 -AttemptDir $AttemptDir -Description 'apparatus integrity test' `
+    -Command { python -m pytest tests -q }
+```
+
+### 3.2 Clean-host bootstrap and attempt evidence (optional, recommended)
+
+You are presumably reading this from *some* clone of Toyotamahime already — that is fine, and expected: this is documentation, read once to learn the procedure. A **recorded attempt** is a separate thing. `Start-Study01.ps1` performs its own, fresh `git clone` inside the attempt directory it creates, independent of whatever copy you are reading this from, so that attempt's transcript and recorded `HEAD` cover a clone it controls end to end. Run it from a clean starting point when you want a properly recorded attempt, not merely to read ahead.
+
+This section adds an **optional harness** that automates the bookkeeping around a K8-3 attempt — creating the evidence directory, starting a transcript before `git clone`, recording the exact clone `HEAD`, capturing a small environment record, and closing the attempt out on success or failure — so you are not hand-assembling that from scratch, especially after a failure. It changes nothing about what you run for Range A/B/C; it only records it.
+
+**What it is and is not.** The harness is infrastructure for attempt lifecycle and evidence acquisition. It does not run Range A/B/C for you, does not install or fix anything you are missing, does not decide whether your attempt succeeded, and does not determine Gate K8 — Gate K8 is independent review. If a step fails, the harness's job is to make sure that failure is recorded and the attempt is closed cleanly, not to work around it.
+
+**What is downloaded, from where, and how it is verified.** `bootstrap/Start-Study01.ps1` is an ordinary file tracked in this repository (see [`bootstrap/README.md`](../bootstrap/README.md)). Fetch it from a tag-pinned URL — not a branch, which can move — and verify its SHA-256 before running it:
+
+```powershell
+$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v1/bootstrap/Start-Study01.ps1'
+$Dest     = Join-Path $env:TEMP 'Start-Study01.ps1'
+$Expected = '03e086fc35e2091f4f73379c2ca8cb3bb9e4f6e1fcc8f8eaa972ce2cfc9c0262'
+
+Invoke-WebRequest -Uri $Url -OutFile $Dest
+$Actual = (Get-FileHash -Path $Dest -Algorithm SHA256).Hash.ToLower()
+if ($Actual -ne $Expected) {
+    throw "SHA-256 mismatch: expected $Expected, got $Actual. Do not run this file."
+}
+
+& $Dest
+```
+
+The tag `k8-bootstrap-v1` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
+
+**What it executes and where it writes.** `Start-Study01.ps1` creates a new attempt directory under `C:\K8\attempts\<attempt-id>\` (override with `-AttemptRoot`), starts a transcript there, clones `https://github.com/schutzz/toyotamahime` into it, records the exact clone `HEAD`, and captures a small environment record. It writes only under `-AttemptRoot`; it does not touch anything outside it, and it does not send anything over the network beyond the clone itself.
+
+**What you get back**, printed at the end and available under the attempt directory:
+
+```text
+C:\K8\attempts\k8-repro-YYYYMMDD-NNN\
+  transcript.txt             one ordered log, from before the clone onward
+  attempt.json                \
+  repository.json              small, machine-readable identity records
+  environment.json            /
+  steps.jsonl                 one line per Invoke-K8Step.ps1 call, with exit codes
+  knowledge-leak-log.md        \  Sec6.2 knowledge-leak log, human + machine forms
+  knowledge-leak-log.jsonl     /
+  stop-reason.txt             written by Finalize-K8Attempt.ps1
+  final-status.json           outcome, reason, final HEAD/status -- not a Gate K8 verdict
+  manifest.sha256             sha256 of every file above, before archiving
+
+C:\K8\attempts\k8-repro-YYYYMMDD-NNN.zip           the attempt directory, archived
+C:\K8\attempts\k8-repro-YYYYMMDD-NNN.zip.sha256    sha256 of that archive
+```
+
+**Using it while you follow this README:**
+
+- Run a command with recorded exit-code capture: `.\Study01\tools\Invoke-K8Step.ps1 -AttemptDir $AttemptDir -Description '...' -Command { <command> }`. If a step's protocol expects a non-zero exit code (the Range C validator does — §5.3, §6.1), pass `-ExpectedExitCode 1` rather than treating it as a failure.
+- Record a knowledge-leak entry in one line: `.\Study01\tools\Record-K8KnowledgeLeak.ps1 -AttemptDir $AttemptDir -Reason '...'`.
+- Close the attempt when you are done, success or failure: `.\Study01\tools\Finalize-K8Attempt.ps1 -AttemptDir $AttemptDir -Outcome Success|Failed -Reason '...'`.
+
+**When something fails:** a critical step run through `Invoke-K8Step.ps1` stops there by default and tells you to finalize as `Failed`. Do that — do not install the missing thing from memory and re-run the same step. §7 of this README already tells you how to classify what happened; the harness only makes sure the attempt is closed and archived either way, with its own attempt ID, never repaired or reused in place.
 
 ## 4. Dependencies you must fetch
 
