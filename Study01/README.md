@@ -53,14 +53,15 @@ Study01/
 | Shell | **PowerShell 7**. The apparatus rejects other shells at preflight — Git Bash / MSYS rewrites bare in-container paths, which silently breaks capture and sender steps. This is enforced, not advisory. |
 | OS | Windows with Docker Desktop. The original runs used Windows 11. |
 | Docker | Docker Engine with Compose v2 (`docker compose`, not `docker-compose`). |
-| Python | 3.10 or later, with `pytest` if you want to run the apparatus tests. Range C additionally needs `pydantic` 2.x and `PyYAML`, which the validator's own repository declares. |
+| Python | 3.10 or later. `pytest` is required — §3.1's apparatus-integrity check is mandatory, not optional, before you use the apparatus. Range C additionally needs `pydantic` 2.x and `PyYAML`; §4.1 installs them from the validator's own declared requirements. |
 | `git` | any recent version |
 
 Record your own versions before you start; the original runs used Python 3.10.11, pydantic 2.12.5, PyYAML 6.0.3.
 
-Confirm the apparatus is intact before using it:
+Install `pytest`, then confirm the apparatus is intact before using it:
 
 ```powershell
+python -m pip install pytest
 cd Study01/studies/study-01-negative-result/scripts
 python -m pytest tests -q
 ```
@@ -88,7 +89,10 @@ cd ..
 
 ```powershell
 git clone --branch v0.13.0 --depth=1 https://github.com/schutzz/ot-range-amenonuboco amenonuboco-v0.13.0
+python -m pip install -r amenonuboco-v0.13.0/requirements.txt
 ```
+
+That installs `pydantic` and `PyYAML` at the versions the validator's own repository declares (`pydantic>=2.0,<3.0`, `PyYAML>=6.0` as of `v0.13.0`) — do not pin different versions here.
 
 Keep them as two separate checkouts. Do not reuse one for both.
 
