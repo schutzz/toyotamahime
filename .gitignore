@@ -1,0 +1,16 @@
+# Toyotamahime is a curated reproduction kit, not a general working
+# repository. This exists to stop exactly the class of packaging defect
+# found during K8-3 attempt review: __pycache__/*.pyc files that a local
+# `python -m pytest` run generates got committed alongside the frozen
+# apparatus, so a fresh clone carried compiled bytecode that looked (to
+# a careless reviewer) like evidence of an execution that never happened
+# in that clone. See docs/k8-packaging-certification.md.
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# K8-3 attempt certification/runbook test output. Test-Study01Packaging.ps1
+# writes its scratch fixtures and result JSON outside the repository by
+# default; this is a backstop in case a future change writes one inside.
+package-certification.json

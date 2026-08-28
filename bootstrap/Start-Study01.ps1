@@ -8,15 +8,22 @@
 .DESCRIPTION
     This script exists solely to solve one ordering problem: a K8-3
     attempt's ordered transcript should include `git clone` itself, but
-    the repo-local harness (Study01/tools/K8AttemptCommon.psm1) does not
-    exist on disk until after that clone completes. So this script
-    duplicates, in minimal form, exactly the pre-clone steps that
-    Study01/tools/K8AttemptCommon.psm1 also implements for later,
-    repo-local use (New-K8AttemptId, Initialize-K8AttemptDirectory,
-    Invoke-K8CloneToyotamahime). See that module for the canonical,
-    documented implementation; this script's copies are intentionally
-    minimal and exist only because they must run before the module is
-    available.
+    the repo-local harness (Study01/tools/) does not exist on disk until
+    after that clone completes. So this script duplicates, in minimal
+    form, exactly the pre-clone steps that Study01/tools/K8AttemptCommon.psm1
+    also implements for later, repo-local use (New-K8AttemptId,
+    Initialize-K8AttemptDirectory, Invoke-K8CloneToyotamahime, and
+    Set-K8CurrentAttempt). See that module for the canonical, documented
+    implementation; this script's copies are intentionally minimal and
+    exist only because they must run before the module is available.
+
+    v2 change from k8-bootstrap-v1: this script now records the current
+    attempt as $env:K8_ATTEMPT_DIR (a process environment variable, not a
+    PowerShell scope variable -- it survives this script returning via
+    `& $Dest`) and a pointer file under -AttemptRoot, so that no
+    downstream tool needs an operator to type or remember an attempt
+    path. v1 left $AttemptDir as a script-local variable, which did not
+    survive `& $Dest` -- see Kakuriyo attempt k8-repro-20260828-001.
 
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
@@ -24,11 +31,11 @@
     follows is captured in the same ordered log.
 
     Provenance and trust model for this file are documented in
-    bootstrap/README.md and in Study01/README.md's "Before you clone"
-    section. In short: this file is an ordinary tracked file in the
-    public Toyotamahime repository, fetched via a URL pinned to an
-    immutable tag, and verified by SHA-256 against the value printed in
-    Study01/README.md before it is ever executed.
+    bootstrap/README.md and in Study01/README.md's Sec3.2. In short: this
+    file is an ordinary tracked file in the public Toyotamahime
+    repository, fetched via a URL pinned to an immutable tag, and
+    verified by SHA-256 against the value printed in Study01/README.md
+    before it is ever executed.
 
 .PARAMETER AttemptRoot
     Where attempt evidence directories and archives are created.
@@ -91,6 +98,23 @@ function New-BootstrapAttemptId {
 }
 
 # ----------------------------------------------------------------------
+# Minimal "current attempt" recording (pre-clone).
+# Mirrors Study01/tools/K8AttemptCommon.psm1's Set-K8CurrentAttempt.
+# This is the v2 fix: $env: is process-wide, so it survives this
+# script returning to the caller via `& $Dest`, unlike a $variable.
+# ----------------------------------------------------------------------
+
+function Set-BootstrapCurrentAttempt {
+    param([Parameter(Mandatory)] [string] $AttemptDir)
+
+    $env:K8_ATTEMPT_DIR = $AttemptDir
+
+    $AttemptRootPath = Split-Path -Parent $AttemptDir
+    $PointerPath = Join-Path $AttemptRootPath 'current-attempt.txt'
+    Set-Content -Path $PointerPath -Value $AttemptDir -Encoding utf8 -NoNewline
+}
+
+# ----------------------------------------------------------------------
 # Minimal finalize, used only if the clone itself fails -- before the
 # repo-local harness exists on disk to do this properly.
 # ----------------------------------------------------------------------
@@ -142,6 +166,8 @@ $ClonedRepoDir = Join-Path $AttemptDir 'toyotamahime'
 
 New-Item -ItemType Directory -Force -Path $AttemptDir | Out-Null
 Start-Transcript -Path (Join-Path $AttemptDir 'transcript.txt') -Force | Out-Null
+
+Set-BootstrapCurrentAttempt -AttemptDir $AttemptDir
 
 Write-Host "K8-3 attempt: $AttemptId"
 Write-Host "Attempt directory: $AttemptDir"
@@ -224,23 +250,30 @@ $Paths = Get-K8AttemptPaths -AttemptRoot $AttemptRoot -AttemptId $AttemptId
 Initialize-K8AttemptEnvironment -Paths $Paths | Out-Null
 
 # ----------------------------------------------------------------------
-# 4. Hand off to the operator. Transcript keeps running.
+# 4. Hand off to the operator. Transcript keeps running. Canonical cwd
+#    from here on is Study01/ (see Study01/README.md Sec2) -- every
+#    repo-local tool path below is written relative to that, with no
+#    "Study01\" prefix, matching every protocol/ command in this kit.
 # ----------------------------------------------------------------------
+
+$Study01Dir = Join-Path $ClonedRepoDir 'Study01'
 
 Write-Host ''
 Write-Host '=== Bootstrap complete. Continue manually from here. ===' -ForegroundColor Cyan
 Write-Host "Attempt directory : $AttemptDir"
 Write-Host "Cloned repository : $ClonedRepoDir"
 Write-Host ''
-Write-Host 'Next: open the cloned root README.md, then Study01/README.md, and follow it.'
-Write-Host 'The transcript above and below this line is one continuous ordered log.'
+Write-Host 'Next:'
+Write-Host "  cd '$Study01Dir'"
+Write-Host '  Then open the repository root README.md, then Study01\README.md, and follow it.'
+Write-Host '  The transcript above and below this line is one continuous ordered log.'
 Write-Host ''
-Write-Host 'Tools available from the cloned repo (run from anywhere, or cd into it first):'
-Write-Host "  Import-Module '$ModulePath'"
-Write-Host "  Invoke-K8Step -Paths `$Paths -Description '...' -Command { <command> }"
-Write-Host "  or: .\Study01\tools\Invoke-K8Step.ps1 -AttemptDir '$AttemptDir' -Description '...' -Command { <command> }"
-Write-Host "  .\Study01\tools\Record-K8KnowledgeLeak.ps1 -AttemptDir '$AttemptDir' -Reason '...'"
-Write-Host "  .\Study01\tools\Finalize-K8Attempt.ps1 -AttemptDir '$AttemptDir' -Outcome Success|Failed -Reason '...'"
+Write-Host 'From Study01\ (the canonical cwd -- do not prefix tool paths with Study01\ again):'
+Write-Host "  .\tools\Invoke-K8Step.ps1 -Description '...' -Command { <command> }"
+Write-Host "  .\tools\Record-K8KnowledgeLeak.ps1 '...'"
+Write-Host "  .\tools\Stop-K8.ps1 '...'                 # closes as Failed"
+Write-Host "  .\tools\Stop-K8.ps1 -Success '...'        # closes as Success"
 Write-Host ''
+Write-Host 'None of these need an -AttemptDir; this attempt is already the current one.'
 Write-Host 'Do not remediate a missing dependency or failed step from memory.'
 Write-Host 'If the README does not tell you how, record it and close this attempt as Failed.'

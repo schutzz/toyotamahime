@@ -13,6 +13,14 @@ Scope discipline (read before editing this file):
     review, over evidence this module only helps collect.
   - A failed attempt is retained under its own ID. Nothing here repairs
     or reuses an existing attempt directory.
+
+Operator-facing functions in this module take an explicit -Paths object
+(from Get-K8AttemptPaths) -- that keeps the module's own API unambiguous
+and easy to unit-test. The convenience of *not* having to know or type
+an attempt path lives one layer up, in the thin tools/*.ps1 CLI wrappers,
+which call Resolve-K8AttemptDir before calling into this module. See
+Resolve-K8AttemptDir below for exactly what an operator does and does
+not need to provide.
 #>
 
 Set-StrictMode -Version Latest
@@ -134,12 +142,115 @@ function Get-K8AttemptPaths {
     }
 }
 
+function Get-K8CurrentAttemptPointerPath {
+    <#
+        Path to the small pointer file that records "the current attempt"
+        across a fresh PowerShell process/session -- $env:K8_ATTEMPT_DIR
+        alone only survives within one process.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $AttemptRoot
+    )
+
+    Join-Path $AttemptRoot 'current-attempt.txt'
+}
+
+function Set-K8CurrentAttempt {
+    <#
+        Records which attempt is "current" two ways, so no tool ever
+        needs an operator to type or remember an attempt path:
+
+        1. $env:K8_ATTEMPT_DIR -- a process *environment* variable, not a
+           PowerShell scope variable. Setting it here, even from inside a
+           script invoked as `& $Dest`, is visible to the caller after
+           that script returns, because environment variables belong to
+           the whole process, not to a PowerShell scope. This is what
+           fixes the original defect: Start-Study01.ps1 no longer needs
+           to export a $AttemptDir *variable* across a scope boundary --
+           it sets an *environment* variable instead, which was never
+           scope-bound in the first place.
+        2. A one-line pointer file under $AttemptRoot, for the case where
+           the operator closes and reopens their terminal (a fresh
+           process has no inherited $env: from the old one either, on
+           Windows, once the parent process is gone).
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $AttemptDir
+    )
+
+    $env:K8_ATTEMPT_DIR =
+        $AttemptDir
+
+    $AttemptRoot =
+        Split-Path -Parent $AttemptDir
+
+    $PointerPath =
+        Get-K8CurrentAttemptPointerPath -AttemptRoot $AttemptRoot
+
+    Set-Content -Path $PointerPath -Value $AttemptDir -Encoding utf8 -NoNewline
+}
+
+function Resolve-K8AttemptDir {
+    <#
+        Resolves "the current attempt directory" without requiring an
+        operator to have typed, copied, or remembered it. Priority:
+
+        1. -Explicit, if given and non-empty -- an advanced/debug escape
+           hatch. Normal README-documented usage never needs this.
+        2. $env:K8_ATTEMPT_DIR, if set and it still exists -- the normal
+           case within the PowerShell session Start-Study01.ps1 was run
+           in.
+        3. The current-attempt pointer file under -AttemptRootHint -- the
+           normal case in a fresh session/process.
+
+        Throws with an actionable message if none of the above resolves,
+        rather than silently guessing at a path.
+    #>
+    param(
+        [string] $Explicit = '',
+        [string] $AttemptRootHint = 'C:\K8\attempts'
+    )
+
+    if ($Explicit) {
+        if (-not (Test-Path $Explicit)) {
+            throw "Explicit -AttemptDir does not exist: $Explicit"
+        }
+        return (Resolve-Path -LiteralPath $Explicit).Path
+    }
+
+    if ($env:K8_ATTEMPT_DIR -and (Test-Path $env:K8_ATTEMPT_DIR)) {
+        return (Resolve-Path -LiteralPath $env:K8_ATTEMPT_DIR).Path
+    }
+
+    $PointerPath =
+        Get-K8CurrentAttemptPointerPath -AttemptRoot $AttemptRootHint
+
+    if (Test-Path $PointerPath) {
+        $Pointed =
+            (Get-Content -Path $PointerPath -Raw).Trim()
+
+        if ($Pointed -and (Test-Path $Pointed)) {
+            return (Resolve-Path -LiteralPath $Pointed).Path
+        }
+    }
+
+    throw (
+        'Could not resolve the current K8-3 attempt directory. Neither ' +
+        '$env:K8_ATTEMPT_DIR nor the current-attempt pointer file under ' +
+        "'$AttemptRootHint' point at an existing directory. If you " +
+        'know the path, pass it explicitly with -AttemptDir. Otherwise, ' +
+        'this session likely never ran Start-Study01.ps1, or the ' +
+        'pointed-at attempt was moved or deleted.'
+    )
+}
+
 function Initialize-K8AttemptDirectory {
     <#
-        Creates the attempt directory and starts its transcript. Does not
-        clone anything. Idempotent only in the sense that it refuses to
-        run twice against the same ID (the directory must not already
-        exist), matching the no-overwrite rule in New-K8AttemptId.
+        Creates the attempt directory, starts its transcript, and marks
+        it as the current attempt (Set-K8CurrentAttempt) so nothing
+        downstream needs the operator to supply its path. Does not clone
+        anything. Refuses to run twice against the same ID, matching the
+        no-overwrite rule in New-K8AttemptId.
     #>
     param(
         [Parameter(Mandatory)] [string] $AttemptRoot,
@@ -160,6 +271,8 @@ function Initialize-K8AttemptDirectory {
 
     Start-Transcript -Path $Paths.Transcript -Force |
         Out-Null
+
+    Set-K8CurrentAttempt -AttemptDir $Paths.AttemptDir
 
     Write-Host "K8-3 attempt: $AttemptId"
     Write-Host "Attempt directory: $($Paths.AttemptDir)"
@@ -251,6 +364,9 @@ function Get-K8ToolVersion {
         Runs a version-probe command and returns its trimmed output, or
         an explicit "unavailable: <reason>" string. Never throws -- a
         missing optional tool must not abort environment capture.
+
+        Do not use this for wsl.exe -- its redirected output requires
+        explicit UTF-16LE decoding on this platform. Use Get-K8WslField.
     #>
     param(
         [Parameter(Mandatory)] [scriptblock] $Probe
@@ -272,6 +388,94 @@ function Get-K8ToolVersion {
     catch {
         return "unavailable: $($_.Exception.Message)"
     }
+}
+
+function Invoke-Utf16LEProcessCapture {
+    <#
+        Runs a native command and decodes its redirected stdout/stderr as
+        UTF-16LE, returning an ordinary .NET string.
+
+        Some Windows-native console binaries -- wsl.exe, confirmed on
+        this platform -- write UTF-16LE to a redirected/piped output
+        handle even though they print correctly to a real console.
+        Capturing that through PowerShell's ordinary native-command
+        pipeline (`& cmd args`) produces mojibake with embedded NUL
+        characters, exactly as Kakuriyo's K8-2 evidence documented (see
+        evidence/reproduction/k8-environment/README.md, "WSL redirection
+        encoding", and the Kakuriyo bootstrap's Invoke-WslUtf16Capture,
+        which this mirrors). Setting the child process's
+        Standard*Encoding to UTF-16LE before starting it makes .NET
+        decode the stream correctly at the source, rather than after the
+        fact.
+
+        Never throws on a non-zero exit code or a capture failure --
+        returns an "unavailable: ..." string instead, matching
+        Get-K8ToolVersion, since this is used for optional environment
+        identification, not a gating step.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $FileName,
+        [Parameter(Mandatory)] [string] $Arguments
+    )
+
+    try {
+        $Psi =
+            [System.Diagnostics.ProcessStartInfo]::new()
+
+        $Psi.FileName               = $FileName
+        $Psi.Arguments              = $Arguments
+        $Psi.RedirectStandardOutput = $true
+        $Psi.RedirectStandardError  = $true
+        $Psi.StandardOutputEncoding = [System.Text.Encoding]::Unicode
+        $Psi.StandardErrorEncoding  = [System.Text.Encoding]::Unicode
+        $Psi.UseShellExecute        = $false
+        $Psi.CreateNoWindow         = $true
+
+        $Proc =
+            [System.Diagnostics.Process]::new()
+
+        $Proc.StartInfo = $Psi
+
+        [void]$Proc.Start()
+
+        $StdOut = $Proc.StandardOutput.ReadToEnd()
+        $StdErr = $Proc.StandardError.ReadToEnd()
+
+        $Proc.WaitForExit()
+
+        $ExitCode =
+            $Proc.ExitCode
+
+        $Text =
+            ($StdOut + $StdErr).Trim()
+
+        if ($Text.Contains([char]0)) {
+            # Should never happen once decoded correctly. Surfaced
+            # explicitly rather than silently written into JSON with an
+            # embedded NUL.
+            throw 'decoded text still contains a NUL character'
+        }
+
+        if ($ExitCode -ne 0) {
+            return "unavailable: exit $ExitCode : $Text"
+        }
+
+        return $Text
+    }
+    catch {
+        return "unavailable: $($_.Exception.Message)"
+    }
+}
+
+function Get-K8WslField {
+    <#
+        wsl.exe, decoded correctly. See Invoke-Utf16LEProcessCapture.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Arguments
+    )
+
+    Invoke-Utf16LEProcessCapture -FileName 'wsl.exe' -Arguments $Arguments
 }
 
 function Initialize-K8AttemptEnvironment {
@@ -301,8 +505,8 @@ function Initialize-K8AttemptEnvironment {
             git               = Get-K8ToolVersion { git --version }
             docker            = Get-K8ToolVersion { docker --version }
             docker_compose    = Get-K8ToolVersion { docker compose version }
-            wsl_version       = Get-K8ToolVersion { wsl.exe --version }
-            wsl_status        = Get-K8ToolVersion { wsl.exe --status }
+            wsl_version       = Get-K8WslField -Arguments '--version'
+            wsl_status        = Get-K8WslField -Arguments '--status'
         }
 
     Write-K8Json -Object $Environment -Path $Paths.EnvironmentJson
@@ -374,9 +578,7 @@ function Invoke-K8Step {
         ) -ForegroundColor Red
         Write-Host (
             'Do not work around this from memory. Close this attempt: ' +
-            "Finalize-K8Attempt.ps1 -AttemptDir '$($Paths.AttemptDir)' " +
-            "-Outcome Failed -Reason `"<why>`" " +
-            "-FailingCommand `"$Description`" -FailingExitCode $ExitCode"
+            "Stop-K8.ps1 `"<why>`""
         ) -ForegroundColor Yellow
 
         if (-not $ContinueOnFailure) {
@@ -385,6 +587,31 @@ function Invoke-K8Step {
     }
 
     return $Record
+}
+
+function Get-K8LastStep {
+    <#
+        The last recorded steps.jsonl entry, or $null if none exists yet.
+        Used by Stop-K8.ps1 to auto-populate failure context so an
+        operator closing a failed attempt does not have to retype the
+        command or exit code the harness already recorded.
+    #>
+    param(
+        [Parameter(Mandatory)] $Paths
+    )
+
+    if (-not (Test-Path $Paths.StepsLog)) {
+        return $null
+    }
+
+    $LastLine =
+        Get-Content -Path $Paths.StepsLog -Tail 1
+
+    if (-not $LastLine) {
+        return $null
+    }
+
+    return ($LastLine | ConvertFrom-Json)
 }
 
 function Add-K8KnowledgeLeak {
@@ -589,11 +816,17 @@ Export-ModuleMember -Function @(
     'Write-K8Json',
     'New-K8AttemptId',
     'Get-K8AttemptPaths',
+    'Get-K8CurrentAttemptPointerPath',
+    'Set-K8CurrentAttempt',
+    'Resolve-K8AttemptDir',
     'Initialize-K8AttemptDirectory',
     'Invoke-K8CloneToyotamahime',
     'Get-K8ToolVersion',
+    'Invoke-Utf16LEProcessCapture',
+    'Get-K8WslField',
     'Initialize-K8AttemptEnvironment',
     'Invoke-K8Step',
+    'Get-K8LastStep',
     'Add-K8KnowledgeLeak',
     'Complete-K8Attempt'
 )

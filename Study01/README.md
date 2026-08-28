@@ -58,19 +58,21 @@ Study01/
 
 Record your own versions before you start; the original runs used Python 3.10.11, pydantic 2.12.5, PyYAML 6.0.3.
 
-Install `pytest`, then confirm the apparatus is intact before using it. **You are already at `Study01/`** per §2 — do not prefix the path below with `Study01/` again:
+Install `pytest`, then confirm the apparatus is intact before using it. **You are already at `Study01/`** per §2 — do not prefix any path below with `Study01/` again; that includes the repo-local tools in §3.2, which live at `.\tools\...` from here, not `.\Study01\tools\...`.
 
+<!-- k8-test:id=apparatus-check mode=exec cwd=Study01 -->
 ```powershell
 python -m pip install pytest
 cd studies/study-01-negative-result/scripts
 python -m pytest tests -q
 ```
 
-69 tests should pass. If they do not, stop and record the failure; do not continue. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically:
+69 tests should pass. If they do not, stop and record the failure; do not continue. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of `cd`-ing into it — confirmed to produce the identical result (69 passed):
 
+<!-- k8-test:id=apparatus-check-via-harness mode=exec cwd=Study01 -->
 ```powershell
-.\Study01\tools\Invoke-K8Step.ps1 -AttemptDir $AttemptDir -Description 'apparatus integrity test' `
-    -Command { python -m pytest tests -q }
+.\tools\Invoke-K8Step.ps1 -Description 'install pytest' -Command { python -m pip install pytest }
+.\tools\Invoke-K8Step.ps1 -Description 'apparatus integrity test' -Command { python -m pytest studies/study-01-negative-result/scripts/tests -q }
 ```
 
 ### 3.2 Clean-host bootstrap and attempt evidence (optional, recommended)
@@ -81,12 +83,13 @@ This section adds an **optional harness** that automates the bookkeeping around 
 
 **What it is and is not.** The harness is infrastructure for attempt lifecycle and evidence acquisition. It does not run Range A/B/C for you, does not install or fix anything you are missing, does not decide whether your attempt succeeded, and does not determine Gate K8 — Gate K8 is independent review. If a step fails, the harness's job is to make sure that failure is recorded and the attempt is closed cleanly, not to work around it.
 
-**What is downloaded, from where, and how it is verified.** `bootstrap/Start-Study01.ps1` is an ordinary file tracked in this repository (see [`bootstrap/README.md`](../bootstrap/README.md)). Fetch it from a tag-pinned URL — not a branch, which can move — and verify its SHA-256 before running it:
+**What is downloaded, from where, and how it is verified.** `bootstrap/Start-Study01.ps1` is an ordinary file tracked in this repository (see [`bootstrap/README.md`](../bootstrap/README.md)). Fetch it from a tag-pinned URL — not a branch, which can move — and verify its SHA-256 before running it. This step needs network access to GitHub, so it is not part of this repository's own pre-VM package certification (`Study01/tools/Test-Study01Packaging.ps1` — see `docs/k8-packaging-certification.md`), which mocks external network dependencies; everything after the fetch is certified.
 
+<!-- k8-test:id=bootstrap-fetch-verify-run mode=parse cwd=repo-root -->
 ```powershell
-$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v1/bootstrap/Start-Study01.ps1'
+$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v2/bootstrap/Start-Study01.ps1'
 $Dest     = Join-Path $env:TEMP 'Start-Study01.ps1'
-$Expected = '03e086fc35e2091f4f73379c2ca8cb3bb9e4f6e1fcc8f8eaa972ce2cfc9c0262'
+$Expected = 'baa61eeb25ffc5016304411363121887df436a41a5b29679182c26a12a22ae06'
 
 Invoke-WebRequest -Uri $Url -OutFile $Dest
 $Actual = (Get-FileHash -Path $Dest -Algorithm SHA256).Hash.ToLower()
@@ -97,9 +100,11 @@ if ($Actual -ne $Expected) {
 & $Dest
 ```
 
-The tag `k8-bootstrap-v1` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
+The tag `k8-bootstrap-v2` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
 
 **What it executes and where it writes.** `Start-Study01.ps1` creates a new attempt directory under `C:\K8\attempts\<attempt-id>\` (override with `-AttemptRoot`), starts a transcript there, clones `https://github.com/schutzz/toyotamahime` into it, records the exact clone `HEAD`, and captures a small environment record. It writes only under `-AttemptRoot`; it does not touch anything outside it, and it does not send anything over the network beyond the clone itself.
+
+**You never provide an attempt path.** `& $Dest` records the attempt as `$env:K8_ATTEMPT_DIR` — a process *environment* variable, which (unlike a PowerShell `$variable`) survives the bootstrap script returning to your session — and in a small pointer file under `-AttemptRoot`, for a fresh session. Every tool in `.\tools\` below resolves the current attempt from these automatically. You do not type, copy, or remember `C:\K8\attempts\...` at any point in normal use. (Advanced/debug use: every tool still accepts an explicit `-AttemptDir` override if you ever need one.)
 
 **What you get back**, printed at the end and available under the attempt directory:
 
@@ -112,21 +117,50 @@ C:\K8\attempts\k8-repro-YYYYMMDD-NNN\
   steps.jsonl                 one line per Invoke-K8Step.ps1 call, with exit codes
   knowledge-leak-log.md        \  Sec6.2 knowledge-leak log, human + machine forms
   knowledge-leak-log.jsonl     /
-  stop-reason.txt             written by Finalize-K8Attempt.ps1
+  stop-reason.txt             written by Stop-K8.ps1
   final-status.json           outcome, reason, final HEAD/status -- not a Gate K8 verdict
   manifest.sha256             sha256 of every file above, before archiving
 
 C:\K8\attempts\k8-repro-YYYYMMDD-NNN.zip           the attempt directory, archived
 C:\K8\attempts\k8-repro-YYYYMMDD-NNN.zip.sha256    sha256 of that archive
+C:\K8\attempts\current-attempt.txt                 pointer to the current attempt directory
 ```
 
-**Using it while you follow this README:**
+**Using it while you follow this README** — every command below runs from `Study01/`, and none of them take an attempt path:
 
-- Run a command with recorded exit-code capture: `.\Study01\tools\Invoke-K8Step.ps1 -AttemptDir $AttemptDir -Description '...' -Command { <command> }`. If a step's protocol expects a non-zero exit code (the Range C validator does — §5.3, §6.1), pass `-ExpectedExitCode 1` rather than treating it as a failure.
-- Record a knowledge-leak entry in one line: `.\Study01\tools\Record-K8KnowledgeLeak.ps1 -AttemptDir $AttemptDir -Reason '...'`.
-- Close the attempt when you are done, success or failure: `.\Study01\tools\Finalize-K8Attempt.ps1 -AttemptDir $AttemptDir -Outcome Success|Failed -Reason '...'`.
+<!-- k8-test:id=harness-oneliners mode=exec cwd=Study01 -->
+```powershell
+.\tools\Record-K8KnowledgeLeak.ps1 'README did not specify X'
+```
 
-**When something fails:** a critical step run through `Invoke-K8Step.ps1` stops there by default and tells you to finalize as `Failed`. Do that — do not install the missing thing from memory and re-run the same step. §7 of this README already tells you how to classify what happened; the harness only makes sure the attempt is closed and archived either way, with its own attempt ID, never repaired or reused in place.
+Run a command with recorded exit-code capture: `.\tools\Invoke-K8Step.ps1 -Description '...' -Command { <command> }`. If a step's protocol expects a non-zero exit code (the Range C validator does — §5.3, §6.1), pass `-ExpectedExitCode 1` rather than treating it as a failure.
+
+Close the attempt when you are done — exactly one of these two, never both:
+
+<!-- k8-test:id=stop-k8-failure-example mode=exec cwd=Study01 -->
+```powershell
+.\tools\Stop-K8.ps1 'README did not expose attempt context'
+```
+
+<!-- k8-test:id=stop-k8-success-example mode=exec cwd=Study01 -->
+```powershell
+.\tools\Stop-K8.ps1 -Success 'Range A/B/C completed and compared against expected/'
+```
+
+If you closed as `Failed` right after an `Invoke-K8Step.ps1` failure, you do not need to repeat the failing command or its exit code — `Stop-K8.ps1` reads them from the last `steps.jsonl` entry automatically.
+
+**When something fails:** a critical step run through `Invoke-K8Step.ps1` stops there by default and tells you to close the attempt as `Failed`. Do that — do not install the missing thing from memory and re-run the same step. §7 of this README already tells you how to classify what happened; the harness only makes sure the attempt is closed and archived either way, with its own attempt ID, never repaired or reused in place.
+
+### 3.3 A clean-VM attempt requires a certified commit
+
+**A clean-VM K8-3 attempt MUST NOT start unless package certification passes on the exact Toyotamahime commit being tested.** Before taking this kit into a clean VM:
+
+```powershell
+cd Study01
+.\tools\Test-Study01Packaging.ps1
+```
+
+This must print `PACKAGE CERTIFICATION: PASS` and exit `0`, on the commit you are about to test — not on a different commit, and not "it passed last time." A `FAIL` (nonzero exit) is not something to route around; it means this packaging has a defect a clean VM does not need to be spent discovering. See `docs/k8-packaging-certification.md` for what certification checks and how.
 
 ## 4. Dependencies you must fetch
 
@@ -136,6 +170,7 @@ Two different pinned commits of the same public repository, `https://github.com/
 
 **Range generation** (Ranges A and B), pinned to `78fc17746b5d663fafec9dffe563d79fe9ea02b7`:
 
+<!-- k8-test:id=amenonuboco-range-gen-clone mode=parse cwd=repo-root -->
 ```powershell
 git init amenonuboco-gen
 cd amenonuboco-gen
@@ -147,6 +182,7 @@ cd ..
 
 **Contract validation** (Range C), pinned to tag `v0.13.0` = `0378f8a32701b481e030f3db3d5f66ea471a4675`:
 
+<!-- k8-test:id=amenonuboco-range-c-clone mode=parse cwd=repo-root -->
 ```powershell
 git clone --branch v0.13.0 --depth=1 https://github.com/schutzz/ot-range-amenonuboco amenonuboco-v0.13.0
 python -m pip install -r amenonuboco-v0.13.0/requirements.txt
@@ -160,6 +196,7 @@ Keep them as two separate checkouts. Do not reuse one for both.
 
 The capture helper is pinned by digest and must be pulled by digest:
 
+<!-- k8-test:id=docker-pull-tcpdump mode=parse cwd=repo-root -->
 ```powershell
 docker pull corfr/tcpdump@sha256:3006b3bd9f041bf73f21e626b97cca5e78fd6ce271549ca95b8e6a508165512b
 ```
