@@ -360,6 +360,30 @@ function Initialize-K8AttemptDirectory {
     return $Paths
 }
 
+function Get-K8BootstrapDefaultRef {
+    <#
+        Extracts bootstrap/Start-Study01.ps1's own default -Ref value by
+        reading its source text -- the single source of truth for which
+        release tag the bootstrap self-pins to by default. Used by:
+        Test-Study01Packaging.ps1 (to tag its certification fixture the
+        same way a default, un-overridden bootstrap invocation expects)
+        and Test-K8ReleaseBinding.ps1 (to confirm this default actually
+        agrees with the pushed tag and the README pin after a release).
+        One implementation, so the two can never read it differently.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $BootstrapPath
+    )
+
+    $Source = Get-Content -Path $BootstrapPath -Raw
+
+    if ($Source -notmatch "\[string\]\s*\`$Ref\s*=\s*'([^']*)'") {
+        throw "Could not find a `$Ref default in $BootstrapPath"
+    }
+
+    return $Matches[1]
+}
+
 function Invoke-K8CloneToyotamahime {
     <#
         Clones the public Toyotamahime repository into the attempt
@@ -911,6 +935,7 @@ Export-ModuleMember -Function @(
     'Clear-K8CurrentAttempt',
     'Resolve-K8AttemptDir',
     'Assert-K8AttemptOpen',
+    'Get-K8BootstrapDefaultRef',
     'Initialize-K8AttemptDirectory',
     'Invoke-K8CloneToyotamahime',
     'Get-K8ToolVersion',

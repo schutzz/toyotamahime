@@ -402,27 +402,6 @@ else {
 # Fixture repository, shared by Layer B and Layer C
 # ======================================================================
 
-function Get-K8BootstrapDefaultRef {
-    <#
-        Extracts bootstrap/Start-Study01.ps1's own default -Ref value by
-        reading its source text -- the single source of truth for which
-        tag the certification fixture must also carry, so a default
-        (un-overridden) bootstrap invocation resolves the same way
-        against the fixture as it will against the real, tagged repo.
-    #>
-    param(
-        [Parameter(Mandatory)] [string] $BootstrapPath
-    )
-
-    $Source = Get-Content -Path $BootstrapPath -Raw
-
-    if ($Source -notmatch "\[string\]\s*\`$Ref\s*=\s*'([^']*)'") {
-        throw "Could not find a `$Ref default in $BootstrapPath"
-    }
-
-    return $Matches[1]
-}
-
 function New-K8PackagingFixtureRepo {
     <#
         Builds a real, local git repository from the CURRENT working tree

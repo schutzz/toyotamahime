@@ -36,6 +36,26 @@
     re-tagging a new bootstrap release, so "the commit this script's tag
     points at" and "the commit that was certified" are the same act.
 
+    v4 change from k8-bootstrap-v3: v3's own release process broke the
+    rule v3 had just introduced. `k8-bootstrap-v3` was tagged at the
+    commit that added the -Ref pin, but a follow-up commit (fixing a
+    dirty-tree-detection bug in Test-Study01Packaging.ps1 itself) landed
+    immediately after, and was never re-tagged. The clean-tree,
+    gate-eligible certification run that actually printed
+    `PACKAGE CERTIFICATION: PASS` ran on that follow-up commit, not on
+    the one `k8-bootstrap-v3` names -- i.e. the tagged commit was not the
+    certified commit, exactly the failure mode v3 exists to prevent, now
+    reintroduced by process error rather than by code. `k8-bootstrap-v3`
+    is left exactly as it was (an immutable tag is never moved); v4 is a
+    fresh commit, fresh certification run, fresh tag, and adds
+    Study01/tools/Test-K8ReleaseBinding.ps1 -- a small, separate,
+    post-release check (run after pushing and tagging, not as part of
+    Test-Study01Packaging.ps1, since the tag does not exist yet during
+    pre-push certification) that confirms the pushed tag's target, this
+    script's own -Ref default, and Study01/README.md's pin all name the
+    same commit, mechanically, rather than relying on a maintainer to
+    remember.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -58,7 +78,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v3` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v4` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -67,7 +87,13 @@
 
     NOTE FOR MAINTAINERS: this default must be updated, together with
     Study01/README.md's bootstrap SHA-256/tag and a new immutable tag,
-    every time this script's content changes. See
+    every time this script's content changes -- including a change to
+    this file made *after* certifying and tagging a commit, which must
+    become its own new commit, certified and tagged again from scratch
+    (see the v4 changelog note above for exactly this happening once
+    already). Run Study01/tools/Test-K8ReleaseBinding.ps1 after pushing
+    and tagging to confirm the tag, this default, and the README pin
+    all agree, rather than trusting memory. See
     docs/k8-packaging-certification.md.
 #>
 
@@ -77,7 +103,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v3'
+    [string] $Ref = 'k8-bootstrap-v4'
 )
 
 Set-StrictMode -Version Latest
