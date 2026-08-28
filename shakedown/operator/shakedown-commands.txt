@@ -1,0 +1,25 @@
+K8-3 Shakedown -- operator copy/paste reference
+================================================
+Not a formal K8-3 attempt. Not Gate K8 evidence. See ../README.md.
+
+This file only calls the scripts in ../tools/. It does not restate what they
+do -- read ../README.md and the script comments for that, so this file never
+drifts out of sync with the actual implementation.
+
+One-time, per VM/session (run from inside the cloned repo's shakedown/ dir):
+
+    .\tools\Start-K8Shakedown.ps1
+
+Then, in order, each may be re-run independently once Setup has passed:
+
+    .\tools\Run-K8ShakedownRangeA.ps1
+    .\tools\Run-K8ShakedownRangeB.ps1
+    .\tools\Run-K8ShakedownRangeC.ps1
+
+If something fails partway through a Range run: fix the branch on your dev
+machine, push, then on the VM:
+
+    git pull
+    .\tools\Run-K8ShakedownRange<X>.ps1
+
+(a fresh run ID is allocated automatically each time -- nothing to type.)
