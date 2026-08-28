@@ -473,8 +473,6 @@ function Invoke-K8ShakedownRangeAB {
     finally { Pop-Location }
     $envDir = Join-Path $RunEvidence 'environment'
     $composeHash = (Get-FileHash -Path $ComposePath -Algorithm SHA256).Hash
-    "generated compose SHA-256 (within-run integrity record only, per c2-dnp3-range-derivation.md SS2.2): $composeHash" |
-        Set-Content -Path (Join-Path $envDir 'generated-compose-hash.txt') -Encoding utf8NoBOM
 
     # 3. Execution preflight gate -- do not provision if this fails.
     Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @(
@@ -485,6 +483,12 @@ function Invoke-K8ShakedownRangeAB {
         '--path-probe', '/study/traffic/send_direct_operate.py', '/data/c2-original-path.pcap', '/data/c2-mirror-sensor.pcap'
     ) -Description 'execution preflight gate (Docker-free)' |
         ForEach-Object { $_.Output | Set-Content -Path (Join-Path $envDir 'preflight.txt') -Encoding utf8NoBOM }
+
+    # The frozen preflight requires every runtime evidence directory to be
+    # empty at invocation time. Retain the generated Compose hash only after
+    # that freshness gate has passed; writing it earlier invalidates the run.
+    "generated compose SHA-256 (within-run integrity record only, per c2-dnp3-range-derivation.md SS2.2): $composeHash" |
+        Set-Content -Path (Join-Path $envDir 'generated-compose-hash.txt') -Encoding utf8NoBOM
 
     # 4. Provision.
     Invoke-K8ShakedownCommand -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'up', '-d', '--build') `

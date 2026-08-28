@@ -136,6 +136,28 @@ Assert-K8Test 'Start-K8Shakedown.ps1 refuses to run when Study01/README.md is no
     if ($src -notmatch "README\.md.*not found") { throw 'no guard for a missing Study01/README.md found in source' }
 }
 
+Assert-K8Test 'Range A/B keeps the fresh evidence tree empty until frozen preflight passes' {
+    $modulePath = Join-Path $ToolsDir 'K8ShakedownCommon.psm1'
+    $tokens = $null; $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($modulePath, [ref]$tokens, [ref]$errors)
+    if ($errors.Count) { throw "module parse failed: $($errors -join '; ')" }
+    $function = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-K8ShakedownRangeAB'
+    }, $true)
+    if (-not $function) { throw 'Invoke-K8ShakedownRangeAB not found' }
+    $body = $function.Extent.Text
+    $preflight = $body.IndexOf("-Description 'execution preflight gate (Docker-free)'")
+    $hashWrite = $body.IndexOf("generated-compose-hash.txt")
+    if ($preflight -lt 0 -or $hashWrite -lt 0 -or $hashWrite -lt $preflight) {
+        throw "generated Compose hash must be written only after preflight PASS (preflight=$preflight hash=$hashWrite)"
+    }
+    $beforePreflight = $body.Substring(0, $preflight)
+    if ($beforePreflight -match '(?m)\b(Set-Content|Add-Content|Out-File|Export-Clixml)\b') {
+        throw "evidence-writing command found before preflight freshness gate: $($Matches[1])"
+    }
+}
+
 # --- 4. Runner argument coverage against the real scripts' own argparse ------
 #
 # Per-invocation, not whole-module: a whole-file substring search cannot tell
