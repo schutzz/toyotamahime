@@ -53,10 +53,11 @@ Layer C runs the full lifecycle twice — once ending in `Stop-K8.ps1 -Success`,
 Mocked (external dependencies a clean VM still has to prove for itself, and that this certification does not claim to):
 
 - GitHub network (the local fixture repo stands in for `https://github.com/schutzz/toyotamahime`)
-- pip network (Python packages still install for real, from whatever index is configured on the certifying machine — not mocked further)
 - Docker runtime (§4.2's `docker pull` is `parse`-only)
 - The Amenonuboco remote (§4.1's clones are `parse`-only)
 - Range A/B/C runtime execution (out of scope for this certification entirely — it governs K8-3 packaging, not Amenonuboco-provisioned range behavior)
+
+**Not mocked, and worth calling out because it is easy to assume otherwise:** pip/PyPI network access. `apparatus-check` genuinely runs `pip install pytest` against whatever package index the certifying machine is configured for, and then runs the real 69-test suite. A machine with no route to PyPI fails Layer C for that reason — correctly, since a clean VM without one would fail identically.
 
 Never mocked, per the original defect classes this exists to catch:
 
@@ -75,9 +76,23 @@ Two checks need no execution at all and run over every extracted block regardles
 - **Double `Study01\` prefix detection**: any block declaring `cwd=Study01` whose text still references `Study01\tools` or `Study01\studies` is flagged — the exact defect class found during review, now caught even in a block that is never executed (a `parse`-mode example could still carry this mistake).
 - **`display` block hygiene**: a `display`-mode block whose text looks like a real command is flagged as a finding, not silently accepted.
 
+## What "certified commit" actually means
+
+Two review findings against the first version of this gate were both about the same underlying gap: a certification result naming commit X did not actually guarantee X was what got tested, or what a VM would later clone.
+
+**The commit under test must be committed and clean.** `Test-Study01Packaging.ps1` runs `git status --porcelain` on `-RepoRoot` before anything else. A dirty tree (or a directory that is not a git repository at all) is refused outright unless `-AllowDirty` is passed explicitly; passing it relabels the entire run as a `DEVELOPMENT CHECK -- NOT ELIGIBLE FOR VM GATE` and the script never prints the `PACKAGE CERTIFICATION: PASS/FAIL (commit X)` line for that run. `package-certification.json`'s `gate_eligible` field records the same distinction machine-readably. This exists because certifying a working tree and reporting the result under the last *commit's* SHA is not certifying that commit.
+
+**The commit `git clone` will actually fetch must be the one that was certified.** This is `bootstrap/Start-Study01.ps1`'s `-Ref` default: rather than defaulting to empty (whatever the default branch's HEAD happens to be *when a VM runs it*, which can be a different commit than whatever was certified earlier), it defaults to this script's own release tag (`k8-bootstrap-v3` as of this writing). That tag is only ever created pointing at a commit that has already passed certification, so "the commit the tag names" and "the commit that was certified" are the same act, not two things that can drift apart. `Test-Study01Packaging.ps1` builds its local git fixture with that same tag on its single commit (`Get-K8BootstrapDefaultRef` reads the pin out of the bootstrap script's own source, so there is exactly one place that name lives) and includes a dedicated regression check: add a further commit to the fixture's default branch *after* tagging (simulating "someone pushed to `main` after this commit was certified, before a VM ran"), then run bootstrap with its default, un-overridden `-Ref`, and assert the cloned `HEAD` is the *tagged* commit, not the drifted branch tip.
+
+Cutting a new bootstrap version means updating, together, in one commit: the script's own `$Ref` default, `Study01/README.md` §3.2's pinned tag name and SHA-256 (verified against the actual git blob, not the working-tree file — see the project's own commit history for why), and creating the new tag after that commit lands. `Test-Study01Packaging.ps1`'s "default -Ref is non-empty" check catches the case where a future edit reverts the default to blank; it cannot catch a maintainer forgetting to also move the tag, since certification runs before the tag exists for a not-yet-tagged commit — that step stays a documented part of the release process (§21 of the corresponding review), not something this script can self-verify.
+
+## Closed-attempt immutability
+
+A closed attempt (`final-status.json` exists) is treated as immutable. `Invoke-K8Step`, `Add-K8KnowledgeLeak`, and `Complete-K8Attempt` itself all refuse to run against one (`Assert-K8AttemptOpen`, and an explicit re-entry guard in `Complete-K8Attempt`), regardless of whether the attempt path came from auto-resolution or an explicit `-AttemptDir` override. `Complete-K8Attempt` also clears `$env:K8_ATTEMPT_DIR` (if it still points at the attempt being closed) and deletes the current-attempt pointer file (same condition) on a successful close, so nothing downstream can auto-resolve back into a just-closed attempt by accident. Layer C certifies this directly: after each lifecycle pass closes, it spawns real child processes that attempt `Record-K8KnowledgeLeak.ps1`, `Invoke-K8Step.ps1`, and a second `Stop-K8.ps1` against the now-closed attempt (via explicit `-AttemptDir`, since auto-resolution should already find nothing) and asserts all three fail, then re-hashes `manifest.sha256` to confirm the directory was not actually touched.
+
 ## Output
 
-Console output names every check as `PASS`/`FAIL` with `[Layer] check` and, on failure, the specific reason (never a bare "N assertions failed"). A machine-readable `package-certification.json` (path via `-ResultPath`, default under `$env:TEMP`) records `commit`, `timestamp_utc`, per-layer pass booleans, the full findings list, and `overall`. This file is runtime evidence about *a certification run*, not repository content — it is not committed, and `.gitignore` backstops that.
+Console output names every check as `PASS`/`FAIL`/`SKIP` with `[Layer] check` and, on failure, the specific reason (never a bare "N assertions failed"). `SKIP` (not a silent pass, not a failure) is reserved for a check whose precondition genuinely does not hold on the certifying machine — currently only the WSL unit check on a machine with no `wsl.exe` at all. A machine-readable `package-certification.json` (path via `-ResultPath`, default under `$env:TEMP`) records `commit`, `timestamp_utc`, `gate_eligible`, per-layer pass booleans, the full findings list, and `overall`. This file is runtime evidence about *a certification run*, not repository content — it is not committed, and `.gitignore` backstops that.
 
 ## Running it
 
@@ -85,6 +100,8 @@ Console output names every check as `PASS`/`FAIL` with `[Layer] check` and, on f
 cd Study01
 .\tools\Test-Study01Packaging.ps1
 ```
+
+Refuses to run as a gate-eligible certification against a dirty working tree (see above); pass `-AllowDirty` for a development check that is explicitly not eligible to authorize a clean-VM attempt.
 
 `-SkipUnit` / `-SkipIntegration` / `-SkipRunbook` exist for fast iteration while developing a change to the harness itself; a certification that is allowed to gate a clean-VM attempt does not use them.
 

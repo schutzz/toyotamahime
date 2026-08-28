@@ -16,13 +16,19 @@
     Advanced/debug override. Normal use resolves the current attempt
     automatically; you should not need this.
 
+.PARAMETER AttemptRootHint
+    Advanced/debug: where to look for the current-attempt pointer file
+    in a fresh PowerShell session, if you ran Start-Study01.ps1 with a
+    non-default -AttemptRoot. Normal use never needs this.
+
 .EXAMPLE
     .\tools\Initialize-K8Attempt.ps1
 #>
 
 [CmdletBinding()]
 param(
-    [string] $AttemptDir = ''
+    [string] $AttemptDir = '',
+    [string] $AttemptRootHint = 'C:\K8\attempts'
 )
 
 Set-StrictMode -Version Latest
@@ -31,7 +37,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'K8AttemptCommon.psm1') -Force
 
 $ResolvedAttemptDir =
-    Resolve-K8AttemptDir -Explicit $AttemptDir
+    Resolve-K8AttemptDir -Explicit $AttemptDir -AttemptRootHint $AttemptRootHint
 
 $AttemptRoot = Split-Path -Parent $ResolvedAttemptDir
 $AttemptId   = Split-Path -Leaf $ResolvedAttemptDir

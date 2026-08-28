@@ -14,8 +14,11 @@
     This does not judge Gate K8 and does not decide whether a
     reproduction "counts" -- it only closes the evidence record. Every
     finalization step is attempted independently, so a failure partway
-    through (for example, an archive that already exists) does not erase
-    evidence already collected.
+    through does not erase evidence already collected. A closed attempt
+    (final-status.json already exists) is immutable: running this again
+    on the same attempt refuses outright, rather than silently touching
+    an already-archived evidence directory. A retry is always a new
+    attempt with a new ID.
 
     Default outcome is Failed, since closing a failed attempt is the
     common case this script exists to make short. Pass -Success to close
@@ -39,6 +42,11 @@
     Advanced/debug override. Normal use resolves the current attempt
     automatically; you should not need this.
 
+.PARAMETER AttemptRootHint
+    Advanced/debug: where to look for the current-attempt pointer file
+    in a fresh PowerShell session, if you ran Start-Study01.ps1 with a
+    non-default -AttemptRoot. Normal use never needs this.
+
 .EXAMPLE
     .\tools\Stop-K8.ps1 'README did not expose attempt context'
 
@@ -52,7 +60,8 @@ param(
     [switch] $Success,
     [string] $FailingCommand = '',
     [Nullable[int]] $FailingExitCode = $null,
-    [string] $AttemptDir = ''
+    [string] $AttemptDir = '',
+    [string] $AttemptRootHint = 'C:\K8\attempts'
 )
 
 Set-StrictMode -Version Latest
@@ -61,7 +70,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'K8AttemptCommon.psm1') -Force
 
 $ResolvedAttemptDir =
-    Resolve-K8AttemptDir -Explicit $AttemptDir
+    Resolve-K8AttemptDir -Explicit $AttemptDir -AttemptRootHint $AttemptRootHint
 
 $AttemptRoot = Split-Path -Parent $ResolvedAttemptDir
 $AttemptId   = Split-Path -Leaf $ResolvedAttemptDir

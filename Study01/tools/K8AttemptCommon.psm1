@@ -239,9 +239,75 @@ function Resolve-K8AttemptDir {
         '$env:K8_ATTEMPT_DIR nor the current-attempt pointer file under ' +
         "'$AttemptRootHint' point at an existing directory. If you " +
         'know the path, pass it explicitly with -AttemptDir. Otherwise, ' +
-        'this session likely never ran Start-Study01.ps1, or the ' +
-        'pointed-at attempt was moved or deleted.'
+        'this session likely never ran Start-Study01.ps1, the attempt ' +
+        'was already closed (Stop-K8.ps1 clears the pointer on close), ' +
+        'or the pointed-at attempt was moved or deleted.'
     )
+}
+
+function Assert-K8AttemptOpen {
+    <#
+        Closed-attempt immutability guard. A "closed" attempt is one
+        whose final-status.json already exists -- i.e. Complete-K8Attempt
+        has already run for it. Every operation that mutates attempt
+        evidence (a new step, a new knowledge-leak entry, or a second
+        close) calls this first and refuses to proceed if the attempt is
+        closed, regardless of how its path was obtained (auto-resolved
+        or an explicit -AttemptDir override). This is what stops a
+        stray or automated call from silently drifting an already-
+        archived attempt's directory out of sync with its own manifest
+        and ZIP.
+    #>
+    param(
+        [Parameter(Mandatory)] $Paths,
+        [Parameter(Mandatory)] [string] $Operation
+    )
+
+    if (Test-Path $Paths.FinalStatusJson) {
+        throw (
+            "Attempt '$($Paths.AttemptId)' is already closed " +
+            "(final-status.json exists) -- refusing to $Operation. " +
+            'A closed attempt is immutable. If you need a new attempt, ' +
+            'start one with Start-Study01.ps1; it gets its own ID.'
+        )
+    }
+}
+
+function Clear-K8CurrentAttempt {
+    <#
+        Called by Complete-K8Attempt right after a successful close, so
+        that nothing -- $env:K8_ATTEMPT_DIR in this process, or the
+        pointer file for a fresh one -- keeps resolving to a now-closed
+        attempt as "the current one". Only clears the pointer file if it
+        still points at *this* attempt, so closing attempt A never
+        clobbers a pointer that something else has since pointed at
+        attempt B.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $AttemptDir
+    )
+
+    if ($env:K8_ATTEMPT_DIR -and
+        (Resolve-Path -LiteralPath $env:K8_ATTEMPT_DIR -ErrorAction SilentlyContinue).Path -eq
+        (Resolve-Path -LiteralPath $AttemptDir -ErrorAction SilentlyContinue).Path) {
+        $env:K8_ATTEMPT_DIR = ''
+    }
+
+    $AttemptRoot =
+        Split-Path -Parent $AttemptDir
+
+    $PointerPath =
+        Get-K8CurrentAttemptPointerPath -AttemptRoot $AttemptRoot
+
+    if (Test-Path $PointerPath) {
+        $Pointed =
+            (Get-Content -Path $PointerPath -Raw).Trim()
+
+        if ((Resolve-Path -LiteralPath $Pointed -ErrorAction SilentlyContinue).Path -eq
+            (Resolve-Path -LiteralPath $AttemptDir -ErrorAction SilentlyContinue).Path) {
+            Remove-Item -Path $PointerPath -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Initialize-K8AttemptDirectory {
@@ -536,6 +602,8 @@ function Invoke-K8Step {
         [switch] $ContinueOnFailure
     )
 
+    Assert-K8AttemptOpen -Paths $Paths -Operation 'record a new step'
+
     $Start =
         Get-Date
 
@@ -629,6 +697,8 @@ function Add-K8KnowledgeLeak {
         [switch] $PriorKnowledgeUsed
     )
 
+    Assert-K8AttemptOpen -Paths $Paths -Operation 'record a knowledge-leak entry'
+
     $Timestamp =
         (Get-Date).ToUniversalTime().ToString('o')
 
@@ -680,6 +750,15 @@ function Complete-K8Attempt {
         [string] $FailingCommand = '',
         [Nullable[int]] $FailingExitCode = $null
     )
+
+    if (Test-Path $Paths.FinalStatusJson) {
+        throw (
+            "Attempt '$($Paths.AttemptId)' is already closed " +
+            '(final-status.json exists) -- refusing a second close. ' +
+            'A closed attempt is immutable; a retry is a new attempt ' +
+            'with a new ID from Start-Study01.ps1.'
+        )
+    }
 
     Write-Host ''
     Write-Host "=== K8 STEP: finalize attempt ($Outcome) ===" -ForegroundColor Cyan
@@ -810,6 +889,17 @@ function Complete-K8Attempt {
         Write-Warning "Failed to create archive/hash: $($_.Exception.Message)"
         Write-Warning "Evidence directory is still intact and unarchived at: $($Paths.AttemptDir)"
     }
+
+    # 7. Clear "current attempt" state -- $env:K8_ATTEMPT_DIR in this
+    #    process and the pointer file, if either still points here --
+    #    so nothing downstream auto-resolves back into a closed attempt.
+    #    Best-effort: a failure here does not un-close the attempt.
+    try {
+        Clear-K8CurrentAttempt -AttemptDir $Paths.AttemptDir
+    }
+    catch {
+        Write-Warning "Failed to clear current-attempt state: $($_.Exception.Message)"
+    }
 }
 
 Export-ModuleMember -Function @(
@@ -818,7 +908,9 @@ Export-ModuleMember -Function @(
     'Get-K8AttemptPaths',
     'Get-K8CurrentAttemptPointerPath',
     'Set-K8CurrentAttempt',
+    'Clear-K8CurrentAttempt',
     'Resolve-K8AttemptDir',
+    'Assert-K8AttemptOpen',
     'Initialize-K8AttemptDirectory',
     'Invoke-K8CloneToyotamahime',
     'Get-K8ToolVersion',

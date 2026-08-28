@@ -25,6 +25,17 @@
     path. v1 left $AttemptDir as a script-local variable, which did not
     survive `& $Dest` -- see Kakuriyo attempt k8-repro-20260828-001.
 
+    v3 change from k8-bootstrap-v2: -Ref now defaults to this script's
+    own release tag (see below) instead of an empty string. v2 cloned
+    whatever the default branch's HEAD happened to be at clone time --
+    which meant a commit landing on that branch *after* a commit was
+    package-certified, but *before* a VM attempt actually ran, would be
+    the commit the VM tested, silently, with no certification of its
+    own. Pinning -Ref by default to this script's own tag closes that
+    gap: the tag is only ever moved forward as part of certifying and
+    re-tagging a new bootstrap release, so "the commit this script's tag
+    points at" and "the commit that was certified" are the same act.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -46,8 +57,18 @@
     at a private fork or a local working copy as a substitute.
 
 .PARAMETER Ref
-    Optional branch/tag/commit to check out after cloning. Leave empty to
-    reproduce against the default branch as it stands when you run this.
+    Branch/tag/commit to check out after cloning. Defaults to this
+    script's own release tag, `k8-bootstrap-v3` -- the same tag pinned
+    in Study01/README.md Sec3.2 for fetching this file, and the exact
+    commit that was package-certified before that tag was created. Pass
+    an explicit value only if you have a specific, disclosed reason to
+    test a different commit; doing so means you are no longer testing a
+    certified commit; see Study01/README.md Sec3.3.
+
+    NOTE FOR MAINTAINERS: this default must be updated, together with
+    Study01/README.md's bootstrap SHA-256/tag and a new immutable tag,
+    every time this script's content changes. See
+    docs/k8-packaging-certification.md.
 #>
 
 [CmdletBinding()]
@@ -56,7 +77,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = ''
+    [string] $Ref = 'k8-bootstrap-v3'
 )
 
 Set-StrictMode -Version Latest

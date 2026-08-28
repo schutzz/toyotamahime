@@ -58,16 +58,17 @@ Study01/
 
 Record your own versions before you start; the original runs used Python 3.10.11, pydantic 2.12.5, PyYAML 6.0.3.
 
-Install `pytest`, then confirm the apparatus is intact before using it. **You are already at `Study01/`** per §2 — do not prefix any path below with `Study01/` again; that includes the repo-local tools in §3.2, which live at `.\tools\...` from here, not `.\Study01\tools\...`.
+Install `pytest`, then confirm the apparatus is intact before using it. **You are already at `Study01/`** per §2 — do not prefix any path below with `Study01/` again; that includes the repo-local tools in §3.2, which live at `.\tools\...` from here, not `.\Study01\tools\...`. `Push-Location`/`Pop-Location` below returns you to `Study01/` when it's done, rather than leaving you three directories deeper — important if you continue on to §3.2's tools next, which need to be run from `Study01/`:
 
 <!-- k8-test:id=apparatus-check mode=exec cwd=Study01 -->
 ```powershell
 python -m pip install pytest
-cd studies/study-01-negative-result/scripts
+Push-Location studies/study-01-negative-result/scripts
 python -m pytest tests -q
+Pop-Location
 ```
 
-69 tests should pass. If they do not, stop and record the failure; do not continue. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of `cd`-ing into it — confirmed to produce the identical result (69 passed):
+69 tests should pass. If they do not, stop and record the failure; do not continue. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (69 passed):
 
 <!-- k8-test:id=apparatus-check-via-harness mode=exec cwd=Study01 -->
 ```powershell
@@ -87,9 +88,9 @@ This section adds an **optional harness** that automates the bookkeeping around 
 
 <!-- k8-test:id=bootstrap-fetch-verify-run mode=parse cwd=repo-root -->
 ```powershell
-$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v2/bootstrap/Start-Study01.ps1'
+$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v3/bootstrap/Start-Study01.ps1'
 $Dest     = Join-Path $env:TEMP 'Start-Study01.ps1'
-$Expected = 'baa61eeb25ffc5016304411363121887df436a41a5b29679182c26a12a22ae06'
+$Expected = '8a164b252a8567afaaceaf27318facd322f15fdb8c86f96db57279fe0a5816a0'
 
 Invoke-WebRequest -Uri $Url -OutFile $Dest
 $Actual = (Get-FileHash -Path $Dest -Algorithm SHA256).Hash.ToLower()
@@ -100,7 +101,7 @@ if ($Actual -ne $Expected) {
 & $Dest
 ```
 
-The tag `k8-bootstrap-v2` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
+The tag `k8-bootstrap-v3` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. `Start-Study01.ps1` also checks out that same tag by default when it clones Toyotamahime (its `-Ref` parameter defaults to `k8-bootstrap-v3`), so the commit you fetched this script from and the commit your attempt actually reproduces are the same one, even if `main` has moved on by the time you run this. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
 
 **What it executes and where it writes.** `Start-Study01.ps1` creates a new attempt directory under `C:\K8\attempts\<attempt-id>\` (override with `-AttemptRoot`), starts a transcript there, clones `https://github.com/schutzz/toyotamahime` into it, records the exact clone `HEAD`, and captures a small environment record. It writes only under `-AttemptRoot`; it does not touch anything outside it, and it does not send anything over the network beyond the clone itself.
 

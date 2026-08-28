@@ -23,12 +23,15 @@
       process, in the README's own documented cwd. This is what keeps
       the README itself under test, not a hand-copied paraphrase of it.
 
-    What gets mocked: GitHub network, pip network, Docker runtime,
-    Amenonuboco remote, range runtime -- exactly the external
-    dependencies a clean VM would still need to prove for itself.
-    Everything else (git, PowerShell process/scope boundaries, cwd,
-    environment-variable handoff, CLI parameter parsing, transcript
-    open/close, archive/hash) is the real thing.
+    What gets mocked: GitHub network (a local git fixture stands in for
+    it) and, by not executing them, Docker runtime, Amenonuboco remote,
+    and range runtime. pip/PyPI network is NOT mocked -- Layer C's
+    apparatus-check blocks genuinely `pip install pytest` and run the
+    real 69-test suite; a machine with no route to PyPI correctly fails
+    Layer C, the same way a clean VM without one would. Everything else
+    (git, PowerShell process/scope boundaries, cwd, environment-variable
+    handoff, CLI parameter parsing, transcript open/close, archive/hash)
+    is the real thing.
 
     Does not remediate anything it finds broken, and never will --
     fixture/test setup here is not the same thing as production-attempt
@@ -61,6 +64,7 @@ param(
     [switch] $SkipUnit,
     [switch] $SkipIntegration,
     [switch] $SkipRunbook,
+    [switch] $AllowDirty,
     [string] $ResultPath = (Join-Path $env:TEMP "package-certification-$(Get-Date -Format yyyyMMddHHmmssfff).json")
 )
 
@@ -76,14 +80,53 @@ $BootstrapPath = Join-Path $RepoRoot 'bootstrap\Start-Study01.ps1'
 Import-Module (Join-Path $ToolsPath 'K8AttemptCommon.psm1') -Force
 Import-Module (Join-Path $ToolsPath 'K8ReadmeRunbook.psm1') -Force
 
+# ======================================================================
+# Commit identity and dirty-tree gating.
+#
+# "PACKAGE CERTIFICATION: PASS (commit X)" is a claim about commit X
+# specifically. It must never be printed for a working tree that has
+# uncommitted changes on top of X -- that would certify bytes that were
+# never actually committed as X. A dirty tree can still be checked (for
+# fast iteration while developing a harness change), but its result is
+# labeled DEVELOPMENT CHECK and is explicitly not eligible to gate a
+# clean-VM attempt, and -AllowDirty must be passed to acknowledge that
+# on purpose.
+# ======================================================================
+
 $CommitSha =
     try { (& git -C $RepoRoot rev-parse HEAD 2>$null).Trim() } catch { $null }
 
-if (-not $CommitSha) { $CommitSha = '(uncommitted working tree)' }
+$IsGitRepo = [bool]$CommitSha
+
+$PorcelainStatus =
+    if ($IsGitRepo) { @(& git -C $RepoRoot status --porcelain 2>$null) } else { @() }
+
+$IsDirty = ($PorcelainStatus.Count -gt 0) -or (-not $IsGitRepo)
+
+if ($IsDirty -and -not $AllowDirty) {
+    Write-Host 'K8-3 package certification' -ForegroundColor Cyan
+    Write-Host "Repository : $RepoRoot"
+    Write-Host ''
+    Write-Host 'REFUSING TO RUN: the working tree has uncommitted changes (or is not a git repository).' -ForegroundColor Red
+    Write-Host 'A certification run against a dirty tree cannot say PASS/FAIL "for commit X" honestly,' -ForegroundColor Red
+    Write-Host 'because commit X on disk is not what would actually be cloned into a clean VM.' -ForegroundColor Red
+    Write-Host ''
+    Write-Host 'Commit your changes first, then re-run this script -- that is the certification-eligible path.'
+    Write-Host 'To run anyway for fast local iteration on a harness change in progress (NOT eligible for the'
+    Write-Host 'clean-VM gate), pass -AllowDirty explicitly.'
+    exit 2
+}
+
+if (-not $CommitSha) { $CommitSha = '(uncommitted working tree -- not eligible for the VM gate)' }
+
+$GateEligible = $IsGitRepo -and -not $IsDirty
 
 Write-Host "K8-3 package certification"
 Write-Host "Repository : $RepoRoot"
 Write-Host "Commit     : $CommitSha"
+if (-not $GateEligible) {
+    Write-Host 'Mode       : DEVELOPMENT CHECK -- NOT ELIGIBLE FOR VM GATE (dirty working tree, -AllowDirty)' -ForegroundColor Yellow
+}
 Write-Host ''
 
 # ======================================================================
@@ -96,7 +139,7 @@ function Add-Finding {
     param(
         [Parameter(Mandatory)] [string] $Layer,
         [Parameter(Mandatory)] [string] $Check,
-        [Parameter(Mandatory)] [ValidateSet('PASS', 'FAIL')] [string] $Status,
+        [Parameter(Mandatory)] [ValidateSet('PASS', 'FAIL', 'SKIP')] [string] $Status,
         [string] $Detail = ''
     )
 
@@ -107,13 +150,14 @@ function Add-Finding {
         detail = $Detail
     })
 
-    if ($Status -eq 'PASS') {
-        Write-Host "PASS: [$Layer] $Check" -ForegroundColor Green
-    }
-    else {
-        Write-Host "FAIL: [$Layer] $Check" -ForegroundColor Red
-        if ($Detail) {
-            Write-Host "  reason: $Detail" -ForegroundColor Red
+    switch ($Status) {
+        'PASS' { Write-Host "PASS: [$Layer] $Check" -ForegroundColor Green }
+        'SKIP' { Write-Host "SKIP: [$Layer] $Check -- $Detail" -ForegroundColor Yellow }
+        default {
+            Write-Host "FAIL: [$Layer] $Check" -ForegroundColor Red
+            if ($Detail) {
+                Write-Host "  reason: $Detail" -ForegroundColor Red
+            }
         }
     }
 }
@@ -124,6 +168,13 @@ function Invoke-Check {
         throwing (and does not itself call Add-Finding), FAIL with the
         exception message if it throws. Keeps each check's failure
         isolated from the rest of the suite.
+
+        A body that wants to report "not applicable on this machine"
+        rather than a failure -- the WSL check on a machine with no
+        wsl.exe, for example -- throws a message starting with
+        "SKIPPED:"; that is recorded as SKIP, which does not count
+        toward the overall FAIL total, and is never silently treated as
+        a pass either.
     #>
     param(
         [Parameter(Mandatory)] [string] $Layer,
@@ -136,7 +187,13 @@ function Invoke-Check {
         Add-Finding -Layer $Layer -Check $Check -Status 'PASS'
     }
     catch {
-        Add-Finding -Layer $Layer -Check $Check -Status 'FAIL' -Detail $_.Exception.Message
+        if ($_.Exception.Message -match '^SKIPPED:\s*(.*)$') {
+            Add-Finding -Layer $Layer -Check $Check -Status 'SKIP' -Detail $Matches[1]
+        }
+        else {
+            Add-Finding -Layer $Layer -Check $Check -Status 'FAIL' -Detail $_.Exception.Message
+            if ($env:K8_CERT_DEBUG) { Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray }
+        }
     }
 }
 
@@ -305,7 +362,7 @@ if (-not $SkipUnit) {
         Invoke-Check -Layer 'Unit' -Check 'WSL field capture: real wsl.exe, human-readable, no NUL/mojibake' -Body {
             $HaveWsl = [bool](Get-Command wsl.exe -ErrorAction SilentlyContinue)
             if (-not $HaveWsl) {
-                throw 'SKIPPED (not a failure): wsl.exe not present on this machine -- cannot exercise the real fix here.'
+                throw 'SKIPPED: wsl.exe not present on this machine -- cannot exercise the real fix here.'
             }
             $Version = Get-K8WslField -Arguments '--version'
             Assert (-not $Version.Contains([char]0)) 'wsl_version contains a NUL character'
@@ -340,17 +397,48 @@ else {
 # Fixture repository, shared by Layer B and Layer C
 # ======================================================================
 
+function Get-K8BootstrapDefaultRef {
+    <#
+        Extracts bootstrap/Start-Study01.ps1's own default -Ref value by
+        reading its source text -- the single source of truth for which
+        tag the certification fixture must also carry, so a default
+        (un-overridden) bootstrap invocation resolves the same way
+        against the fixture as it will against the real, tagged repo.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $BootstrapPath
+    )
+
+    $Source = Get-Content -Path $BootstrapPath -Raw
+
+    if ($Source -notmatch "\[string\]\s*\`$Ref\s*=\s*'([^']*)'") {
+        throw "Could not find a `$Ref default in $BootstrapPath"
+    }
+
+    return $Matches[1]
+}
+
 function New-K8PackagingFixtureRepo {
     <#
         Builds a real, local git repository from the CURRENT working tree
-        (including uncommitted changes -- certification must reflect
-        what is about to be committed, not the last commit), so
-        Layer B/C's `git clone` is a real git operation against a real
-        repo, per the "do not mock git" rule, without depending on
-        network access to GitHub or on this change already being pushed.
+        (including uncommitted changes when -AllowDirty is in play --
+        certification must reflect what is about to be committed, not
+        necessarily the last commit), so Layer B/C's `git clone` is a
+        real git operation against a real repo, per the "do not mock
+        git" rule, without depending on network access to GitHub or on
+        this change already being pushed.
+
+        Also tags that single commit with bootstrap's own default -Ref
+        value (see Get-K8BootstrapDefaultRef), so a default,
+        un-overridden bootstrap invocation against this fixture resolves
+        a tag exactly the way it will against the real, released repo --
+        this is what makes the "-Ref pin" checks below meaningful rather
+        than accidentally passing because the fixture has no tags to get
+        wrong.
     #>
     param(
-        [Parameter(Mandatory)] [string] $SourceRoot
+        [Parameter(Mandatory)] [string] $SourceRoot,
+        [Parameter(Mandatory)] [string] $DefaultRefTag
     )
 
     $FixtureRoot = Join-Path $env:TEMP "k8-cert-fixture-$([guid]::NewGuid().ToString('N'))"
@@ -373,6 +461,10 @@ function New-K8PackagingFixtureRepo {
         throw 'Failed to initialize the certification fixture repository.'
     }
 
+    if ($DefaultRefTag) {
+        & git -C $FixtureRoot tag $DefaultRefTag 2>&1 | Out-Null
+    }
+
     return $FixtureRoot
 }
 
@@ -380,12 +472,25 @@ $FixtureRepo = $null
 $IntegrationAttemptRoot = $null
 $FailureAttemptRoot = $null
 $SuccessAttemptRoot = $null
+$BootstrapDefaultRef = $null
 
 if (-not $SkipIntegration -or -not $SkipRunbook) {
+    Invoke-Check -Layer 'Integration' -Check 'bootstrap: default -Ref is a specific, non-empty pin (not a floating branch)' -Body {
+        $script:BootstrapDefaultRef = Get-K8BootstrapDefaultRef -BootstrapPath $BootstrapPath
+        Assert ([bool]$BootstrapDefaultRef) 'bootstrap default -Ref is empty -- it would clone whatever the default branch HEAD is at clone time, not a certified commit'
+    }
+
+    if (-not $BootstrapDefaultRef) {
+        throw (
+            'Cannot continue Layer B/C: bootstrap has no default -Ref pin, so ' +
+            'there is nothing to certify against a fixed commit. Fix BLOCKER 1 first.'
+        )
+    }
+
     Write-Host ''
     Write-Host '--- Building local git fixture repository (mocks GitHub network only; git itself is real) ---' -ForegroundColor Cyan
-    $FixtureRepo = New-K8PackagingFixtureRepo -SourceRoot $RepoRoot
-    Write-Host "Fixture repo: $FixtureRepo"
+    $FixtureRepo = New-K8PackagingFixtureRepo -SourceRoot $RepoRoot -DefaultRefTag $BootstrapDefaultRef
+    Write-Host "Fixture repo: $FixtureRepo (tagged '$BootstrapDefaultRef')"
 }
 
 # ======================================================================
@@ -399,6 +504,13 @@ function Invoke-K8CertChildProcess {
         output. This is the real process boundary the $AttemptDir defect
         lived in -- Layer B/C must never substitute an in-process call
         for this.
+
+        -TimeoutSeconds is enforced for real: uses Process.WaitForExit(ms)
+        rather than an unbounded `&` invocation, and kills the process
+        tree (Stop-Process -Id ... -ErrorAction; taskkill /T as a
+        backstop for any grandchildren, e.g. a hung pip/pytest) on
+        timeout, returning ExitCode -1 with TimedOut = $true rather than
+        hanging the whole certification run.
     #>
     param(
         [Parameter(Mandatory)] [string] $ScriptText,
@@ -406,15 +518,47 @@ function Invoke-K8CertChildProcess {
     )
 
     $ScriptFile = Join-Path $env:TEMP "k8-cert-child-$([guid]::NewGuid().ToString('N')).ps1"
+    $StdOutFile = "$ScriptFile.out.txt"
+    $StdErrFile = "$ScriptFile.err.txt"
     Set-Content -Path $ScriptFile -Value $ScriptText -Encoding utf8
 
     try {
-        $Output = & pwsh -NoProfile -File $ScriptFile 2>&1
-        $ExitCode = $LASTEXITCODE
-        return [pscustomobject]@{ ExitCode = $ExitCode; Output = ($Output -join "`n") }
+        $Proc = Start-Process -FilePath 'pwsh' `
+            -ArgumentList @('-NoProfile', '-File', $ScriptFile) `
+            -NoNewWindow -PassThru `
+            -RedirectStandardOutput $StdOutFile `
+            -RedirectStandardError $StdErrFile
+
+        # Redirecting to files (rather than pipes/events) avoids both the
+        # classic pipe-buffer deadlock on chatty children and the
+        # cross-runspace flakiness of event-based async stream reads --
+        # simple, and reliable enough for a certification runner.
+        $Finished = $Proc.WaitForExit($TimeoutSeconds * 1000)
+
+        $ReadOutput = {
+            $Out = if (Test-Path $StdOutFile) { Get-Content $StdOutFile -Raw -ErrorAction SilentlyContinue } else { '' }
+            $Err = if (Test-Path $StdErrFile) { Get-Content $StdErrFile -Raw -ErrorAction SilentlyContinue } else { '' }
+            "$Out$Err"
+        }
+
+        if (-not $Finished) {
+            try { & taskkill /PID $Proc.Id /T /F 2>&1 | Out-Null } catch {}
+            try { if (-not $Proc.HasExited) { $Proc.Kill() } } catch {}
+            return [pscustomobject]@{
+                ExitCode = -1
+                TimedOut = $true
+                Output   = (& $ReadOutput) + "`n[k8-cert] TIMED OUT after $TimeoutSeconds seconds; process killed."
+            }
+        }
+
+        return [pscustomobject]@{
+            ExitCode = $Proc.ExitCode
+            TimedOut = $false
+            Output   = & $ReadOutput
+        }
     }
     finally {
-        Remove-Item -Path $ScriptFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $ScriptFile, $StdOutFile, $StdErrFile -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -446,6 +590,48 @@ if (-not $SkipIntegration) {
         Assert ([bool]$R.env_attempt_dir) '$env:K8_ATTEMPT_DIR was empty after `& $Dest` returned -- the original defect'
         Assert ([bool]$R.env_exists) '$env:K8_ATTEMPT_DIR did not point at an existing directory'
         Remove-Item $ResultPath1 -Force -ErrorAction SilentlyContinue
+    }
+
+    Invoke-Check -Layer 'Integration' -Check 'bootstrap: -Ref pin survives the default branch advancing past the certified commit (BLOCKER 1 regression test)' -Body {
+        # Simulate exactly the scenario the review flagged: a commit
+        # lands on the fixture's default branch AFTER the commit that
+        # was tagged/certified, before any VM attempt runs. A
+        # default (un-overridden) bootstrap invocation must still check
+        # out the TAGGED commit -- not whatever the branch tip has since
+        # become.
+        $TaggedHead = (& git -C $FixtureRepo rev-parse $BootstrapDefaultRef).Trim()
+
+        $DriftMarker = Join-Path $FixtureRepo 'k8-cert-drift-marker.txt'
+        Set-Content -Path $DriftMarker -Value 'commit landed after certification/tagging' -Encoding utf8
+        & git -C $FixtureRepo add -A 2>&1 | Out-Null
+        & git -C $FixtureRepo commit -q -m 'simulated post-certification commit (tag must not follow this)' 2>&1 | Out-Null
+        $AdvancedHead = (& git -C $FixtureRepo rev-parse HEAD).Trim()
+
+        try {
+            Assert ($AdvancedHead -ne $TaggedHead) 'test setup error: advancing commit did not change HEAD'
+
+            $DriftRoot = Join-Path $env:TEMP "k8-cert-drift-$([guid]::NewGuid().ToString('N'))"
+            $Run = Invoke-K8CertChildProcess -ScriptText "& '$BootstrapPath' -AttemptRoot '$DriftRoot' -RepoUrl '$FixtureRepo' | Out-Null"
+            Assert ($Run.ExitCode -eq 0) "bootstrap failed against the drifted fixture:`n$($Run.Output)"
+
+            $Dirs = @(Get-ChildItem -Path $DriftRoot -Directory -ErrorAction SilentlyContinue)
+            Assert ($Dirs.Count -eq 1) "expected exactly one attempt directory, got $($Dirs.Count)"
+            $Repository = Get-Content (Join-Path $Dirs[0].FullName 'repository.json') -Raw | ConvertFrom-Json
+
+            Assert ($Repository.head -eq $TaggedHead) (
+                "pin did NOT hold: cloned HEAD ($($Repository.head)) should equal the tagged/" +
+                "certified commit ($TaggedHead), not the drifted branch tip ($AdvancedHead). " +
+                'This is exactly the failure mode BLOCKER 1 described.'
+            )
+
+            Remove-Item -Recurse -Force $DriftRoot -ErrorAction SilentlyContinue
+        }
+        finally {
+            # Reset the shared fixture back to the tagged commit so later
+            # checks in this run see the intended (untampered) fixture.
+            & git -C $FixtureRepo reset -q --hard $TaggedHead 2>&1 | Out-Null
+            Remove-Item -Path $DriftMarker -Force -ErrorAction SilentlyContinue
+        }
     }
 
     Invoke-Check -Layer 'Integration' -Check 'bootstrap: duplicate invocation allocates a distinct, non-colliding attempt' -Body {
@@ -535,6 +721,11 @@ if (-not $SkipRunbook) {
         [void]$Sb.AppendLine("if (-not `$env:K8_ATTEMPT_DIR) { throw 'K8_ATTEMPT_DIR not set after bootstrap' }")
         [void]$Sb.AppendLine("`$ClonedRepo = Join-Path `$env:K8_ATTEMPT_DIR 'toyotamahime'")
         [void]$Sb.AppendLine("`$Study01Dir = Join-Path `$ClonedRepo 'Study01'")
+        # Captured now, not read again later: Stop-K8.ps1 clears
+        # $env:K8_ATTEMPT_DIR on a successful close (by design -- see
+        # Clear-K8CurrentAttempt), so anything needed after closing must
+        # be saved before that point, not re-read from the environment.
+        [void]$Sb.AppendLine("`$CapturedAttemptDir = `$env:K8_ATTEMPT_DIR")
 
         foreach ($Id in $BlockIds) {
             $Block = Get-K8ReadmeBlockById -Blocks $Blocks -Id $Id
@@ -567,7 +758,7 @@ if (-not $SkipRunbook) {
         $Script += "`nSet-Location `$Study01Dir`n"
         $StopBlock = Get-K8ReadmeBlockById -Blocks $Blocks -Id 'stop-k8-failure-example'
         $Script += "# ----- k8-test block: stop-k8-failure-example -----`n" + $StopBlock.Code + "`n"
-        $Script += "`$env:K8_ATTEMPT_DIR | Set-Content -Path (Join-Path '$FailureAttemptRoot' 'winning-attempt.txt') -NoNewline`n"
+        $Script += "`$CapturedAttemptDir | Set-Content -Path (Join-Path '$FailureAttemptRoot' 'winning-attempt.txt') -NoNewline`n"
 
         $Run = Invoke-K8CertChildProcess -ScriptText $Script -TimeoutSeconds 600
         Assert ($Run.ExitCode -eq 0) "failure-lifecycle runbook script itself errored (exit $($Run.ExitCode)):`n$($Run.Output)"
@@ -599,6 +790,35 @@ if (-not $SkipRunbook) {
             $Actual = (Get-FileHash -Path $Zip -Algorithm SHA256).Hash.ToLowerInvariant()
             Assert ($Recorded -eq $Actual) 'archive SHA-256 does not match archive bytes'
         }
+
+        Invoke-Check -Layer 'Runbook' -Check 'closed-attempt immutability: Record-K8KnowledgeLeak / Invoke-K8Step / Stop-K8 all refuse a closed attempt' -Body {
+            $Dir = $FailureAttemptDirForAssertions
+            $ManifestBefore = (Get-FileHash -Path (Join-Path $Dir 'manifest.sha256') -Algorithm SHA256).Hash
+
+            $RecordRun = Invoke-K8CertChildProcess -ScriptText @"
+`$ErrorActionPreference = 'Stop'
+Set-Location (Join-Path '$Dir' 'toyotamahime\Study01')
+& '.\tools\Record-K8KnowledgeLeak.ps1' -AttemptDir '$Dir' 'attempted mutation of a closed attempt'
+"@
+            Assert ($RecordRun.ExitCode -ne 0) 'Record-K8KnowledgeLeak.ps1 on a closed attempt should fail, but exited 0'
+
+            $StepRun = Invoke-K8CertChildProcess -ScriptText @"
+`$ErrorActionPreference = 'Stop'
+Set-Location (Join-Path '$Dir' 'toyotamahime\Study01')
+& '.\tools\Invoke-K8Step.ps1' -AttemptDir '$Dir' -Description 'attempted mutation' -Command { & cmd.exe /c "exit 0" }
+"@
+            Assert ($StepRun.ExitCode -ne 0) 'Invoke-K8Step.ps1 on a closed attempt should fail, but exited 0'
+
+            $StopAgainRun = Invoke-K8CertChildProcess -ScriptText @"
+`$ErrorActionPreference = 'Stop'
+Set-Location (Join-Path '$Dir' 'toyotamahime\Study01')
+& '.\tools\Stop-K8.ps1' -AttemptDir '$Dir' 'attempted second close'
+"@
+            Assert ($StopAgainRun.ExitCode -ne 0) 'Stop-K8.ps1 called a second time should fail, but exited 0'
+
+            $ManifestAfter = (Get-FileHash -Path (Join-Path $Dir 'manifest.sha256') -Algorithm SHA256).Hash
+            Assert ($ManifestBefore -eq $ManifestAfter) 'manifest.sha256 changed after refused mutation attempts -- the attempt was not actually left untouched'
+        }
     }
 
     # --- Success lifecycle pass -----------------------------------------
@@ -611,7 +831,7 @@ if (-not $SkipRunbook) {
         $Script += "`nSet-Location `$Study01Dir`n"
         $StopBlock = Get-K8ReadmeBlockById -Blocks $Blocks -Id 'stop-k8-success-example'
         $Script += "# ----- k8-test block: stop-k8-success-example -----`n" + $StopBlock.Code + "`n"
-        $Script += "`$env:K8_ATTEMPT_DIR | Set-Content -Path (Join-Path '$SuccessAttemptRoot' 'winning-attempt.txt') -NoNewline`n"
+        $Script += "`$CapturedAttemptDir | Set-Content -Path (Join-Path '$SuccessAttemptRoot' 'winning-attempt.txt') -NoNewline`n"
 
         $Run = Invoke-K8CertChildProcess -ScriptText $Script -TimeoutSeconds 600
         Assert ($Run.ExitCode -eq 0) "success-lifecycle runbook script itself errored (exit $($Run.ExitCode)):`n$($Run.Output)"
@@ -634,6 +854,21 @@ if (-not $SkipRunbook) {
             $Actual = (Get-FileHash -Path $Zip -Algorithm SHA256).Hash.ToLowerInvariant()
             Assert ($Recorded -eq $Actual) 'archive SHA-256 does not match archive bytes'
             Assert (Test-Path (Join-Path $Dir 'knowledge-leak-log.md')) 'knowledge-leak-log.md missing from the README-literal one-liner'
+        }
+
+        Invoke-Check -Layer 'Runbook' -Check 'closed-attempt immutability (success case): Stop-K8 refuses a second close' -Body {
+            $Dir = $SuccessAttemptDirForAssertions
+            $ManifestBefore = (Get-FileHash -Path (Join-Path $Dir 'manifest.sha256') -Algorithm SHA256).Hash
+
+            $StopAgainRun = Invoke-K8CertChildProcess -ScriptText @"
+`$ErrorActionPreference = 'Stop'
+Set-Location (Join-Path '$Dir' 'toyotamahime\Study01')
+& '.\tools\Stop-K8.ps1' -AttemptDir '$Dir' -Success 'attempted second close'
+"@
+            Assert ($StopAgainRun.ExitCode -ne 0) 'Stop-K8.ps1 -Success called a second time should fail, but exited 0'
+
+            $ManifestAfter = (Get-FileHash -Path (Join-Path $Dir 'manifest.sha256') -Algorithm SHA256).Hash
+            Assert ($ManifestBefore -eq $ManifestAfter) 'manifest.sha256 changed after a refused second close'
         }
     }
 }
@@ -660,13 +895,14 @@ $FailCount = @($Findings | Where-Object { $_.status -eq 'FAIL' }).Count
 $Overall = if ($FailCount -eq 0) { 'PASS' } else { 'FAIL' }
 
 $Result = [ordered]@{
-    commit        = $CommitSha
-    timestamp_utc = (Get-Date).ToUniversalTime().ToString('o')
-    unit_pass     = -not ($Findings | Where-Object { $_.layer -eq 'Unit' -and $_.status -eq 'FAIL' })
-    integration_pass = -not ($Findings | Where-Object { $_.layer -eq 'Integration' -and $_.status -eq 'FAIL' })
-    runbook_pass  = -not ($Findings | Where-Object { $_.layer -eq 'Runbook' -and $_.status -eq 'FAIL' })
-    findings      = $Findings
-    overall       = $Overall
+    commit            = $CommitSha
+    gate_eligible     = $GateEligible
+    timestamp_utc     = (Get-Date).ToUniversalTime().ToString('o')
+    unit_pass         = -not ($Findings | Where-Object { $_.layer -eq 'Unit' -and $_.status -eq 'FAIL' })
+    integration_pass  = -not ($Findings | Where-Object { $_.layer -eq 'Integration' -and $_.status -eq 'FAIL' })
+    runbook_pass      = -not ($Findings | Where-Object { $_.layer -eq 'Runbook' -and $_.status -eq 'FAIL' })
+    findings          = $Findings
+    overall           = $Overall
 }
 
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -677,12 +913,14 @@ Write-Host "Findings: $($Findings.Count) total, $FailCount failed"
 Write-Host "Result written to: $ResultPath"
 Write-Host ''
 
+$Label = if ($GateEligible) { 'PACKAGE CERTIFICATION' } else { 'DEVELOPMENT CHECK -- NOT ELIGIBLE FOR VM GATE' }
+
 if ($Overall -eq 'PASS') {
-    Write-Host "PACKAGE CERTIFICATION: PASS (commit $CommitSha)" -ForegroundColor Green
+    Write-Host "${Label}: PASS (commit $CommitSha)" -ForegroundColor Green
     exit 0
 }
 else {
-    Write-Host "PACKAGE CERTIFICATION: FAIL (commit $CommitSha)" -ForegroundColor Red
+    Write-Host "${Label}: FAIL (commit $CommitSha)" -ForegroundColor Red
     foreach ($F in ($Findings | Where-Object { $_.status -eq 'FAIL' })) {
         Write-Host "  FAIL: [$($F.layer)] $($F.check)" -ForegroundColor Red
         if ($F.detail) { Write-Host "    $($F.detail)" -ForegroundColor Red }
