@@ -235,8 +235,12 @@ function Install-K8RangeCDependencies {
 # apart; -Range selects which literal filename/fault behavior applies. It does
 # not change what either Range does -- it mechanically sequences the same
 # frozen CLI scripts (study01_preflight.py / study01_capture.py /
-# study01_sender.py / study01_collect.py) and the same literal docker/tc
-# commands already written in protocol/c2-dnp3-range-derivation.md,
+# study01_sender.py / study01_collect.py), the fixed Collector/Rule/R-OBS-05
+# queries against Elasticsearch (mechanical: fetching a mapping, running a
+# fixed query, saving the raw response, and computing a mechanical
+# correlation are automated; only the SCIENTIFIC judgment of what a result
+# means is left to the operator at scoring-input time), and the same literal
+# docker/tc commands already written in protocol/c2-dnp3-range-derivation.md,
 # c2-dnp3-capture-procedure.md, and c2-dnp3-sender-procedure.md, with the run
 # ID and paths substituted instead of hand-typed.
 #
@@ -248,12 +252,160 @@ function Install-K8RangeCDependencies {
 #     discipline the study's own limitations analysis is about. This function
 #     stops after finalize/verify-integrity and prints the exact
 #     study01_score.py command to run once scoring-input.json exists.
-#   - It does not execute the R-OBS-05 Elasticsearch collector query (Range B
-#     only). That query is a human correlation judgment against live
-#     Elasticsearch, not a mechanical step with a frozen CLI wrapper. This
-#     function writes the exact frozen query JSON, with T0 substituted, to
-#     contract-output/r-obs-05-query.json for copy/paste, and stops there.
+#   - It does not decide what a Collector/Rule/R-OBS-05 result MEANS
+#     scientifically (Pass/Fail/Unresolved for scoring purposes). It runs the
+#     fixed query, saves the raw response, and computes the fixed mechanical
+#     correlation the freeze documents themselves define; the classification
+#     of that into a scored field happens by hand at README SS6.2.
+#
+# LEAST-VERIFIED PART OF THIS FILE: the pcap-to-document nanosecond
+# correlation in k8_shakedown_evidence.py, and the tshark `-T fields` names
+# used by Write-K8UnrelatedPcapRows, have never been run against a real DNP3 capture
+# or a real Elasticsearch response in this development environment (no
+# Docker daemon / no live stack was available while writing this). Treat
+# their output as provisional until the first real VM run confirms the
+# field names and precision handling against actual retained bytes -- the
+# raw tshark/ES output is always retained alongside the computed result
+# specifically so a human can redo the exact SS4 decimal-nanosecond
+# comparison by hand if this code's approximation is ever in doubt.
 # ---------------------------------------------------------------------------
+
+function Get-K8ExpectedServices {
+    <# The Compose file's own declared service set -- not a hardcoded list,
+       so a manifest variant with more/fewer services is still checked
+       correctly against itself. #>
+    param(
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string] $ComposePath
+    )
+    $services = @(docker compose -p $RunId -f $ComposePath config --services 2>&1 | Where-Object { $_ -and $_.Trim() })
+    if ($LASTEXITCODE -ne 0) {
+        throw "'docker compose config --services' failed for $ComposePath"
+    }
+    if ($services.Count -eq 0) {
+        throw "Could not determine the expected service set via 'compose config --services' for $ComposePath; not proceeding without knowing what 'ready' means."
+    }
+    return $services
+}
+
+function ConvertFrom-K8ComposePsJson {
+    <# `compose ps --format json` emits either one JSON array or
+       newline-delimited JSON objects depending on Compose version. #>
+    param([string] $Raw)
+    try { return @($Raw | ConvertFrom-Json) }
+    catch {
+        return @($Raw -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
+    }
+}
+
+function Test-K8ComposeServiceReadiness {
+    param([Parameter(Mandatory)][string[]] $Expected, [Parameter(Mandatory)][object[]] $Services)
+    $byService = @{}
+    foreach ($service in $Services) {
+        if (-not $service.Service) { throw 'compose ps row has no Service field' }
+        $byService[$service.Service] = $service
+    }
+    $missing = @($Expected | Where-Object { -not $byService.ContainsKey($_) })
+    $notRunning = @($Expected | Where-Object { $byService.ContainsKey($_) -and $byService[$_].State -ne 'running' })
+    $notHealthy = @($Expected | Where-Object {
+        $byService.ContainsKey($_) -and $byService[$_].Health -and $byService[$_].Health -ne 'healthy'
+    })
+    return [pscustomobject]@{ Ready=($missing.Count -eq 0 -and $notRunning.Count -eq 0 -and $notHealthy.Count -eq 0); Missing=$missing; NotRunning=$notRunning; NotHealthy=$notHealthy }
+}
+
+function Invoke-K8ElasticsearchRequest {
+    param(
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string] $ComposePath,
+        [Parameter(Mandatory)][string] $Method,
+        [Parameter(Mandatory)][string] $Endpoint,
+        [string] $Body = '',
+        [Parameter(Mandatory)][string] $OutputPath
+    )
+    $container = (docker compose -p $RunId -f $ComposePath ps -q elasticsearch | Out-String).Trim()
+    if (-not $container) { throw 'Elasticsearch container could not be resolved' }
+    $args = @('exec', $container, 'curl', '--fail-with-body', '--silent', '--show-error', '-X', $Method,
+        "http://localhost:9200/$Endpoint", '-H', 'Content-Type: application/json')
+    if ($Body) { $args += @('--data-binary', $Body) }
+    $raw = (docker @args 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw "Elasticsearch $Method $Endpoint failed; refusing to broaden or retry the fixed request: $raw" }
+    try { $null = $raw | ConvertFrom-Json } catch { throw "Elasticsearch $Endpoint returned invalid JSON: $($_.Exception.Message)" }
+    $raw | Set-Content -Path $OutputPath -Encoding utf8NoBOM
+}
+
+function Assert-K8UnrelatedMirrorFilter {
+    param([Parameter(Mandatory)] $Gateway, [Parameter(Mandatory)][string] $RunEvidence)
+    $contractDir = Join-Path $RunEvidence 'contract-output'
+    $links = @(docker exec $Gateway.Router ip -o link show 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw 'could not enumerate gateway interfaces for the unrelated mirror-filter gate' }
+    $records = @()
+    $found = $false
+    foreach ($line in $links) {
+        if ($line -notmatch '^\d+:\s+([^:@]+)') { continue }
+        $interface = $Matches[1]
+        if ($interface -eq 'lo' -or $interface -eq $Gateway.Interface) { continue }
+        $filter = (docker exec $Gateway.Router tc filter show dev $interface parent ffff: 2>&1 | Out-String)
+        $records += "### $interface`n$filter"
+        if ($filter -match 'mirred\s+.*egress\s+mirror') { $found = $true }
+    }
+    $records -join "`n" | Set-Content -Path (Join-Path $contractDir 'unrelated-mirror-filters.txt') -Encoding utf8NoBOM
+    if (-not $found) { throw 'Range B R-OBS-05 gate failed: no unrelated gateway interface retained a mirred egress mirror filter' }
+}
+
+function Write-K8UnrelatedPcapRows {
+    param(
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string] $ComposePath,
+        [Parameter(Mandatory)][string] $RunEvidence
+    )
+    $pcap = Join-Path $RunEvidence 'sensor-input\mirror-capture\c2-mirror-sensor.pcap'
+    if (-not (Test-Path $pcap)) { throw "Range B sensor pcap missing: $pcap" }
+    $container = (docker compose -p $RunId -f $ComposePath ps -q log_structurer | Out-String).Trim()
+    if (-not $container) { throw 'log_structurer container could not be resolved for frozen pcap decode' }
+    $remote = "/tmp/$RunId-r-obs-05.pcap"
+    & docker cp $pcap "${container}:$remote" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'could not copy the retained sensor pcap for decode' }
+    $display = '(ip.src == 10.1.10.10 && ip.dst == 10.1.40.10 && tcp.dstport == 20000 && (dnp3.al.func == 1 || dnp3.al.func == 5) && dnp3.src == 1 && dnp3.dst == 20) || (ip.src == 10.1.40.10 && ip.dst == 10.1.10.10 && tcp.srcport == 20000 && dnp3.al.func == 129 && dnp3.src == 20 && dnp3.dst == 1)'
+    $raw = @(docker exec $container tshark -r $remote -Y $display -T fields -E 'separator=\t' -e frame.number -e frame.time_epoch -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e dnp3.al.func -e dnp3.src -e dnp3.dst 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "tshark unrelated-flow decode failed: $($raw -join ' ')" }
+    $rows = @()
+    foreach ($line in $raw) {
+        $columns = @($line -split "`t", -1)
+        if ($columns.Count -ne 9) { throw "unexpected tshark row shape: $line" }
+        $rows += [ordered]@{ frame_number=$columns[0]; frame_time_epoch=$columns[1]; ip_src=$columns[2]; ip_dst=$columns[3]; tcp_srcport=$columns[4]; tcp_dstport=$columns[5]; dnp3_al_func=$columns[6]; dnp3_src=$columns[7]; dnp3_dst=$columns[8] }
+    }
+    $path = Join-Path $RunEvidence 'contract-output\r-obs-05-pcap-rows.json'
+    ConvertTo-Json -InputObject @($rows) -Depth 4 | Set-Content -Path $path -Encoding utf8NoBOM
+    if ($rows.Count -eq 0) { throw 'Range B R-OBS-05 gate failed: sensor pcap contains no unrelated-flow frame' }
+    return $path
+}
+
+function Invoke-K8AutomatedQueries {
+    param(
+        [Parameter(Mandatory)][ValidateSet('a','b')][string] $Range,
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string] $ComposePath,
+        [Parameter(Mandatory)][string] $RunEvidence,
+        [Parameter(Mandatory)][string] $WindowStart,
+        [Parameter(Mandatory)][string] $WindowEnd
+    )
+    $envDir = Join-Path $RunEvidence 'environment'
+    $collectorResponse = Join-Path $RunEvidence 'collector-output\collector-response.json'
+    $ruleResponse = Join-Path $RunEvidence 'rule-output\rule-response.json'
+    Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method POST -Endpoint 'ot-logs-dnp3-*/_search' -Body (Get-Content (Join-Path $envDir 'collector-query.json') -Raw) -OutputPath $collectorResponse
+    Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method POST -Endpoint 'ot-signals-zone-violation-*/_search' -Body (Get-Content (Join-Path $envDir 'rule-query.json') -Raw) -OutputPath $ruleResponse
+    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'target-correlation', '--collector', $collectorResponse, '--rule', $ruleResponse, '--output', (Join-Path $RunEvidence 'rule-output\collector-rule-correlation.json')) -Description 'retain complete Collector hit IDs and mechanically correlate every Rule hit'
+    if ($Range -eq 'b') {
+        $mappingPath = Join-Path $RunEvidence 'contract-output\r-obs-05-mapping-response.json'
+        $mappingDecision = Join-Path $RunEvidence 'contract-output\r-obs-05-mapping-gate.json'
+        Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method GET -Endpoint 'ot-logs-dnp3-*/_mapping' -OutputPath $mappingPath
+        Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'mapping-gate', '--mapping', $mappingPath, '--output', $mappingDecision) -Description 'R-OBS-05 exact mapping field/type gate'
+        $response = Join-Path $RunEvidence 'contract-output\r-obs-05-response.json'
+        Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method POST -Endpoint 'ot-logs-dnp3-*/_search' -Body (Get-Content (Join-Path $envDir 'r-obs-05-query.json') -Raw) -OutputPath $response
+        $frames = Write-K8UnrelatedPcapRows -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
+        Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'r-obs-05', '--response', $response, '--frames', $frames, '--window-start', $WindowStart, '--window-end', $WindowEnd, '--output', (Join-Path $RunEvidence 'contract-output\r-obs-05-correlation.json')) -Description 'R-OBS-05 exact integer-nanosecond pcap/document correlation'
+    }
+}
 
 function Resolve-K8GatewayInterface {
     <# Literal transcription of c2-dnp3-capture-procedure.md SS3. #>
@@ -366,6 +518,7 @@ function Invoke-K8ShakedownRangeAB {
             -Description 'Range B fault: delete ingress qdisc (the sole permitted fault)'
         $post = docker exec $gw.Router tc filter show dev $gw.Interface parent ffff: 2>&1
         $post | Set-Content -Path (Join-Path $contractDir 'qdisc-post-fault.txt') -Encoding utf8NoBOM
+        Assert-K8UnrelatedMirrorFilter -Gateway $gw -RunEvidence $RunEvidence
     }
 
     # 6a. Runtime contract observational record (evidence-schema.md SS3: "Range
@@ -418,15 +571,9 @@ function Invoke-K8ShakedownRangeAB {
         ) -Description "capture stop/export: $stage"
     }
 
-    # 10. Write the frozen Collector and Rule queries (freeze-decision-table.md
-    # SS3) with T0 substituted, plus the Range B R-OBS-05 query, for MANUAL
-    # execution against the still-running Elasticsearch. These are written to
-    # environment/ (not into collector-output/ / rule-output/ themselves) so
-    # that those two RUNTIME_DIRS stay genuinely empty until the operator
-    # saves a real response into them -- study01_collect.py validate-evidence
-    # requires at least one retained file in every one of ground-truth,
-    # sensor-input, collector-output, rule-output, and contract-output, and a
-    # query template is not a response.
+    # 10. Instantiate the fixed queries from retained T0. The exact requests,
+    # raw responses and mechanical correlations are executed below without
+    # retries, selector changes, field substitution, or result-driven widening.
     $t0Path = Join-Path $RunEvidence 'ground-truth\metadata-t0.txt'
     if (-not (Test-Path $t0Path)) {
         throw "T0 record not found at $t0Path after stop-export; cannot window the Collector/Rule queries. This is a STOP condition -- do not proceed to teardown without it."
@@ -439,13 +586,15 @@ function Invoke-K8ShakedownRangeAB {
     $collectorQuery | Set-Content -Path (Join-Path $envDir 'collector-query.json') -Encoding utf8NoBOM
     $ruleQuery = (Get-Content (Join-Path $PSScriptRoot 'rule-query.template.json') -Raw).Replace('<WINDOW_START>', $windowStart).Replace('<WINDOW_END>', $windowEnd)
     $ruleQuery | Set-Content -Path (Join-Path $envDir 'rule-query.json') -Encoding utf8NoBOM
-    Write-K8ShakedownLog -Message "Collector query (ot-logs-dnp3-*) and Rule query (ot-signals-zone-violation-*) written to environment/ with T0 window [$windowStart, $windowEnd]. VERIFY field mapping (GET <index>/_mapping) before trusting term matches -- freeze-decision-table.md SS3."
+    Write-K8ShakedownLog -Message "Fixed Collector and Rule requests retained with T0 window [$windowStart, $windowEnd]."
 
     if ($Range -eq 'b') {
         $r0query = (Get-Content (Join-Path $PSScriptRoot 'r-obs-05-query.template.json') -Raw).Replace('<WINDOW_START>', $windowStart).Replace('<WINDOW_END>', $windowEnd)
         $r0query | Set-Content -Path (Join-Path $envDir 'r-obs-05-query.json') -Encoding utf8NoBOM
-        Write-K8ShakedownLog -Message "R-OBS-05 query (k6-r-obs-05-collector-query-contract.md) written to environment/. This is a human correlation judgment, not automated by this runner."
+        Write-K8ShakedownLog -Message 'Fixed R-OBS-05 request retained; mapping/query/correlation gates will execute mechanically.'
     }
+
+    Invoke-K8AutomatedQueries -Range $Range -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence -WindowStart $windowStart -WindowEnd $windowEnd
 
     # 11. metadata.md / deviations.md -- required by study01_collect.py validate-evidence.
     # Templated from facts this runner already retained; free-text additions are still
@@ -466,7 +615,7 @@ function Invoke-K8ShakedownRangeAB {
 | Sender container | $senderContainer |
 | Sender asset in-container SHA-256 | $inContainerSha |
 | tcpdump helper image | $($state.tcpdump_image_ref) |
-| Cleanup | NOT YET PERFORMED -- range is still up pending manual Collector/Rule query execution. Run .\tools\Complete-K8ShakedownRange.ps1 once environment/collector-output and environment/rule-output responses are saved. |
+| Cleanup | NOT YET PERFORMED -- all runtime evidence has been exported; pre-teardown validation/hash remains before destruction. |
 
 See environment/, ground-truth/, sensor-input/, contract-output/ for the machine-recorded per-step argv/exit-code/timestamp evidence this table summarizes.
 "@ | Set-Content -Path (Join-Path $RunEvidence 'metadata.md') -Encoding utf8NoBOM
@@ -478,30 +627,19 @@ See environment/, ground-truth/, sensor-input/, contract-output/ for the machine
     }
     $deviationsBody | Set-Content -Path (Join-Path $RunEvidence 'deviations.md') -Encoding utf8NoBOM
 
-    # 12. STOP HERE. The range is deliberately left running: the Collector and
-    # Rule queries (and, on Range B, R-OBS-05) can only be executed against a
-    # live Elasticsearch, and evidence-schema.md's own cleanup ordering
-    # ("only after every required artifact has been exported and hashed...
-    # remove the project") means teardown must come AFTER those responses are
-    # saved, not before. Automatically tearing down here, before those queries
-    # can be run, would make target-event Collector/Rule evidence permanently
-    # unobtainable for this run.
+    # 12. Leave the range running only until Complete performs the mandatory
+    # pre-teardown validate/finalize gate. No operator query/curl step remains.
     Set-K8ShakedownState -Updates @{
         "range_$($Range)_run_id"      = $RunId
         "range_$($Range)_evidence"    = $RunEvidence
         "range_$($Range)_compose"     = $ComposePath
-        "range_$($Range)_stage"       = 'awaiting-manual-queries'
+        "range_$($Range)_stage"       = 'awaiting-completion'
     }
 
-    Write-K8ShakedownLog -Level STEP -Message "=== Shakedown Range $($Range.ToUpper()) mechanical steps PASS, range left running: $RunId ==="
+    Write-K8ShakedownLog -Level STEP -Message "=== Shakedown Range $($Range.ToUpper()) runtime evidence PASS, range left running for ordered finalize/teardown: $RunId ==="
     Write-Host ''
-    Write-Host "Range $($Range.ToUpper()) run '$RunId' is up and captured. The range is still running. Next:"
-    Write-Host "  1. Run $envDir\collector-query.json against ot-logs-dnp3-*; save the RAW response as $RunEvidence\collector-output\collector-response.json"
-    Write-Host "  2. Run $envDir\rule-query.json against ot-signals-zone-violation-*; save the RAW response as $RunEvidence\rule-output\rule-response.json"
-    if ($Range -eq 'b') {
-        Write-Host "  3. Run $envDir\r-obs-05-query.json against ot-logs-dnp3-*; save the RAW response under $RunEvidence\contract-output\ (k6-r-obs-05-collector-query-contract.md)."
-    }
-    Write-Host "  4. Then: .\tools\Complete-K8ShakedownRange.ps1 -Range $Range"
+    Write-Host "Range $($Range.ToUpper()) run '$RunId' retained all automated runtime evidence. Next:"
+    Write-Host "  .\tools\Complete-K8ShakedownRange.ps1 -Range $Range"
     return $RunEvidence
 }
 
@@ -520,21 +658,17 @@ function Wait-K8ComposeReady {
         [int] $PollSeconds = 3
     )
     $envDir = Join-Path $RunEvidence 'environment'
+    $expected = @(Get-K8ExpectedServices -RunId $RunId -ComposePath $ComposePath)
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $lastRaw = ''
     while ((Get-Date) -lt $deadline) {
-        $lastRaw = (docker compose -p $RunId -f $ComposePath ps --format json 2>&1 | Out-String)
+        $lastRaw = (docker compose -p $RunId -f $ComposePath ps --all --format json 2>&1 | Out-String)
         try {
-            # `compose ps --format json` emits either a single JSON array or
-            # newline-delimited JSON objects depending on Compose version;
-            # handle both rather than assuming one.
-            $parsed = try { $lastRaw | ConvertFrom-Json } catch {
-                @($lastRaw -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
-            }
-            $services = @($parsed)
-            if ($services.Count -gt 0 -and -not ($services | Where-Object { $_.State -and $_.State -ne 'running' })) {
+            $services = @(ConvertFrom-K8ComposePsJson -Raw $lastRaw)
+            $gate = Test-K8ComposeServiceReadiness -Expected $expected -Services $services
+            if ($gate.Ready) {
                 $lastRaw | Set-Content -Path (Join-Path $envDir 'readiness.json') -Encoding utf8NoBOM
-                Write-K8ShakedownLog -Message "Environment readiness PASS: $($services.Count) service(s) running."
+                Write-K8ShakedownLog -Message "Environment readiness PASS: all $($expected.Count) expected service(s) present/running and all reported healthchecks healthy."
                 return
             }
         }
@@ -544,7 +678,7 @@ function Wait-K8ComposeReady {
         Start-Sleep -Seconds $PollSeconds
     }
     $lastRaw | Set-Content -Path (Join-Path $envDir 'readiness.json') -Encoding utf8NoBOM
-    throw "Environment readiness timed out after ${TimeoutSeconds}s; not all services reached 'running'. See environment/readiness.json. Not proceeding to capture/trigger."
+    throw "Environment readiness timed out after ${TimeoutSeconds}s; an expected service was missing/not running/unhealthy or output could not be parsed. See environment/readiness.json."
 }
 
 function Write-K8ImageInventory {
@@ -560,28 +694,29 @@ function Write-K8ImageInventory {
         [Parameter(Mandatory)][string] $RunEvidence
     )
     $envDir = Join-Path $RunEvidence 'environment'
+    $expected = @(Get-K8ExpectedServices -RunId $RunId -ComposePath $ComposePath)
     $psJson = docker compose -p $RunId -f $ComposePath images --format json 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "docker compose images failed; image inventory is mandatory" }
     $psJson | Set-Content -Path (Join-Path $envDir 'compose-images.json') -Encoding utf8NoBOM
     (docker compose -p $RunId -f $ComposePath ps 2>&1) | Set-Content -Path (Join-Path $envDir 'compose-ps.txt') -Encoding utf8NoBOM
 
-    $inspectLines = @()
-    try {
-        $images = try { $psJson | Out-String | ConvertFrom-Json } catch {
-            @(($psJson | Out-String) -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
-        }
-        foreach ($img in @($images)) {
-            $ref = if ($img.ID) { $img.ID } elseif ($img.Repository -and $img.Tag) { "$($img.Repository):$($img.Tag)" } else { $null }
-            if (-not $ref) { continue }
-            $inspected = (docker image inspect $ref --format '{{.Id}} {{json .RepoDigests}}' 2>&1 | Out-String).Trim()
-            $service = if ($img.ContainerName) { $img.ContainerName } elseif ($img.Service) { $img.Service } else { '(unknown service)' }
-            $inspectLines += "$service`t$ref`t$inspected"
-        }
+    $images = @(ConvertFrom-K8ComposePsJson -Raw ($psJson | Out-String))
+    $inventory = @()
+    foreach ($service in $expected) {
+        $img = @($images | Where-Object { $_.Service -eq $service -or $_.ContainerName -match "(^|[-_])$([regex]::Escape($service))([-_]|$)" })
+        if ($img.Count -ne 1) { throw "image inventory must resolve exactly one image for expected service '$service'; found $($img.Count)" }
+        $ref = if ($img[0].ID) { $img[0].ID } elseif ($img[0].Repository -and $img[0].Tag) { "$($img[0].Repository):$($img[0].Tag)" } else { $null }
+        if (-not $ref) { throw "image reference/ID missing for expected service '$service'" }
+        $raw = (docker image inspect $ref 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0) { throw "docker image inspect failed for service '$service' image '$ref'" }
+        $inspection = @($raw | ConvertFrom-Json)
+        if ($inspection.Count -ne 1 -or -not $inspection[0].Id) { throw "inspect result for '$service' lacks an immutable image Id" }
+        $digests = @($inspection[0].RepoDigests | Where-Object { $_ })
+        $inventory += [ordered]@{ service=$service; resolved_reference=$ref; image_id=$inspection[0].Id; repo_digests=$digests; repo_digests_status=$(if ($digests.Count) {'present'} else {'absent-local-build'}) }
     }
-    catch {
-        Write-K8ShakedownLog -Level WARN -Message "Could not fully parse 'compose images --format json' for per-role docker image inspect; compose-images.json is still retained raw. $($_.Exception.Message)"
-    }
-    $inspectLines | Set-Content -Path (Join-Path $envDir 'image-inventory.txt') -Encoding utf8NoBOM
-    Write-K8ShakedownLog -Message "Image inventory: $($inspectLines.Count) service(s) inspected (see environment/image-inventory.txt, environment/compose-images.json)."
+    if ($inventory.Count -ne $expected.Count) { throw 'image inventory is incomplete' }
+    $inventory | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $envDir 'image-inventory.json') -Encoding utf8NoBOM
+    Write-K8ShakedownLog -Message "Image inventory PASS: all $($inventory.Count) expected service(s) inspected."
 }
 
 function Write-K8RuntimeContractRecord {
@@ -628,22 +763,21 @@ function Write-K8RuntimeContractRecord {
         $lines += '## c2-dnp3-step4-range-b-fault-pilot.md SS3 nontriviality checks'
         $lines += ''
         $lines += "1. Required services present in \`compose ps\`: $(if ($missing.Count -eq 0) { 'PASS (all of ' + ($requiredServices -join ', ') + ' found)' } else { 'FAIL -- missing: ' + ($missing -join ', ') })"
-        $lines += "2. Target-interface ($($Gateway.Interface)) mirror filter removed: see qdisc-pre-fault.txt / qdisc-post-fault.txt in this directory. 'One unrelated observed gateway interface still has a mirred egress mirror filter' -- **REQUIRES MANUAL CONFIRMATION** (needs the generated topology's other interfaces, not resolved by this script)."
+        $lines += "2. Target-interface ($($Gateway.Interface)) mirror filter removed: see qdisc-pre-fault.txt / qdisc-post-fault.txt. Unrelated mirror-filter gate: see unrelated-mirror-filters.txt (runner stops unless another interface retains mirred egress mirror)."
         try {
             $esContainer = (docker compose -p $RunId -f $ComposePath ps -q elasticsearch | Out-String).Trim()
             if ($esContainer) {
                 $esHealth = (docker exec $esContainer curl -s -o /dev/null -w '%{http_code}' http://localhost:9200/_cluster/health 2>&1 | Out-String).Trim()
                 $zoneDetectorUp = $psText -match 'zone_detector' -and $psText -notmatch 'zone_detector.*Exit'
-                $lines += "3. Elasticsearch health check (docker exec -> curl localhost:9200/_cluster/health): HTTP $esHealth; zone_detector running: $zoneDetectorUp"
+                if ($esHealth -ne '200' -or -not $zoneDetectorUp) { throw "Range B service-health gate failed (Elasticsearch HTTP $esHealth; zone_detector running: $zoneDetectorUp)" }
+                $lines += "3. Elasticsearch health check (docker exec -> curl localhost:9200/_cluster/health): HTTP $esHealth; zone_detector running: $zoneDetectorUp -- PASS"
             }
             else {
-                $lines += '3. Elasticsearch health check: FAIL -- elasticsearch container not resolved via compose ps -q.'
+                throw 'Range B service-health gate failed: elasticsearch container not resolved via compose ps -q'
             }
         }
-        catch {
-            $lines += "3. Elasticsearch health check: could not execute ($($_.Exception.Message)) -- REQUIRES MANUAL CONFIRMATION."
-        }
-        $lines += '4. Sensor capture contains at least one unrelated frame during the window -- **REQUIRES MANUAL CONFIRMATION** (needs pcap content inspection; not performed by this script beyond the capture-lifecycle record already retained under sensor-input/).'
+        catch { throw "Range B service-health gate failed: $($_.Exception.Message)" }
+        $lines += '4. Sensor unrelated-flow frame and Collector correlation are checked after capture export; see r-obs-05-pcap-rows.json and r-obs-05-correlation.json (runner stops unless the gate passes).'
     }
 
     $lines -join "`n" | Set-Content -Path (Join-Path $contractDir 'runtime-contract-record.md') -Encoding utf8NoBOM
@@ -668,7 +802,7 @@ function Complete-K8ShakedownRangeAB {
 
     $state = Get-K8ShakedownState
     $stageKey = "range_$($Range)_stage"
-    if (-not $state.PSObject.Properties[$stageKey] -or $state.$stageKey -ne 'awaiting-manual-queries') {
+    if (-not $state.PSObject.Properties[$stageKey] -or $state.$stageKey -ne 'awaiting-completion') {
         throw "No Range $($Range.ToUpper()) run is awaiting completion (state.$stageKey = $(if ($state.PSObject.Properties[$stageKey]) { $state.$stageKey } else { '<none>' })). Run .\tools\Run-K8ShakedownRange$($Range.ToUpper()).ps1 first."
     }
     $RunId = $state."range_$($Range)_run_id"
@@ -679,20 +813,24 @@ function Complete-K8ShakedownRangeAB {
 
     Write-K8ShakedownLog -Level STEP -Message "=== Completing Shakedown Range $($Range.ToUpper()): $RunId ==="
 
-    foreach ($dir in @('collector-output', 'rule-output')) {
-        $full = Join-Path $RunEvidence $dir
-        if (-not (Get-ChildItem -Path $full -File -Recurse -ErrorAction SilentlyContinue)) {
-            throw "$dir is still empty. Save the real query response there first (see environment/collector-query.json / environment/rule-query.json and the instructions printed by Run-K8ShakedownRange$($Range.ToUpper()).ps1). Not tearing down or finalizing until it is -- an empty directory here is not something this script fills in."
-        }
+    foreach ($required in @('collector-output\collector-response.json', 'rule-output\rule-response.json', 'rule-output\collector-rule-correlation.json')) {
+        if (-not (Test-Path (Join-Path $RunEvidence $required))) { throw "required automated runtime evidence missing: $required" }
     }
     if ($Range -eq 'b') {
-        $contractFiles = Get-ChildItem -Path (Join-Path $RunEvidence 'contract-output') -File -ErrorAction SilentlyContinue
-        if (-not ($contractFiles | Where-Object { $_.Name -match 'r-obs-05' })) {
-            Write-K8ShakedownLog -Level WARN -Message 'No r-obs-05*-named file found in contract-output/ yet. Confirm the R-OBS-05 response was saved before trusting Range B Runtime Contract as Pass -- not blocking finalize, since R-OBS-05 evidence may be saved under a different filename.'
+        foreach ($required in @('r-obs-05-mapping-response.json','r-obs-05-mapping-gate.json','r-obs-05-response.json','r-obs-05-pcap-rows.json','r-obs-05-correlation.json','unrelated-mirror-filters.txt')) {
+            if (-not (Test-Path (Join-Path $RunEvidence "contract-output\$required"))) { throw "Range B cannot complete: required R-OBS-05 evidence missing: $required" }
         }
+        $mappingGate = Get-Content (Join-Path $RunEvidence 'contract-output\r-obs-05-mapping-gate.json') -Raw | ConvertFrom-Json
+        $correlationGate = Get-Content (Join-Path $RunEvidence 'contract-output\r-obs-05-correlation.json') -Raw | ConvertFrom-Json
+        if ($mappingGate.mapping_gate_pass -ne $true -or $correlationGate.r_obs_05_mechanical_gate_pass -ne $true) { throw 'Range B cannot complete: an R-OBS-05 mechanical gate is not PASS' }
     }
 
-    # Cleanup: export/hash of what's already retained is complete; now destroy the project.
+    # Frozen ordering: prove the runtime evidence is complete and hash it while
+    # the project still exists. Only then may cleanup destroy project/volumes.
+    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'validate-evidence', $RunEvidence) -Description 'pre-teardown validate-evidence'
+    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'finalize-evidence', $RunEvidence) -Description 'pre-teardown finalize/hash'
+    if (-not (Test-Path (Join-Path $RunEvidence 'hashes.sha256'))) { throw 'pre-teardown finalize did not create hashes.sha256; refusing teardown' }
+
     Invoke-K8ShakedownCommand -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'down', '-v', '--remove-orphans') `
         -Description 'destroy project + volumes (prevent state carry-over)'
     $finalPs = (docker compose -p $RunId -f $ComposePath ps 2>&1 | Out-String)
@@ -703,9 +841,10 @@ function Complete-K8ShakedownRangeAB {
         "| Cleanup | destroyed via 'docker compose down -v --remove-orphans' at $((Get-Date).ToUniversalTime().ToString('o')); final ps: see environment/compose-ps.txt |" |
         Set-Content -Path (Join-Path $RunEvidence 'metadata.md') -Encoding utf8NoBOM
 
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'validate-evidence', $RunEvidence) -Description 'validate-evidence'
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'finalize-evidence', $RunEvidence) -Description 'finalize-evidence'
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'verify-integrity', $RunEvidence) -Description 'verify-integrity'
+    "cleanup_utc=$((Get-Date).ToUniversalTime().ToString('o'))`ncommand=docker compose -p $RunId -f $ComposePath down -v --remove-orphans`nresult=PASS" |
+        Set-Content -Path (Join-Path $RunEvidence 'environment\cleanup-result.txt') -Encoding utf8NoBOM
+    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'finalize-evidence', $RunEvidence) -Description 'final finalize/hash including cleanup record'
+    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'verify-integrity', $RunEvidence) -Description 'final verify-integrity'
 
     Set-K8ShakedownState -Updates @{ $stageKey = 'complete'; "range_$($Range)_complete_utc" = (Get-Date).ToUniversalTime().ToString('o') }
 

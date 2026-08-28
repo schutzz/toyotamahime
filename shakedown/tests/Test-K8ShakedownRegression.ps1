@@ -19,7 +19,8 @@
          this tooling builds for them.
       5. Range C runner does not throw on validator exit 1 (the expected,
          not-forced outcome).
-      6. Study01/ is byte-for-byte unmodified on this branch versus origin/main.
+      6. Fail-closed readiness/image/finalize ordering and mechanical evidence gates.
+      7. Study01/ is byte-for-byte unmodified on this branch versus origin/main.
 
     Exits 0 if all checks pass, 1 otherwise. Prints PASS/FAIL per check.
 
@@ -245,7 +246,90 @@ Assert-K8Test 'Run-K8ShakedownRangeC.ps1 does not throw on validator exit 1' {
     }
 }
 
-# --- 6. Study01/ untouched on this branch -------------------------------------
+# --- 6. Fail-closed runtime/evidence mechanics --------------------------------
+
+$commonSource = Get-Content $CommonPath -Raw
+$helper = Join-Path $ToolsDir 'k8_shakedown_evidence.py'
+
+Assert-K8Test 'readiness compares config --services with ps --all and rejects missing/not-running/unhealthy services' {
+    foreach ($needle in @('config --services', 'ps --all --format json', 'Test-K8ComposeServiceReadiness')) {
+        if ($commonSource -notlike "*$needle*") { throw "readiness fail-closed marker missing: $needle" }
+    }
+    Import-Module $CommonPath -Force
+    $expected = @('one','two')
+    $healthy = @([pscustomobject]@{Service='one';State='running';Health='healthy'}, [pscustomobject]@{Service='two';State='running';Health=''})
+    if (-not (Test-K8ComposeServiceReadiness -Expected $expected -Services $healthy).Ready) { throw 'complete healthy expected set did not PASS' }
+    if ((Test-K8ComposeServiceReadiness -Expected $expected -Services @($healthy[0])).Ready) { throw 'missing service incorrectly PASSed' }
+    $exited = @($healthy[0], [pscustomobject]@{Service='two';State='exited';Health=''})
+    if ((Test-K8ComposeServiceReadiness -Expected $expected -Services $exited).Ready) { throw 'exited service incorrectly PASSed' }
+    $unhealthy = @($healthy[0], [pscustomobject]@{Service='two';State='running';Health='unhealthy'})
+    if ((Test-K8ComposeServiceReadiness -Expected $expected -Services $unhealthy).Ready) { throw 'unhealthy service incorrectly PASSed' }
+}
+
+Assert-K8Test 'image inventory requires every expected service, inspect success, image Id, and explicit absent-local-build status' {
+    foreach ($needle in @('image inventory must resolve exactly one image', 'docker image inspect failed', 'lacks an immutable image Id', 'absent-local-build', '$inventory.Count -ne $expected.Count')) {
+        if ($commonSource -notlike "*$needle*") { throw "image inventory fail-closed marker missing: $needle" }
+    }
+}
+
+Assert-K8Test 'pre-teardown validate/finalize precede compose down and cleanup is followed by final finalize/verify' {
+    $pre = $commonSource.IndexOf("-Description 'pre-teardown finalize/hash'")
+    $down = $commonSource.IndexOf("-Description 'destroy project + volumes")
+    $final = $commonSource.IndexOf("-Description 'final finalize/hash including cleanup record'")
+    $verify = $commonSource.IndexOf("-Description 'final verify-integrity'")
+    if ($pre -lt 0 -or $down -lt 0 -or $final -lt 0 -or $verify -lt 0 -or -not ($pre -lt $down -and $down -lt $final -and $final -lt $verify)) {
+        throw "incorrect evidence ordering: pre=$pre down=$down final=$final verify=$verify"
+    }
+}
+
+Assert-K8Test 'Range B Complete requires every named R-OBS-05 artifact and PASS gates' {
+    foreach ($needle in @('r-obs-05-mapping-response.json','r-obs-05-mapping-gate.json','r-obs-05-response.json','r-obs-05-pcap-rows.json','r-obs-05-correlation.json','unrelated-mirror-filters.txt','R-OBS-05 mechanical gate is not PASS')) {
+        if ($commonSource -notlike "*$needle*") { throw "Range B completion gate missing: $needle" }
+    }
+}
+
+Assert-K8Test 'Collector retains all hit IDs and Rule source_dnp3_doc_id is correlated mechanically' {
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-test-" + [guid]::NewGuid())
+    New-Item -ItemType Directory $tmp | Out-Null
+    try {
+        '{"hits":{"total":{"value":2,"relation":"eq"},"hits":[{"_id":"c1","_source":{}},{"_id":"c2","_source":{}}]}}' | Set-Content (Join-Path $tmp 'c.json')
+        '{"hits":{"total":{"value":2,"relation":"eq"},"hits":[{"_id":"r1","_source":{"source_dnp3_doc_id":"c2"}},{"_id":"r2","_source":{"source_dnp3_doc_id":"missing"}}]}}' | Set-Content (Join-Path $tmp 'r.json')
+        & python $helper target-correlation --collector (Join-Path $tmp 'c.json') --rule (Join-Path $tmp 'r.json') --output (Join-Path $tmp 'o.json')
+        if ($LASTEXITCODE -ne 0) { throw 'helper failed' }
+        $result = Get-Content (Join-Path $tmp 'o.json') -Raw | ConvertFrom-Json
+        if (($result.accepted_collector_hit_ids -join ',') -ne 'c1,c2') { throw 'complete Collector hit ID set was not retained' }
+        if ($result.rule_correlations[0].correlates_to_accepted_collector_hit -ne $true -or $result.rule_correlations[1].correlates_to_accepted_collector_hit -ne $false) { throw 'Rule correlation decisions incorrect' }
+    } finally { Remove-Item $tmp -Recurse -Force }
+}
+
+Assert-K8Test 'R-OBS-05 integer-nanosecond boundary: 1,000,000 PASS; 1,000,001 FAIL' {
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-ns-" + [guid]::NewGuid())
+    New-Item -ItemType Directory $tmp | Out-Null
+    try {
+        $response = '{"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_id":"d1","_source":{"layers":{"frame":{"frame_frame_time":"2026-01-01T00:00:00.000000000Z"},"ip":{"ip_ip_src":"10.1.10.10","ip_ip_dst":"10.1.40.10"},"tcp":{"tcp_tcp_srcport":"12345","tcp_tcp_dstport":"20000"},"dnp3":{"dnp3_dnp3_al_func":"5","dnp3_dnp3_src":"1","dnp3_dnp3_dst":"20"}}}}]}}'
+        $response | Set-Content (Join-Path $tmp 'response.json')
+        $prefix = '[{"frame_number":"1","frame_time_epoch":"'
+        $suffix = '","ip_src":"10.1.10.10","ip_dst":"10.1.40.10","tcp_srcport":"12345","tcp_dstport":"20000","dnp3_al_func":"5","dnp3_src":"1","dnp3_dst":"20"}]'
+        ($prefix + '1767225600.001000000' + $suffix) | Set-Content (Join-Path $tmp 'pass.json')
+        & python $helper r-obs-05 --response (Join-Path $tmp 'response.json') --frames (Join-Path $tmp 'pass.json') --window-start '2025-12-31T23:59:55Z' --window-end '2026-01-01T00:00:15Z' --output (Join-Path $tmp 'pass-out.json')
+        if ($LASTEXITCODE -ne 0) { throw 'exactly 1,000,000 ns did not PASS' }
+        ($prefix + '1767225600.001000001' + $suffix) | Set-Content (Join-Path $tmp 'fail.json')
+        & python $helper r-obs-05 --response (Join-Path $tmp 'response.json') --frames (Join-Path $tmp 'fail.json') --window-start '2025-12-31T23:59:55Z' --window-end '2026-01-01T00:00:15Z' --output (Join-Path $tmp 'fail-out.json') 2>$null
+        if ($LASTEXITCODE -eq 0) { throw '1,000,001 ns incorrectly PASSed' }
+    } finally { Remove-Item $tmp -Recurse -Force }
+}
+
+Assert-K8Test 'R-OBS-05 mapping drift stops the helper' {
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-map-" + [guid]::NewGuid())
+    New-Item -ItemType Directory $tmp | Out-Null
+    try {
+        '{"index":{"mappings":{"properties":{"layers":{"properties":{}}}}}}' | Set-Content (Join-Path $tmp 'mapping.json')
+        & python $helper mapping-gate --mapping (Join-Path $tmp 'mapping.json') --output (Join-Path $tmp 'decision.json') 2>$null
+        if ($LASTEXITCODE -eq 0) { throw 'mapping drift incorrectly PASSed' }
+    } finally { Remove-Item $tmp -Recurse -Force }
+}
+
+# --- 7. Study01/ untouched on this branch -------------------------------------
 
 Assert-K8Test 'Study01/ is byte-for-byte unchanged versus origin/main' {
     Push-Location $RepoRoot
