@@ -10,11 +10,18 @@ One-time, per VM/session (run from inside the cloned repo's shakedown/ dir):
 
     .\tools\Start-K8Shakedown.ps1
 
-Then, in order, each may be re-run independently once Setup has passed:
+Then, in order, once Setup has passed:
 
     .\tools\Run-K8ShakedownRangeA.ps1
+    (save the Collector/Rule query responses it prints instructions for)
+    .\tools\Complete-K8ShakedownRange.ps1 -Range a
+
     .\tools\Run-K8ShakedownRangeB.ps1
+    (save the Collector/Rule/R-OBS-05 query responses it prints instructions for)
+    .\tools\Complete-K8ShakedownRange.ps1 -Range b
+
     .\tools\Run-K8ShakedownRangeC.ps1
+    (no live-query dependency -- this one is a single command)
 
 If something fails partway through a Range run: fix the branch on your dev
 machine, push, then on the VM:

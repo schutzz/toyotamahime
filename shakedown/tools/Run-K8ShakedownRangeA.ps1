@@ -8,8 +8,14 @@
     k8-repro-*) and calls the shared Range A/B mechanical sequencer in
     K8ShakedownCommon.psm1. See that module for what is and is not automated.
 
+    This is phase 1 of 2. It leaves the range RUNNING and prints the
+    Collector/Rule queries to execute against Elasticsearch by hand. Once you
+    save the responses, run .\tools\Complete-K8ShakedownRange.ps1 -Range a.
+
 .EXAMPLE
     .\tools\Run-K8ShakedownRangeA.ps1
+    # ... save collector-output/ and rule-output/ responses ...
+    .\tools\Complete-K8ShakedownRange.ps1 -Range a
 #>
 [CmdletBinding()]
 param()

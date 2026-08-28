@@ -41,10 +41,35 @@ Unlike a formal K8-3 attempt:
   transcribed by hand from evidence, derived before looking at `expected/`;
   auto-generating it would erase the exact discipline the study's own
   limitations analysis (`claims/limitations.md` R6) is about.
-- It does not execute the Range B R-OBS-05 Elasticsearch query. That is a
-  human correlation judgment against live data, not a mechanical step. The
-  runner writes the frozen query with `T0` substituted for copy/paste and
-  stops there.
+- It does not execute the target-event Collector query, the Rule query, or
+  (Range B) the R-OBS-05 query against Elasticsearch. These are queries
+  against live data whose raw response IS the retained evidence
+  (`evidence-schema.md` §3) -- not something a script can fabricate. The
+  runner writes each frozen query with `T0` substituted to `environment/` for
+  copy/paste, and leaves the range **running** so they can still be executed
+  when you get to them (see "Two-phase Range A/B" below).
+
+## Two-phase Range A/B
+
+`Run-K8ShakedownRange{A,B}.ps1` provisions the range, waits for readiness,
+captures the image inventory and runtime-contract observation, resolves the
+gateway interface, (Range B) applies the fault, captures, and fires the one
+sender trigger -- then **stops with the range still running** and prints the
+Collector/Rule (and Range B: R-OBS-05) queries to run against Elasticsearch
+by hand. Only after you save those raw responses into `collector-output/`,
+`rule-output/`, and (Range B) `contract-output/` do you run
+`Complete-K8ShakedownRange.ps1 -Range a` (or `b`), which tears the range down
+and runs `validate-evidence` / `finalize-evidence` / `verify-integrity`.
+
+This split exists because `study01_collect.py validate-evidence` requires a
+real retained file in every one of `ground-truth/`, `sensor-input/`,
+`collector-output/`, `rule-output/`, and `contract-output/` -- and because
+`evidence-schema.md`'s own cleanup ordering requires every required artifact
+to be exported *before* the project is torn down. Tearing the range down
+automatically, before those two live queries could be run, would make
+target-event Collector/Rule evidence permanently unobtainable for that run.
+`Complete-K8ShakedownRange.ps1` refuses to proceed (no teardown, no finalize)
+while `collector-output/` or `rule-output/` is still empty.
 
 ## Layout
 
@@ -54,10 +79,13 @@ shakedown/
 ├─ tools/
 │  ├─ K8ShakedownCommon.psm1                   <- pinned constants + shared functions
 │  ├─ Start-K8Shakedown.ps1                    <- Setup
-│  ├─ Run-K8ShakedownRangeA.ps1
-│  ├─ Run-K8ShakedownRangeB.ps1
-│  ├─ Run-K8ShakedownRangeC.ps1
-│  └─ r-obs-05-query.template.json             <- frozen ES query, T0 substituted at runtime
+│  ├─ Run-K8ShakedownRangeA.ps1                <- phase 1: provision through capture/trigger; leaves the range UP
+│  ├─ Run-K8ShakedownRangeB.ps1                <- same, + the fault
+│  ├─ Complete-K8ShakedownRange.ps1            <- phase 2: teardown + finalize, AFTER you save the query responses
+│  ├─ Run-K8ShakedownRangeC.ps1                <- Range C is one script; no live-query dependency
+│  ├─ collector-query.template.json            <- frozen target-event Collector query, T0 substituted at runtime
+│  ├─ rule-query.template.json                 <- frozen target-event Rule query, T0 substituted at runtime
+│  └─ r-obs-05-query.template.json             <- frozen R-OBS-05 (Range B) query, T0 substituted at runtime
 ├─ tests/
 │  └─ Test-K8ShakedownRegression.ps1           <- repo-side checks, see below
 └─ operator/
@@ -107,10 +135,19 @@ implementation and full reasoning, and
 Even once Shakedown completes end to end, these remain manual by design (see
 "What Shakedown is not allowed to do" above):
 
-1. `scoring-input.json` for Range A and Range B (README §6.2).
-2. The Range B R-OBS-05 Elasticsearch correlation judgment (the query is
-   pre-filled; running it against Elasticsearch and reading the result is
+1. Executing the Collector query and Rule query against Elasticsearch, and
+   saving the raw responses into `collector-output/` / `rule-output/`
+   (queries are pre-filled with `T0`; running them and judging the result is
    not).
+2. The Range B R-OBS-05 Elasticsearch correlation judgment (same: pre-filled,
+   not executed).
+3. `scoring-input.json` for Range A and Range B (README §6.2).
+4. Range B's step4-fault-pilot nontriviality checks 2 ("one unrelated
+   observed gateway interface still has a mirror filter") and 4 (sensor
+   capture contains an unrelated frame) -- `contract-output/runtime-contract-record.md`
+   marks these `REQUIRES MANUAL CONFIRMATION` rather than guessing at them,
+   since they need generated-topology / pcap-content knowledge this tooling
+   does not have.
 
 ## Status
 

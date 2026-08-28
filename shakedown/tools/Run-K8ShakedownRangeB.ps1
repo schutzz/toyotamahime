@@ -11,8 +11,15 @@
     interface) and writes the R-OBS-05 query for manual execution. See that
     module for what is and is not automated.
 
+    This is phase 1 of 2. It leaves the range RUNNING and prints the
+    Collector/Rule/R-OBS-05 queries to execute against Elasticsearch by hand.
+    Once you save the responses, run
+    .\tools\Complete-K8ShakedownRange.ps1 -Range b.
+
 .EXAMPLE
     .\tools\Run-K8ShakedownRangeB.ps1
+    # ... save collector-output/, rule-output/, contract-output/ responses ...
+    .\tools\Complete-K8ShakedownRange.ps1 -Range b
 #>
 [CmdletBinding()]
 param()

@@ -136,9 +136,18 @@ Assert-K8Test 'Start-K8Shakedown.ps1 refuses to run when Study01/README.md is no
 }
 
 # --- 4. Runner argument coverage against the real scripts' own argparse ------
+#
+# Per-invocation, not whole-module: a whole-file substring search cannot tell
+# apart two different Invoke-K8ShakedownCommand call sites for the same
+# script, so a flag required by one call but only ever typed near a *different*
+# call would have passed. This parses the module's AST, finds every actual
+# Invoke-K8ShakedownCommand call site, classifies which frozen script/
+# subcommand each one targets by inspecting that call's own source text, and
+# checks that call's own argument text (not the rest of the file) contains
+# every flag its target's real -h output marks required.
 
 $ScriptsDir = Join-Path $Study01 'studies\study-01-negative-result\scripts'
-$CommonSrc = Get-Content (Join-Path $ToolsDir 'K8ShakedownCommon.psm1') -Raw
+$CommonPath = Join-Path $ToolsDir 'K8ShakedownCommon.psm1'
 
 function Get-K8RequiredFlags {
     param([string] $HelpText)
@@ -150,22 +159,76 @@ function Get-K8RequiredFlags {
     return $all | Where-Object { $bracketed -notcontains $_ -and $_ -ne '--help' }
 }
 
+function Get-K8InvocationCallSites {
+    <#
+        Returns one object per actual Invoke-K8ShakedownCommand call site in
+        K8ShakedownCommon.psm1: { Text = <that call's own source>,
+        Target = '<script.py>[:subcommand]' or $null if unrecognized }.
+    #>
+    param([string] $Path)
+    $tokens = $null; $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
+    if ($errors.Count -gt 0) { throw "parse errors in $Path`: $($errors -join '; ')" }
+    $calls = $ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.CommandElements.Count -gt 0 -and
+        $node.CommandElements[0].Extent.Text -eq 'Invoke-K8ShakedownCommand'
+    }, $true)
+    $known = @(
+        @{ Script = 'study01_preflight.py'; Sub = $null },
+        @{ Script = 'study01_sender.py';    Sub = $null },
+        @{ Script = 'study01_collect.py';   Sub = $null },
+        @{ Script = 'study01_capture.py';   Sub = 'resolve' },
+        @{ Script = 'study01_capture.py';   Sub = 'start' },
+        @{ Script = 'study01_capture.py';   Sub = 'stop-export' }
+    )
+    foreach ($call in $calls) {
+        $text = $call.Extent.Text
+        $target = $null
+        foreach ($k in $known) {
+            if ($text -notmatch [regex]::Escape($k.Script)) { continue }
+            if ($null -eq $k.Sub -or $text -match "'$([regex]::Escape($k.Sub))'") {
+                $target = if ($k.Sub) { "$($k.Script):$($k.Sub)" } else { $k.Script }
+                break
+            }
+        }
+        [pscustomobject]@{ Text = $text; Target = $target }
+    }
+}
+
+$callSites = Get-K8InvocationCallSites -Path $CommonPath
+
 $checks = @(
-    @{ Script = 'study01_preflight.py'; Args = @() },
-    @{ Script = 'study01_capture.py';   Args = @('resolve') },
-    @{ Script = 'study01_capture.py';   Args = @('start') },
-    @{ Script = 'study01_capture.py';   Args = @('stop-export') },
-    @{ Script = 'study01_sender.py';    Args = @() }
+    @{ Target = 'study01_preflight.py';            Script = 'study01_preflight.py'; Args = @() },
+    @{ Target = 'study01_capture.py:resolve';      Script = 'study01_capture.py';   Args = @('resolve') },
+    @{ Target = 'study01_capture.py:start';        Script = 'study01_capture.py';   Args = @('start') },
+    @{ Target = 'study01_capture.py:stop-export';  Script = 'study01_capture.py';   Args = @('stop-export') },
+    @{ Target = 'study01_sender.py';               Script = 'study01_sender.py';    Args = @() }
 )
 foreach ($c in $checks) {
-    $label = "$($c.Script) $($c.Args -join ' ')".Trim()
-    Assert-K8Test "Runner passes every required flag for: $label" {
+    Assert-K8Test "Runner passes every required flag, per call site, for: $($c.Target)" {
+        $sites = @($callSites | Where-Object { $_.Target -eq $c.Target })
+        if ($sites.Count -eq 0) {
+            throw "no Invoke-K8ShakedownCommand call site found targeting '$($c.Target)' -- this stage is not wired up at all"
+        }
         $help = & python (Join-Path $ScriptsDir $c.Script) @($c.Args) -h 2>&1 | Out-String
         $required = Get-K8RequiredFlags -HelpText $help
-        foreach ($flag in $required) {
-            if ($CommonSrc -notmatch [regex]::Escape($flag)) {
-                throw "required flag '$flag' (from '$label -h') not found anywhere in K8ShakedownCommon.psm1"
+        foreach ($site in $sites) {
+            foreach ($flag in $required) {
+                if ($site.Text -notmatch [regex]::Escape($flag)) {
+                    throw "required flag '$flag' (from '$($c.Target) -h') missing from this specific call site:`n$($site.Text)"
+                }
             }
+        }
+    }
+}
+
+Assert-K8Test 'study01_collect.py is invoked for validate-evidence, finalize-evidence, and verify-integrity' {
+    $sites = @($callSites | Where-Object { $_.Target -eq 'study01_collect.py' })
+    foreach ($sub in @('validate-evidence', 'finalize-evidence', 'verify-integrity')) {
+        if (-not ($sites | Where-Object { $_.Text -match [regex]::Escape($sub) })) {
+            throw "no study01_collect.py call site found passing '$sub'"
         }
     }
 }
