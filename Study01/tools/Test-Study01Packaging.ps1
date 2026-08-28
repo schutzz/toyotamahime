@@ -99,7 +99,12 @@ $CommitSha =
 $IsGitRepo = [bool]$CommitSha
 
 $PorcelainStatus =
-    if ($IsGitRepo) { @(& git -C $RepoRoot status --porcelain 2>$null) } else { @() }
+    # The outer @() matters: `$x = if (...) { @(...) } else { @() }` still
+    # collapses to $null when the chosen branch's array is empty --
+    # PowerShell unwraps a zero-element pipeline output at the if/else
+    # statement boundary regardless of how the branch itself was wrapped.
+    # Wrapping the whole if/else expression is what actually survives.
+    @(if ($IsGitRepo) { & git -C $RepoRoot status --porcelain 2>$null })
 
 $IsDirty = ($PorcelainStatus.Count -gt 0) -or (-not $IsGitRepo)
 
