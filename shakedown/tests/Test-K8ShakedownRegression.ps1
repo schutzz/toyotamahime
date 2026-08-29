@@ -294,6 +294,50 @@ Assert-K8Test 'image inventory requires every expected service, inspect success,
     }
 }
 
+Assert-K8Test 'image row resolution supports Service and Compose 5.4 ContainerName-only shapes exactly' {
+    Import-Module $CommonPath -Force
+    $runId = 'k8shakedown-rangea-20260829-010203'
+    $expected = @('elasticsearch','log_structurer')
+    $withService = @(
+        [pscustomobject]@{Service='elasticsearch';ID='sha256:a';ContainerName='anything'},
+        [pscustomobject]@{Service='log_structurer';ID='sha256:b';ContainerName='anything-else'}
+    )
+    $resolved = Resolve-K8ComposeImageRows -RunId $runId -ExpectedServices $expected -ImageRows $withService
+    if ($resolved['elasticsearch'].ID -ne 'sha256:a' -or $resolved['log_structurer'].ID -ne 'sha256:b') { throw 'Service shape resolved incorrectly' }
+
+    $compose54 = @(
+        [pscustomobject]@{ID='sha256:a';ContainerName="$runId-elasticsearch-1";Repository='elasticsearch';Tag='8.10.2';Platform='linux/amd64'},
+        [pscustomobject]@{ID='sha256:b';ContainerName="$runId-log_structurer-1";Repository='debian';Tag='bullseye-slim';Platform='linux/amd64'}
+    )
+    $resolved = Resolve-K8ComposeImageRows -RunId $runId -ExpectedServices $expected -ImageRows $compose54
+    if ($resolved['elasticsearch'].ID -ne 'sha256:a' -or $resolved['log_structurer'].ID -ne 'sha256:b') { throw 'ContainerName-only shape resolved incorrectly' }
+}
+
+Assert-K8Test 'image row resolution rejects substring ambiguity, missing rows, duplicates, and parse failure' {
+    Import-Module $CommonPath -Force
+    $runId = 'k8shakedown-rangea-20260829-010203'
+    $cases = @()
+    $cases += ,@([pscustomobject]@{ID='x';ContainerName="$runId-myapi-1"})
+    $cases += ,@()
+    $cases += ,@([pscustomobject]@{ID='x';ContainerName="$runId-api-1"}, [pscustomobject]@{ID='x';ContainerName="$runId-api-2"})
+    foreach ($rows in $cases) {
+        $stopped = $false
+        try { $null = Resolve-K8ComposeImageRows -RunId $runId -ExpectedServices @('api') -ImageRows $rows } catch { $stopped = $true }
+        if (-not $stopped) { throw 'non-exact/missing/duplicate image rows did not STOP' }
+    }
+    $stopped = $false
+    try { $null = ConvertFrom-K8ComposePsJson -Raw '{not json' } catch { $stopped = $true }
+    if (-not $stopped) { throw 'invalid image JSON did not STOP' }
+}
+
+Assert-K8Test 'compose build output is redirected to a per-run runtime log with failure-only bounded tail' {
+    foreach ($needle in @('Invoke-K8ShakedownLoggedCommand', '*> $LogPath', '-Tail $FailureTailLines', 'runtime-logs\$RunId\docker-compose-up-build.log')) {
+        if ($commonSource -notlike "*$needle*") { throw "quiet build logging marker missing: $needle" }
+    }
+    $upCall = [regex]::Match($commonSource, "Invoke-K8ShakedownLoggedCommand[^\r\n]+[\s\S]{0,300}?'up', '-d', '--build'")
+    if (-not $upCall.Success) { throw 'docker compose up --build is not routed through the quiet logged command' }
+}
+
 Assert-K8Test 'pre-teardown validate/finalize precede compose down and cleanup is followed by final finalize/verify' {
     $pre = $commonSource.IndexOf("-Description 'pre-teardown finalize/hash'")
     $down = $commonSource.IndexOf("-Description 'destroy project + volumes")

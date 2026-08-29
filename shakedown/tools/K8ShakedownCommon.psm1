@@ -159,6 +159,37 @@ function Invoke-K8ShakedownCommand {
     return [pscustomobject]@{ ExitCode = $exit; Output = $output }
 }
 
+function Invoke-K8ShakedownLoggedCommand {
+    <# Runs a noisy native command with its complete combined output redirected
+       to a per-run Shakedown runtime log outside the scientific evidence tree.
+       Only failures echo a bounded tail to the console. #>
+    param(
+        [Parameter(Mandatory)][string] $FilePath,
+        [string[]] $ArgumentList = @(),
+        [Parameter(Mandatory)][string] $LogPath,
+        [string] $Description = '',
+        [int] $FailureTailLines = 50
+    )
+    $argvDisplay = ($ArgumentList | ForEach-Object { if ($_ -match '\s') { "'$_'" } else { $_ } }) -join ' '
+    $parent = Split-Path -Parent $LogPath
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    Write-K8ShakedownLog -Level STEP -Message "RUN: $FilePath $argvDisplay $(if ($Description) { "  # $Description" }) (full output: $LogPath)"
+    # Inspect the native exit code ourselves so a host-level preference cannot
+    # throw before the bounded failure-tail/reporting path runs.
+    $PSNativeCommandUseErrorActionPreference = $false
+    & $FilePath @ArgumentList *> $LogPath
+    $exit = $LASTEXITCODE
+    Write-K8ShakedownLog -Message "EXIT: $exit (full output: $LogPath)"
+    if ($exit -ne 0) {
+        Write-K8ShakedownLog -Level ERROR -Message "Command failed; last $FailureTailLines log lines follow:"
+        Get-Content -LiteralPath $LogPath -Tail $FailureTailLines | ForEach-Object {
+            Write-K8ShakedownLog -Level ERROR -Message "  | $_"
+        }
+        throw "Command failed (exit $exit): $FilePath $argvDisplay. Full Shakedown runtime log: $LogPath"
+    }
+    return [pscustomobject]@{ ExitCode=$exit; LogPath=$LogPath }
+}
+
 function Assert-K8PinnedCommit {
     <#
         Verifies a git worktree's HEAD equals the pinned commit. Never
@@ -296,6 +327,44 @@ function ConvertFrom-K8ComposePsJson {
     catch {
         return @($Raw -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
     }
+}
+
+function Get-K8ObjectPropertyValue {
+    param([Parameter(Mandatory)] $Object, [Parameter(Mandatory)][string] $Name)
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function Resolve-K8ComposeImageRows {
+    <# Compose v5.4 `images --format json` omits Service. Resolve that shape
+       only through an anchored Compose container name:
+       <project>-<service>-<replica> (or legacy underscore separators).
+       Substring/ambiguous matches are forbidden. #>
+    param(
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string[]] $ExpectedServices,
+        [Parameter(Mandatory)][object[]] $ImageRows
+    )
+    $resolved = @{}
+    foreach ($service in $ExpectedServices) {
+        $dashName = '^{0}-{1}-[0-9]+$' -f [regex]::Escape($RunId), [regex]::Escape($service)
+        $underscoreName = '^{0}_{1}_[0-9]+$' -f [regex]::Escape($RunId), [regex]::Escape($service)
+        $matches = @($ImageRows | Where-Object {
+            $declaredService = Get-K8ObjectPropertyValue -Object $_ -Name 'Service'
+            if (-not [string]::IsNullOrWhiteSpace([string]$declaredService)) {
+                return ([string]$declaredService -ceq $service)
+            }
+            $containerName = Get-K8ObjectPropertyValue -Object $_ -Name 'ContainerName'
+            return (-not [string]::IsNullOrWhiteSpace([string]$containerName) -and
+                (([string]$containerName -cmatch $dashName) -or ([string]$containerName -cmatch $underscoreName)))
+        })
+        if ($matches.Count -ne 1) {
+            throw "image inventory must resolve exactly one image for expected service '$service'; found $($matches.Count)"
+        }
+        $resolved[$service] = $matches[0]
+    }
+    return $resolved
 }
 
 function Test-K8ComposeServiceReadiness {
@@ -490,9 +559,11 @@ function Invoke-K8ShakedownRangeAB {
     "generated compose SHA-256 (within-run integrity record only, per c2-dnp3-range-derivation.md SS2.2): $composeHash" |
         Set-Content -Path (Join-Path $envDir 'generated-compose-hash.txt') -Encoding utf8NoBOM
 
-    # 4. Provision.
-    Invoke-K8ShakedownCommand -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'up', '-d', '--build') `
-        -Description "provision Range $($Range.ToUpper())"
+    # 4. Provision. Compose build output is intentionally kept outside the
+    # scientific evidence tree as a per-run Shakedown runtime/debug log.
+    $buildLog = Join-Path $state.shakedown_root "runtime-logs\$RunId\docker-compose-up-build.log"
+    Invoke-K8ShakedownLoggedCommand -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'up', '-d', '--build') `
+        -LogPath $buildLog -Description "provision Range $($Range.ToUpper())" | Out-Null
 
     # 4a. Environment readiness: wait for every defined service to report a
     # running state before doing anything else (README SS5.1 step 4:
@@ -704,12 +775,16 @@ function Write-K8ImageInventory {
     $psJson | Set-Content -Path (Join-Path $envDir 'compose-images.json') -Encoding utf8NoBOM
     (docker compose -p $RunId -f $ComposePath ps 2>&1) | Set-Content -Path (Join-Path $envDir 'compose-ps.txt') -Encoding utf8NoBOM
 
-    $images = @(ConvertFrom-K8ComposePsJson -Raw ($psJson | Out-String))
+    try { $images = @(ConvertFrom-K8ComposePsJson -Raw ($psJson | Out-String)) }
+    catch { throw "could not parse mandatory compose image inventory JSON: $($_.Exception.Message)" }
+    $resolvedRows = Resolve-K8ComposeImageRows -RunId $RunId -ExpectedServices $expected -ImageRows $images
     $inventory = @()
     foreach ($service in $expected) {
-        $img = @($images | Where-Object { $_.Service -eq $service -or $_.ContainerName -match "(^|[-_])$([regex]::Escape($service))([-_]|$)" })
-        if ($img.Count -ne 1) { throw "image inventory must resolve exactly one image for expected service '$service'; found $($img.Count)" }
-        $ref = if ($img[0].ID) { $img[0].ID } elseif ($img[0].Repository -and $img[0].Tag) { "$($img[0].Repository):$($img[0].Tag)" } else { $null }
+        $img = $resolvedRows[$service]
+        $id = Get-K8ObjectPropertyValue -Object $img -Name 'ID'
+        $repository = Get-K8ObjectPropertyValue -Object $img -Name 'Repository'
+        $tag = Get-K8ObjectPropertyValue -Object $img -Name 'Tag'
+        $ref = if ($id) { $id } elseif ($repository -and $tag) { "${repository}:$tag" } else { $null }
         if (-not $ref) { throw "image reference/ID missing for expected service '$service'" }
         $raw = (docker image inspect $ref 2>&1 | Out-String)
         if ($LASTEXITCODE -ne 0) { throw "docker image inspect failed for service '$service' image '$ref'" }
