@@ -292,7 +292,12 @@ $commonSource = Get-Content $CommonPath -Raw
 $helper = Join-Path $ToolsDir 'k8_shakedown_evidence.py'
 
 Assert-K8Test 'readiness compares config --services with ps --all and rejects missing/not-running/unhealthy services' {
-    foreach ($needle in @('config --services', 'ps --all --format json', 'Test-K8ComposeServiceReadiness')) {
+    # These markers are matched against the ArgumentList array shape (each
+    # flag its own array element, e.g. 'ps', '--all', '--format', 'json'),
+    # not a single inline joined string -- that is what
+    # Invoke-K8SeparatedNativeCapture requires so stderr never merges into
+    # the JSON this parses.
+    foreach ($needle in @("'config', '--services'", "'ps', '--all', '--format', 'json'", 'Test-K8ComposeServiceReadiness')) {
         if ($commonSource -notlike "*$needle*") { throw "readiness fail-closed marker missing: $needle" }
     }
     Import-Module $CommonPath -Force
@@ -576,7 +581,7 @@ Assert-K8Test 'Range B runtime-contract record uses structured service-state che
 # Everything above this point is structural (AST/text). This section
 # actually INVOKES the real Wait-K8LogStructurerReady / Wait-K8ZoneDetectorReady
 # / Wait-K8ElasticsearchReady functions against a scripted `docker` mock
-# (tests/mock-docker/docker.cmd -> docker.ps1), so "not ready -> STOP before
+# (tests/mock-docker/docker.cmd -> docker-impl.ps1), so "not ready -> STOP before
 # trigger" and "ready -> PASS" are proven by running the real code, not by
 # asserting that the right words appear in it.
 
@@ -657,13 +662,13 @@ try {
             if ($body -notmatch $needle) { throw "search check does not use zone_violation.py's own literal query shape (missing: $needle)" }
         }
         if ($body -notmatch 'json\.loads\(raw\)') { throw 'search check does not actually parse the response body as JSON before accepting it' }
-        if ($body -notmatch "docker exec \`$container python3 -c \`$searchScript") { throw 'search check is not executed via docker exec against $container (zone_detector itself)' }
+        if ($body -notmatch "'exec',\s*\`$container,\s*'python3',\s*'-c',\s*\(ConvertTo-K8PythonExecOneLiner -Script \`$searchScript\)") { throw 'search check is not executed via docker exec against $container (zone_detector itself)' }
         if ($body -notmatch '\$pluginLive -and \$connectivityOk -and \$searchOk') { throw 'PASS condition no longer requires plugin-alive AND connectivity AND search all three' }
     }
 
     Assert-K8Test 'zone_detector connectivity check runs FROM INSIDE the zone_detector container, not from Elasticsearch or the host' {
         $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Wait-K8ZoneDetectorReady'
-        if ($body -notmatch "docker exec \`$container python3 -c") { throw 'connectivity check is not executed via docker exec against $container (the zone_detector container)' }
+        if ($body -notmatch "'exec',\s*\`$container,\s*'python3',\s*'-c'") { throw 'connectivity check is not executed via docker exec against $container (the zone_detector container)' }
         if ($body -notmatch 'urllib\.request') { throw 'connectivity check does not use a real HTTP request from inside the container' }
         if ($body -match "ps -q elasticsearch.*python3|elasticsearch.*docker exec.*urllib") { throw 'connectivity check appears to run against the elasticsearch container instead of zone_detector -- this must prove the path FROM zone_detector' }
     }
@@ -1056,6 +1061,170 @@ Assert-K8Test 'The completeness gate runs before "runtime evidence PASS" is ever
     $passLogIndex = $body.IndexOf('=== Shakedown Range $($Range.ToUpper()) runtime evidence PASS')
     if ($passLogIndex -lt 0 -or $gateCalls[0].Index -gt $passLogIndex) { throw 'completeness gate does not run before the "runtime evidence PASS" log line' }
 }
+
+# --- 12. stdout/stderr stream separation fix + cross-cutting audit ----------
+#
+# Real VM failure, root-caused by independent review: Invoke-K8TsharkFieldDecode
+# ran `docker exec ... tshark ... 2>&1`, merging tshark's own stderr
+# root-execution warning ("Running as user \"root\" and group \"root\". This
+# could be dangerous.") into the value parsed as a 9-column TSV row, which
+# threw "unexpected tshark row shape". Fix: Invoke-K8SeparatedNativeCapture
+# redirects stderr to a separate temp file (`2>$stderrFile`, never `2>&1`),
+# returning Stdout/Stderr/ExitCode as distinct values -- never a hardcoded
+# exclusion of that one warning string, which would only mask the next
+# tool's next unrelated stderr line. Cross-audited every OTHER call site in
+# this module that parses stdout as structured data (JSON, TSV, an exact
+# container-id/SHA/HTTP-status match) for the same defect class and fixed
+# each at the same call site (listed in the loop below); sites that only
+# ever retain output as a human-read text log (never parsed for a machine
+# decision) were deliberately left on `2>&1`, since merging stderr into a
+# transcript meant for a person to read is correct, not a defect.
+
+Assert-K8Test 'Invoke-K8SeparatedNativeCapture redirects stderr to a separate file (2>$file), never merges via 2>&1, and preserves the real exit code' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8SeparatedNativeCapture'
+    # Scope the negative check to the actual invocation statement, not this
+    # function's own docstring, which legitimately quotes/explains "2>&1" as
+    # the bug pattern it exists to avoid.
+    $invocationLine = ($body -split "`n") | Where-Object { $_ -match '\$stdout\s*=' }
+    if (-not $invocationLine) { throw 'could not locate the native-command invocation line' }
+    if ($invocationLine -match '2>&1') { throw 'Invoke-K8SeparatedNativeCapture merges stderr via 2>&1 -- defeats its own purpose' }
+    if ($invocationLine -notmatch '2>\$stderrFile') { throw 'stderr is no longer redirected to a separate file' }
+    if ($body -notmatch '\$LASTEXITCODE') { throw 'the real native exit code is no longer captured' }
+}
+
+Assert-K8Test 'REGRESSION: ConvertTo-K8PythonExecOneLiner flattens a multi-line python3 -c script to one line with no embedded newline, and the flattened form still runs correctly' {
+    # Found while writing this round's own regression tests: this module's
+    # docker mock is invoked through a .cmd batch trampoline (deliberately,
+    # so it resolves as a real external process like docker.exe, not an
+    # in-process PS1 script) -- and cmd.exe's line-oriented parser corrupts
+    # any argument containing a literal embedded newline before the batch
+    # body ever runs. Wait-K8ZoneDetectorReady's connectivity/search checks
+    # build multi-line python3 -c scripts; this fixes that at the source
+    # rather than only in the mock.
+    Import-Module $CommonPath -Force
+    $multiline = "import sys`ntry:`n sys.stdout.write('ok')`nexcept Exception as e:`n sys.stdout.write('ERROR:'+str(e))`n sys.exit(1)`n"
+    $flattened = ConvertTo-K8PythonExecOneLiner -Script $multiline
+    if ($flattened.Contains([char]10) -or $flattened.Contains([char]13)) { throw 'flattened script still contains a raw embedded newline/carriage-return byte' }
+    if ($flattened -notmatch "^exec\('") { throw 'flattened script is not wrapped in exec(...)' }
+    $pythonExe = Get-Command python -ErrorAction SilentlyContinue
+    if ($pythonExe) {
+        $out = & $pythonExe.Source -c $flattened
+        if ($LASTEXITCODE -ne 0 -or $out -ne 'ok') { throw "flattened script did not execute correctly (exit $LASTEXITCODE, out '$out')" }
+    }
+    else {
+        Write-Host '  (no python on PATH -- skipped the live-execution half of this check, structural half still verified)'
+    }
+    # The real scripts this wraps (Wait-K8ZoneDetectorReady) are full of
+    # single-quoted python string literals ('ERROR:', 'HTTPERROR:', the
+    # $esUrl literal, etc.) -- $multiline above already exercises that via
+    # 'ok' and 'ERROR:'+str(e), and the live-execution check above already
+    # proves those single quotes survive the exec('...') round-trip
+    # correctly (output was exactly 'ok', not a syntax error or truncation).
+}
+
+Assert-K8Test 'REGRESSION: Invoke-K8TsharkFieldDecode no longer merges tshark stderr into the parsed stdout via 2>&1' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8TsharkFieldDecode'
+    # Scope the negative check to lines that actually invoke tshark (not this
+    # function's own explanatory comment/docstring, which legitimately
+    # quotes the old buggy `2>&1` pattern in prose while describing the fix).
+    $tsharkLines = ($body -split "`n") | Where-Object { $_ -match "'tshark'" -or $_ -match '\btshark\b.*-r\b' }
+    foreach ($line in $tsharkLines) {
+        if ($line -match '2>&1') { throw "a tshark invocation line still merges stdout/stderr via 2>&1 -- the root-warning contamination bug may be back: $line" }
+    }
+    if ($body -notmatch 'Invoke-K8SeparatedNativeCapture') { throw 'Invoke-K8TsharkFieldDecode no longer uses the separated-capture helper' }
+    if ($body -notmatch '\$capture\.ExitCode -ne 0') { throw 'tshark exit code is no longer checked/fail-closed' }
+    if ($body -notmatch '\$capture\.Stderr') { throw 'tshark stderr is no longer retained as a failure diagnostic' }
+}
+
+Assert-K8Test 'Wait-K8ZoneDetectorReady flattens both its python3 -c scripts via ConvertTo-K8PythonExecOneLiner before passing them as a native argument' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Wait-K8ZoneDetectorReady'
+    foreach ($needle in @(
+        "(ConvertTo-K8PythonExecOneLiner -Script `$connectivityScript)",
+        "(ConvertTo-K8PythonExecOneLiner -Script `$searchScript)"
+    )) {
+        if ($body -notmatch [regex]::Escape($needle)) { throw "missing flattening call: $needle" }
+    }
+}
+
+$tier1SeparatedCaptureSites = @(
+    'Get-K8ExpectedServices', 'Invoke-K8ElasticsearchRequest', 'Wait-K8ElasticsearchReady',
+    'Get-K8Dnp3OperationalCanaryHits', 'Wait-K8ComposeReady', 'Write-K8ImageInventory',
+    'Write-K8RuntimeContractRecord', 'Wait-K8ZoneDetectorReady'
+)
+foreach ($fn in $tier1SeparatedCaptureSites) {
+    Assert-K8Test "Cross-cutting audit: $fn parses native stdout via Invoke-K8SeparatedNativeCapture, not a merged 2>&1 capture" {
+        $body = Get-K8FunctionBodyText -Path $CommonPath -Name $fn
+        if ($body -notmatch 'Invoke-K8SeparatedNativeCapture') { throw "$fn no longer calls Invoke-K8SeparatedNativeCapture -- the stderr-contamination fix for this call site may have been reverted" }
+    }
+}
+
+$mockDockerDir3 = Join-Path $ShakedownDir 'tests\mock-docker'
+$rootWarnOriginalPath = $env:PATH
+try {
+    $env:PATH = "$mockDockerDir3;$env:PATH"
+    Import-Module $CommonPath -Force
+
+    Assert-K8Test 'REGRESSION 1/4: stdout=valid 9-column row + stderr=root warning + exit 0 -> parses as exactly 1 hit' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-rootwarn-hit-" + [guid]::NewGuid())
+        $gt = Join-Path $dir 'ground-truth\independent-capture'
+        New-Item -ItemType Directory -Force -Path $gt | Out-Null
+        'fake' | Set-Content (Join-Path $gt 'c2-original-path.pcap')
+        try {
+            $env:K8_MOCK_DOCKER_STATE = 'decode-hit-with-root-warning'
+            $ws = ([datetimeoffset]::UtcNow).AddSeconds(-100).ToString('o'); $we = ([datetimeoffset]::UtcNow).AddSeconds(100).ToString('o')
+            Write-K8TargetCaptureDecode -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -Stage 'ground-truth' -WindowStartIso $ws -WindowEndIso $we
+            $result = Get-Content (Join-Path $gt 'decoded-verification.json') -Raw | ConvertFrom-Json
+            if ($result.decoded_hit_count -ne 1) { throw "decoded_hit_count was $($result.decoded_hit_count), expected 1 -- tshark's stderr root-warning may be contaminating the stdout TSV parse again" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION 2/4: stdout=zero rows + stderr=root warning + exit 0 -> processed as 0 hits, does not throw' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-rootwarn-empty-" + [guid]::NewGuid())
+        $sensor = Join-Path $dir 'sensor-input\mirror-capture'
+        New-Item -ItemType Directory -Force -Path $sensor | Out-Null
+        'fake' | Set-Content (Join-Path $sensor 'c2-mirror-sensor.pcap')
+        try {
+            $env:K8_MOCK_DOCKER_STATE = 'decode-empty-with-root-warning'
+            $ws = ([datetimeoffset]::UtcNow).AddSeconds(-100).ToString('o'); $we = ([datetimeoffset]::UtcNow).AddSeconds(100).ToString('o')
+            Write-K8TargetCaptureDecode -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -Stage 'sensor' -WindowStartIso $ws -WindowEndIso $we
+            $result = Get-Content (Join-Path $sensor 'decoded-verification.json') -Raw | ConvertFrom-Json
+            if ($result.decoded_hit_count -ne 0) { throw "expected decoded_hit_count 0, got $($result.decoded_hit_count)" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION 3/4: stdout=garbage + stderr=real error + exit nonzero -> fail-closed, stderr surfaced as diagnostic' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-rootwarn-err-" + [guid]::NewGuid())
+        $gt = Join-Path $dir 'ground-truth\independent-capture'
+        New-Item -ItemType Directory -Force -Path $gt | Out-Null
+        'fake' | Set-Content (Join-Path $gt 'c2-original-path.pcap')
+        try {
+            $env:K8_MOCK_DOCKER_STATE = 'decode-error-with-message'
+            $ws = ([datetimeoffset]::UtcNow).AddSeconds(-100).ToString('o'); $we = ([datetimeoffset]::UtcNow).AddSeconds(100).ToString('o')
+            $stopped = $false; $msg = ''
+            try { Write-K8TargetCaptureDecode -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -Stage 'ground-truth' -WindowStartIso $ws -WindowEndIso $we }
+            catch { $stopped = $true; $msg = $_.Exception.Message }
+            if (-not $stopped) { throw 'a non-zero tshark exit with a garbage stdout line did not fail-closed' }
+            if ($msg -notmatch 'some transport error occurred') { throw "stderr diagnostic was not surfaced in the failure message (got: $msg)" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION 4/4: R-OBS-05 shared decode path (Write-K8UnrelatedPcapRows) is also immune to stderr root-warning contamination' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-rootwarn-robs05-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir 'sensor-input\mirror-capture'), (Join-Path $dir 'contract-output') | Out-Null
+        'fake' | Set-Content (Join-Path $dir 'sensor-input\mirror-capture\c2-mirror-sensor.pcap')
+        try {
+            $env:K8_MOCK_DOCKER_STATE = 'decode-hit-with-root-warning'
+            $path = Write-K8UnrelatedPcapRows -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir
+            $rows = Get-Content $path -Raw | ConvertFrom-Json
+            if ($rows.Count -ne 1) { throw "expected exactly 1 retained row despite the stderr root-warning, got $($rows.Count) -- the shared decode path may still be contaminating rows with stderr text" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+finally { $env:PATH = $rootWarnOriginalPath }
 
 # --- 7. Study01/ untouched on this branch -------------------------------------
 

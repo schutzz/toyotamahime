@@ -159,6 +159,84 @@ function Invoke-K8ShakedownCommand {
     return [pscustomobject]@{ ExitCode = $exit; Output = $output }
 }
 
+function Invoke-K8SeparatedNativeCapture {
+    <#
+        Runs a native command with STDOUT and STDERR captured into SEPARATE
+        values -- never merged via `2>&1` -- for exactly one purpose: this
+        module parsing that command's stdout as machine-readable data (JSON,
+        TSV, a bare container ID/SHA/HTTP status).
+
+        Root cause this exists to fix (independent review, real VM run
+        k8shakedown-rangea-20260829-033618): `docker exec ... tshark ...
+        2>&1` merged tshark's own "Running as user root and group root.
+        This could be dangerous." stderr warning into the captured stdout,
+        which the caller then tried to parse as a 9-column TSV row and
+        threw "unexpected tshark row shape." This was a Shakedown parser
+        defect, not a scientific finding, and the fix is structural stream
+        separation -- NOT a hardcoded exclusion of that one warning string,
+        which would only mask the next tool's next unrelated stderr line.
+
+        Cross-audited (same review round) for the same defect class across
+        every OTHER call site in this module that parses stdout as
+        structured data (JSON via ConvertFrom-Json, an exact single-value
+        match, a fixed-column TSV row) and fixed at each -- see this
+        function's callers. Call sites that only ever retain output as a
+        raw text log for human review (never parsed for a machine
+        decision) were deliberately left on `2>&1`, since merging stderr
+        into a HUMAN-READ transcript is correct, not a defect.
+
+        Exit code is always the real native exit code (never swallowed);
+        stderr is always returned so a caller can put it in a fail-closed
+        diagnostic rather than discarding it.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $FilePath,
+        [string[]] $ArgumentList = @()
+    )
+    $stderrFile = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-stderr-" + [guid]::NewGuid().ToString('N') + '.txt')
+    try {
+        $stdout = @(& $FilePath @ArgumentList 2>$stderrFile)
+        $exitCode = $LASTEXITCODE
+        $stderr = if (Test-Path $stderrFile) { Get-Content $stderrFile -Raw } else { '' }
+    }
+    finally {
+        Remove-Item $stderrFile -ErrorAction SilentlyContinue
+    }
+    return [pscustomobject]@{ Stdout = $stdout; Stderr = $(if ($stderr) { $stderr } else { '' }); ExitCode = $exitCode }
+}
+
+function ConvertTo-K8PythonExecOneLiner {
+    <#
+        Flattens a multi-line `python3 -c` script into a single logical line
+        with no embedded newline byte, by wrapping it in exec('...') and
+        replacing real newlines with Python's own `\n` string escape (which
+        exec()'s string literal decodes back into a real newline when the
+        code actually runs) -- the same "let the consumer's own escape
+        syntax do the work, never smuggle a raw control character through an
+        argv boundary" principle as the curl `-w` `\n` fix elsewhere in this
+        module.
+
+        Found necessary during this round's own regression testing: this
+        module's docker mock (tests/mock-docker) is invoked through a .cmd
+        batch trampoline so it resolves as a real external process (the same
+        Application-type resolution as real docker.exe, not the PS1
+        Script-type resolution that would run it in-process and mask stderr
+        behavior). cmd.exe is a line-oriented interpreter -- a literal
+        embedded newline inside a single argument corrupts its OWN
+        command-line parsing before the batch file's body ever runs,
+        silently truncating/splitting the argument (confirmed by direct A/B
+        testing: identical args survive intact through a raw native process,
+        but not through a .cmd trampoline). Real docker.exe is a native
+        binary and never has this problem, but flattening the source here
+        removes the dependency on a raw control character surviving several
+        stacked process boundaries at all, which is worth doing regardless
+        of the mock.
+    #>
+    param([Parameter(Mandatory)][string] $Script)
+    $escaped = $Script.Replace('\', '\\').Replace("'", "\'").Replace("`r`n", "`n").Replace("`n", '\n')
+    return "exec('$escaped')"
+}
+
 function Invoke-K8ShakedownLoggedCommand {
     <# Runs a noisy native command with its complete combined output redirected
        to a per-run Shakedown runtime log outside the scientific evidence tree.
@@ -334,19 +412,22 @@ function Install-K8RangeCDependencies {
 function Get-K8ExpectedServices {
     <# The Compose file's own declared service set -- not a hardcoded list,
        so a manifest variant with more/fewer services is still checked
-       correctly against itself. #>
+       correctly against itself. STDOUT/STDERR captured separately: a
+       Compose deprecation notice or similar warning on stderr must not be
+       merged in and mistaken for a service name. #>
     param(
         [Parameter(Mandatory)][string] $RunId,
         [Parameter(Mandatory)][string] $ComposePath
     )
-    $services = @(docker compose -p $RunId -f $ComposePath config --services 2>&1 | Where-Object { $_ -and $_.Trim() })
-    if ($LASTEXITCODE -ne 0) {
-        throw "'docker compose config --services' failed for $ComposePath"
+    $capture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'config', '--services')
+    if ($capture.ExitCode -ne 0) {
+        throw "'docker compose config --services' failed for $ComposePath (exit $($capture.ExitCode)). stderr: $($capture.Stderr.Trim())"
     }
+    $services = @($capture.Stdout | Where-Object { $_ -and $_.Trim() })
     if ($services.Count -eq 0) {
         throw "Could not determine the expected service set via 'compose config --services' for $ComposePath; not proceeding without knowing what 'ready' means."
     }
-    return $services
+    return ,$services
 }
 
 function ConvertFrom-K8ComposePsJson {
@@ -506,9 +587,17 @@ function Wait-K8ElasticsearchReady {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         $attemptStart = (Get-Date).ToUniversalTime().ToString('o')
-        $raw = (docker exec $container curl -sS --max-time 5 -w "`n${marker}:%{http_code}" http://localhost:9200/_cluster/health 2>&1 | Out-String)
-        $curlExit = $LASTEXITCODE
-        $record = [ordered]@{ attempt_utc=$attemptStart; curl_exit=$curlExit; http_status=$null; cluster_status=$null; body_parsed=$false }
+        # STDOUT/STDERR captured separately: curl's own stderr diagnostics
+        # must never be merged into the body+marker text this regex parses.
+        # The -w value uses curl's OWN literal `\n` escape (two characters,
+        # backslash-then-n; curl expands it to a real newline when it writes
+        # -w's output), not a raw embedded newline byte in the argument --
+        # curl documents this escape specifically so callers never have to
+        # smuggle a literal control character through a shell/argv boundary.
+        $healthCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $container, 'curl', '-sS', '--max-time', '5', '-w', "\n${marker}:%{http_code}", 'http://localhost:9200/_cluster/health')
+        $raw = ($healthCapture.Stdout | Out-String)
+        $curlExit = $healthCapture.ExitCode
+        $record = [ordered]@{ attempt_utc=$attemptStart; curl_exit=$curlExit; curl_stderr=$healthCapture.Stderr.Trim(); http_status=$null; cluster_status=$null; body_parsed=$false }
         if ($curlExit -eq 0 -and $raw -match "(?s)^(.*)\r?\n${marker}:(\d+)\s*$") {
             $bodyText = $Matches[1]
             $record.http_status = $Matches[2]
@@ -593,10 +682,15 @@ function Get-K8Dnp3OperationalCanaryHits {
     # than by a T0 this check runs before.
     $query = '{"size":3,"track_total_hits":true,"sort":[{"_doc":"desc"}],"query":{"bool":{"minimum_should_match":1,"should":[{"bool":{"filter":[{"term":{"layers.ip.ip_ip_src.keyword":"10.1.10.10"}},{"term":{"layers.ip.ip_ip_dst.keyword":"10.1.40.10"}},{"term":{"layers.tcp.tcp_tcp_dstport.keyword":"20000"}},{"terms":{"layers.dnp3.dnp3_dnp3_al_func.keyword":["1","5"]}},{"term":{"layers.dnp3.dnp3_dnp3_src.keyword":"1"}},{"term":{"layers.dnp3.dnp3_dnp3_dst.keyword":"20"}}]}},{"bool":{"filter":[{"term":{"layers.ip.ip_ip_src.keyword":"10.1.40.10"}},{"term":{"layers.ip.ip_ip_dst.keyword":"10.1.10.10"}},{"term":{"layers.tcp.tcp_tcp_srcport.keyword":"20000"}},{"term":{"layers.dnp3.dnp3_dnp3_al_func.keyword":"129"}},{"term":{"layers.dnp3.dnp3_dnp3_src.keyword":"20"}},{"term":{"layers.dnp3.dnp3_dnp3_dst.keyword":"1"}}]}}]}}}'
     $marker = 'K8_HTTP_STATUS'
-    $raw = (docker exec $container curl -sS --max-time 5 -X POST 'http://localhost:9200/ot-logs-dnp3-*/_search' -H 'Content-Type: application/json' --data-binary $query -w "`n${marker}:%{http_code}" 2>&1 | Out-String)
-    $curlExit = $LASTEXITCODE
+    # STDOUT/STDERR captured separately: curl's own stderr must not be
+    # merged into the body+marker text this regex parses. As above, `\n` is
+    # curl's OWN -w escape (expanded by curl itself), not a raw embedded
+    # newline byte in the argument.
+    $canaryCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $container, 'curl', '-sS', '--max-time', '5', '-X', 'POST', 'http://localhost:9200/ot-logs-dnp3-*/_search', '-H', 'Content-Type: application/json', '--data-binary', $query, '-w', "\n${marker}:%{http_code}")
+    $raw = ($canaryCapture.Stdout | Out-String)
+    $curlExit = $canaryCapture.ExitCode
     if ($curlExit -ne 0 -or $raw -notmatch "(?s)^(.*)\r?\n${marker}:(\d+)\s*$") {
-        throw "operational-canary query transport failure (curl exit $curlExit): $raw"
+        throw "operational-canary query transport failure (curl exit $curlExit): stdout=$raw stderr=$($canaryCapture.Stderr.Trim())"
     }
     $bodyText = $Matches[1]
     $httpStatus = $Matches[2]
@@ -807,9 +901,15 @@ function Wait-K8ZoneDetectorReady {
         # own default if unset), then check connectivity from inside it.
         $esUrlRaw = (docker exec $container sh -lc 'printf "%s" "${ES_URL:-http://elasticsearch:9200}"' 2>&1 | Out-String).Trim()
         $esUrl = if ($esUrlRaw) { $esUrlRaw } else { 'http://elasticsearch:9200' }
+        # STDOUT/STDERR captured separately for both python3 checks below: a
+        # stray interpreter warning on stderr (e.g. a DeprecationWarning)
+        # merged into stdout would corrupt the exact `^2[0-9][0-9]$` match
+        # even on an otherwise-successful request -- the same defect class
+        # as the tshark stdout/stderr bug this round's review found.
         $connectivityScript = "import sys,urllib.request`ntry:`n r=urllib.request.urlopen('$esUrl/_cluster/health',timeout=5)`n sys.stdout.write(str(r.status))`nexcept Exception as e:`n sys.stdout.write('ERROR:'+str(e))`n sys.exit(1)`n"
-        $connOut = (docker exec $container python3 -c $connectivityScript 2>&1 | Out-String).Trim()
-        $connExit = $LASTEXITCODE
+        $connCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $container, 'python3', '-c', (ConvertTo-K8PythonExecOneLiner -Script $connectivityScript))
+        $connOut = ($connCapture.Stdout | Out-String).Trim()
+        $connExit = $connCapture.ExitCode
         $connectivityOk = ($connExit -eq 0 -and $connOut -match '^2[0-9][0-9]$')
 
         # The plugin's own literal search, from inside its own container,
@@ -818,8 +918,9 @@ function Wait-K8ZoneDetectorReady {
         $searchResult = $null
         if ($connectivityOk) {
             $searchScript = "import sys,json,urllib.request,urllib.error`nbody=b'{`"size`": 50, `"sort`": [{`"_doc`": `"desc`"}], `"query`": {`"wildcard`": {`"layers.frame.frame_frame_protocols`": `"*dnp3*`"}}}'`ntry:`n req=urllib.request.Request('$esUrl/ot-logs-dnp3-*/_search',data=body,headers={'Content-Type':'application/json'},method='POST')`n r=urllib.request.urlopen(req,timeout=5)`n raw=r.read()`n json.loads(raw)`n sys.stdout.write(str(r.status))`nexcept urllib.error.HTTPError as e:`n sys.stdout.write('HTTPERROR:'+str(e.code))`n sys.exit(1)`nexcept Exception as e:`n sys.stdout.write('ERROR:'+str(e))`n sys.exit(1)`n"
-            $searchResult = (docker exec $container python3 -c $searchScript 2>&1 | Out-String).Trim()
-            $searchExit = $LASTEXITCODE
+            $searchCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $container, 'python3', '-c', (ConvertTo-K8PythonExecOneLiner -Script $searchScript))
+            $searchResult = ($searchCapture.Stdout | Out-String).Trim()
+            $searchExit = $searchCapture.ExitCode
             $searchOk = ($searchExit -eq 0 -and $searchResult -match '^2[0-9][0-9]$')
         }
 
@@ -891,19 +992,24 @@ function Invoke-K8ElasticsearchRequest {
     $remoteBody = "/tmp/k8-es-$([guid]::NewGuid().ToString('N')).body"
     # Old curl compatibility: one HTTP request writes the body separately and
     # emits only the status. No newer curl failure-body flag, retry, or resend.
+    # STDOUT/STDERR captured SEPARATELY throughout: curl's own `-sS` still
+    # shows real errors on stderr, and merging that into the expected
+    # bare-3-digit-status stdout would corrupt every scientific ES request's
+    # HTTP-status parse (Collector, Rule, mapping, R-OBS-05 all share this).
     $curlArgs = @('exec', $container, 'curl', '-sS', '-o', $remoteBody, '-w', '%{http_code}', '-X', $Method,
         "http://localhost:9200/$Endpoint", '-H', 'Content-Type: application/json')
     if ($Body) { $curlArgs += @('--data-binary', $Body) }
-    $statusOutput = @(docker @curlArgs 2>&1)
-    $curlExit = $LASTEXITCODE
-    $bodyOutput = @(docker exec $container cat $remoteBody 2>&1)
-    $bodyExit = $LASTEXITCODE
+    $statusCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList $curlArgs
+    $curlExit = $statusCapture.ExitCode
+    $bodyCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $container, 'cat', $remoteBody)
+    $bodyExit = $bodyCapture.ExitCode
     docker exec $container rm -f $remoteBody 2>&1 | Out-Null
-    $rawBody = if ($bodyExit -eq 0) { $bodyOutput | Out-String } else { '' }
+    $rawBody = if ($bodyExit -eq 0) { $bodyCapture.Stdout | Out-String } else { '' }
     $effectiveExit = if ($curlExit -ne 0) { $curlExit } elseif ($bodyExit -ne 0) { 98 } else { 0 }
+    $diagnostic = "stdout: $($statusCapture.Stdout -join ' ') | stderr: $($statusCapture.Stderr.Trim()) | body-read stderr: $($bodyCapture.Stderr.Trim())"
     Complete-K8ElasticsearchResponse -CurlExitCode $effectiveExit `
-        -HttpStatus $(if ($curlExit -eq 0) { ($statusOutput | Out-String).Trim() } else { '' }) `
-        -RawBody $rawBody -TransportDiagnostic ($statusOutput | Out-String) -OutputPath $OutputPath `
+        -HttpStatus $(if ($curlExit -eq 0) { ($statusCapture.Stdout -join '').Trim() } else { '' }) `
+        -RawBody $rawBody -TransportDiagnostic $diagnostic -OutputPath $OutputPath `
         -RequestLabel "Elasticsearch $Method $Endpoint"
 }
 
@@ -947,8 +1053,19 @@ function Invoke-K8TsharkFieldDecode {
     & docker cp $LocalPcapPath "${Container}:$remote" 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "could not copy $LocalPcapPath into log_structurer for decode" }
     try {
-        $raw = @(docker exec $Container tshark -r $remote -Y $DisplayFilter -T fields -E 'separator=\t' -e frame.number -e frame.time_epoch -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e dnp3.al.func -e dnp3.src -e dnp3.dst 2>&1)
-        if ($LASTEXITCODE -ne 0) { throw "tshark decode failed for $LocalPcapPath`: $($raw -join ' ')" }
+        # STDOUT and STDERR captured SEPARATELY: tshark writes "Running as
+        # user 'root' and group 'root'. This could be dangerous." (and
+        # similar diagnostics) to stderr, which a merged `2>&1` capture
+        # would hand to the TSV parser below as if it were a data row.
+        $capture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @(
+            'exec', $Container, 'tshark', '-r', $remote, '-Y', $DisplayFilter, '-T', 'fields', '-E', 'separator=\t',
+            '-e', 'frame.number', '-e', 'frame.time_epoch', '-e', 'ip.src', '-e', 'ip.dst',
+            '-e', 'tcp.srcport', '-e', 'tcp.dstport', '-e', 'dnp3.al.func', '-e', 'dnp3.src', '-e', 'dnp3.dst'
+        )
+        if ($capture.ExitCode -ne 0) {
+            throw "tshark decode failed (exit $($capture.ExitCode)) for $LocalPcapPath. stderr: $($capture.Stderr.Trim())"
+        }
+        $raw = $capture.Stdout
     }
     finally {
         docker exec $Container rm -f $remote 2>&1 | Out-Null
@@ -1716,7 +1833,10 @@ function Wait-K8ComposeReady {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $lastRaw = ''
     while ((Get-Date) -lt $deadline) {
-        $lastRaw = (docker compose -p $RunId -f $ComposePath ps --all --format json 2>&1 | Out-String)
+        # STDOUT/STDERR captured separately: a Compose warning on stderr
+        # must not be merged into the JSON this parses.
+        $psCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '--all', '--format', 'json')
+        $lastRaw = ($psCapture.Stdout | Out-String)
         try {
             $services = @(ConvertFrom-K8ComposePsJson -Raw $lastRaw)
             $gate = Test-K8ComposeServiceReadiness -Expected $expected -Services $services
@@ -1749,8 +1869,12 @@ function Write-K8ImageInventory {
     )
     $envDir = Join-Path $RunEvidence 'environment'
     $expected = @(Get-K8ExpectedServices -RunId $RunId -ComposePath $ComposePath)
-    $psJson = docker compose -p $RunId -f $ComposePath images --format json 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "docker compose images failed; image inventory is mandatory" }
+    # STDOUT/STDERR captured separately throughout: a stray Compose/Docker
+    # stderr line merged into either JSON capture below would corrupt the
+    # mandatory image inventory (a completeness-gate-required artifact).
+    $imagesCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'images', '--format', 'json')
+    if ($imagesCapture.ExitCode -ne 0) { throw "docker compose images failed (exit $($imagesCapture.ExitCode)); image inventory is mandatory. stderr: $($imagesCapture.Stderr.Trim())" }
+    $psJson = $imagesCapture.Stdout
     $psJson | Set-Content -Path (Join-Path $envDir 'compose-images.json') -Encoding utf8NoBOM
     (docker compose -p $RunId -f $ComposePath ps 2>&1) | Set-Content -Path (Join-Path $envDir 'compose-ps.txt') -Encoding utf8NoBOM
 
@@ -1765,8 +1889,9 @@ function Write-K8ImageInventory {
         $tag = Get-K8ObjectPropertyValue -Object $img -Name 'Tag'
         $ref = if ($id) { $id } elseif ($repository -and $tag) { "${repository}:$tag" } else { $null }
         if (-not $ref) { throw "image reference/ID missing for expected service '$service'" }
-        $raw = (docker image inspect $ref 2>&1 | Out-String)
-        if ($LASTEXITCODE -ne 0) { throw "docker image inspect failed for service '$service' image '$ref'" }
+        $inspectCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('image', 'inspect', $ref)
+        if ($inspectCapture.ExitCode -ne 0) { throw "docker image inspect failed for service '$service' image '$ref' (exit $($inspectCapture.ExitCode)). stderr: $($inspectCapture.Stderr.Trim())" }
+        $raw = ($inspectCapture.Stdout | Out-String)
         $inspection = @($raw | ConvertFrom-Json)
         if ($inspection.Count -ne 1 -or -not $inspection[0].Id) { throw "inspect result for '$service' lacks an immutable image Id" }
         $digests = @($inspection[0].RepoDigests | Where-Object { $_ })
@@ -1811,9 +1936,11 @@ function Write-K8RuntimeContractRecord {
     )
     $contractDir = Join-Path $RunEvidence 'contract-output'
     $psText = (docker compose -p $RunId -f $ComposePath ps 2>&1 | Out-String)
-    $psJson = (docker compose -p $RunId -f $ComposePath ps --all --format json 2>&1 | Out-String)
-    if ($LASTEXITCODE -ne 0) { throw 'docker compose ps --format json failed while building the runtime contract record' }
-    $services = @(ConvertFrom-K8ComposePsJson -Raw $psJson)
+    # STDOUT/STDERR captured separately: a stray stderr line must not be
+    # merged into the JSON this parses for the Range B service-state gate.
+    $psJsonCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '--all', '--format', 'json')
+    if ($psJsonCapture.ExitCode -ne 0) { throw "docker compose ps --format json failed while building the runtime contract record (exit $($psJsonCapture.ExitCode)). stderr: $($psJsonCapture.Stderr.Trim())" }
+    $services = @(ConvertFrom-K8ComposePsJson -Raw ($psJsonCapture.Stdout | Out-String))
     $lines = @()
     $lines += "# Runtime contract observational record -- $RunId"
     $lines += ''
