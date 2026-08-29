@@ -1012,6 +1012,221 @@ function Resolve-K8GatewayInterface {
     return [pscustomobject]@{ Router = $router; Observer = $observer; Interface = $resolvedIf }
 }
 
+# ---------------------------------------------------------------------------
+# T0-relative timing gates (independent review round 5, BLOCKER)
+#
+# ROOT CAUSE, confirmed against the frozen source, not assumed: this module
+# previously called `study01_capture.py stop-export` immediately after the
+# sender, commented "covers the settle window internally per capture.py".
+# That comment was simply wrong. Study01/studies/study-01-negative-result/
+# scripts/study01_capture.py's own docstring says "Run `stop-export` only
+# after `T0 + 15 s`" -- stop_export() itself contains no wait at all; the
+# 15s wait is entirely the CALLER's responsibility. capture_lifecycle.py's
+# validate() enforces this by requiring the window-end-liveness-check step's
+# own START timestamp to be >= T0 + 15s. A real VM run
+# (k8shakedown-rangea-20260829-021350) called stop-export ~13.465s too
+# early and the frozen validator correctly rejected it:
+#   "helper liveness was not observed at or after the window end
+#    (2026-08-29T02:17:14.197604+00:00 < 2026-08-29T02:17:27.662946+00:00)"
+#
+# Auditing the SAME class of bug at the OTHER edge of the frozen window
+# (the window-START requirement, capture_lifecycle.py: each stage's
+# listening-check must COMPLETE at or before T0 - 5s) found it was ALSO
+# only true "by luck" -- this runner's prior code relied on the sender-prep
+# docker exec round trips (mkdir, docker cp, sha256sum) happening to take
+# at least 5 seconds after the last listening-check, with no explicit
+# guarantee. On a fast host that gap could plausibly be under 5 seconds,
+# which would fail the SAME validator the SAME way, just at the other edge.
+# Wait-K8CaptureWindowStart closes that proactively, before it was ever hit
+# on a real run.
+#
+# Neither gate ever re-sends the sender, retries a capture step, or changes
+# WINDOW_LEAD/WINDOW_TAIL (5s/15s) -- both are read from
+# capture_lifecycle.py's own frozen values in spirit (hardcoded here as the
+# same 5/15 since this is PowerShell, not importing Python), never widened,
+# and both fail closed on a missing/malformed/offset-less timestamp rather
+# than silently proceeding.
+# ---------------------------------------------------------------------------
+
+function Wait-K8CaptureWindowStart {
+    <#
+        Frozen requirement: capture_lifecycle.py's validate() requires each
+        capture stage's OWN retained "listening-check" step to have
+        COMPLETED (`completed_at`) at or before T0 - 5s. T0 does not exist
+        yet at this point (it is stamped by study01_sender.py at the moment
+        it actually sends), so this reads back the real retained completion
+        timestamp for BOTH stages' listening-check (never a guessed
+        wall-clock mark) and waits, if needed, until at least 5s (plus a
+        small safety margin) have elapsed since the LATER of the two --
+        guaranteeing that whenever the sender ends up stamping T0, the
+        already-completed listening-checks are mechanically at or before
+        T0 - 5s. Never retries a capture step and never touches the sender.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RunEvidence,
+        [double] $MarginSeconds = 0.5
+    )
+    $lifecyclePaths = @(
+        (Join-Path $RunEvidence 'ground-truth\independent-capture\capture-lifecycle.json'),
+        (Join-Path $RunEvidence 'sensor-input\mirror-capture\capture-lifecycle.json')
+    )
+    $latest = $null
+    foreach ($path in $lifecyclePaths) {
+        if (-not (Test-Path $path)) {
+            throw "capture-lifecycle record not found at $path; cannot confirm the frozen window-start lead time before invoking the sender. Not proceeding."
+        }
+        $record = Get-Content $path -Raw | ConvertFrom-Json
+        $step = $record.steps | Where-Object { $_.step -eq 'listening-check' } | Select-Object -First 1
+        if (-not $step -or -not (Get-K8ObjectPropertyValue -Object $step -Name 'completed_at')) {
+            throw "no 'listening-check' step with a completed_at timestamp found in $path. Not proceeding."
+        }
+        try { $completed = [datetimeoffset]::Parse($step.completed_at) }
+        catch { throw "listening-check completed_at in $path ('$($step.completed_at)') could not be parsed: $($_.Exception.Message)" }
+        if ($null -eq $latest -or $completed -gt $latest) { $latest = $completed }
+    }
+    $targetSenderNotBefore = $latest.AddSeconds(5).AddSeconds($MarginSeconds)
+    $now = [datetimeoffset]::UtcNow
+    $remaining = ($targetSenderNotBefore - $now).TotalSeconds
+    if ($remaining -gt 0) {
+        Write-K8ShakedownLog -Message "Waiting $([Math]::Round($remaining,3))s so both capture stages' listening-check (latest completion: $($latest.ToString('o'))) will be at least 5s before the sender fires (frozen window-start requirement)."
+        Start-Sleep -Seconds $remaining
+    }
+    else {
+        Write-K8ShakedownLog -Message "Capture listening-check (latest: $($latest.ToString('o'))) already more than 5s ago; no extra wait needed before the sender."
+    }
+    $envDir = Join-Path $RunEvidence 'environment'
+    New-Item -ItemType Directory -Force -Path $envDir | Out-Null
+    [ordered]@{
+        latest_listening_check_completed_utc = $latest.ToString('o')
+        target_sender_not_before_utc = $targetSenderNotBefore.ToString('o')
+        waited_seconds = [Math]::Max(0, $remaining)
+        sender_proceeding_utc = ([datetimeoffset]::UtcNow).ToString('o')
+    } | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $envDir 'capture-window-start-wait.json') -Encoding utf8NoBOM
+}
+
+function Wait-K8CaptureWindowEnd {
+    <#
+        Frozen requirement: Study01/studies/study-01-negative-result/
+        scripts/study01_capture.py's own docstring: "Run `stop-export` only
+        after `T0 + 15 s`." stop_export() itself has no wait -- it is the
+        caller's responsibility, and capture_lifecycle.py's validate()
+        enforces it by requiring the window-end-liveness-check step's own
+        START timestamp to be >= T0 + 15s.
+
+        Computes T0+15s from the retained metadata-t0.txt (written by
+        study01_sender.py at the run evidence root) and sleeps only the
+        REMAINING wall-clock time -- never a fixed "sleep N seconds after
+        the sender returns" (which would be wrong by exactly however long
+        the sender invocation itself took), and never re-sends/retries the
+        sender. If wall-clock time already exceeds T0+15s, returns
+        immediately with no extra wait.
+
+        Fail-closed on a missing, unparseable, or offset-less T0 artifact.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RunEvidence,
+        [double] $MarginSeconds = 0.5
+    )
+    $t0Path = Join-Path $RunEvidence 'metadata-t0.txt'
+    if (-not (Test-Path $t0Path)) {
+        throw "T0 record not found at $t0Path after the sender invocation; cannot compute the T0+15s window end. Not proceeding to stop-export."
+    }
+    $t0Raw = (Get-Content $t0Path -Raw).Trim()
+    if ($t0Raw -notmatch 'Z$|[+-]\d{2}:\d{2}$') {
+        throw "T0 record at $t0Path ('$t0Raw') does not carry an explicit UTC offset (no trailing Z or +hh:mm/-hh:mm). Not proceeding to stop-export."
+    }
+    try { $t0 = [datetimeoffset]::Parse($t0Raw) }
+    catch { throw "T0 record at $t0Path could not be parsed as a timestamp ('$t0Raw'): $($_.Exception.Message). Not proceeding to stop-export." }
+
+    $windowEnd = $t0.AddSeconds(15)
+    $targetWait = $windowEnd.AddSeconds($MarginSeconds)
+    $now = [datetimeoffset]::UtcNow
+    $remaining = ($targetWait - $now).TotalSeconds
+    if ($remaining -gt 0) {
+        Write-K8ShakedownLog -Message "Waiting $([Math]::Round($remaining,3))s for the frozen T0+15s window end (T0=$($t0.ToString('o')), window_end=$($windowEnd.ToString('o'))) before stop-export."
+        Start-Sleep -Seconds $remaining
+    }
+    else {
+        Write-K8ShakedownLog -Message "T0+15s window end ($($windowEnd.ToString('o'))) already passed by $([Math]::Round(-$remaining,3))s; not waiting further before stop-export."
+    }
+    $envDir = Join-Path $RunEvidence 'environment'
+    New-Item -ItemType Directory -Force -Path $envDir | Out-Null
+    [ordered]@{
+        t0 = $t0.ToString('o'); window_end = $windowEnd.ToString('o'); target_wait_with_margin = $targetWait.ToString('o')
+        waited_seconds = [Math]::Max(0, $remaining)
+        stop_export_proceeding_utc = ([datetimeoffset]::UtcNow).ToString('o')
+    } | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $envDir 'capture-window-end-wait.json') -Encoding utf8NoBOM
+}
+
+function Test-K8CaptureLifecycleEarly {
+    <#
+        Runs the FROZEN capture_lifecycle.validate()/capture_context.validate()
+        functions directly against both stages' already-retained records,
+        right after stop-export and BEFORE this runner ever prints "runtime
+        evidence PASS" -- so a capture-lifecycle timing violation (the exact
+        class of bug this round's fix addresses) surfaces here, not three
+        steps later inside Complete-K8ShakedownRange.ps1's pre-teardown
+        validate-evidence.
+
+        This is NOT a re-run of `study01_collect.py validate-evidence`: that
+        full check also requires metadata.md, deviations.md, and non-empty
+        collector-output/rule-output, none of which exist yet at this point
+        in the pipeline (they are written later, and populated by the
+        Elasticsearch queries that have not run yet). Rather than write
+        those prematurely just to satisfy an unrelated check, this imports
+        and calls the SAME two frozen validator functions
+        study01_collect.py itself uses for the capture-lifecycle portion --
+        so the semantics are identical, not reimplemented, just scoped to
+        what is actually available this early. The remaining full
+        validate-evidence still runs, unchanged, in
+        Complete-K8ShakedownRangeAB before teardown.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $ScriptsDir,
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string] $RunEvidence
+    )
+    $script = @'
+import sys, json
+sys.path.insert(0, sys.argv[3])
+from pathlib import Path
+from datetime import datetime
+from study01 import capture_context as context
+from study01 import capture_lifecycle as lifecycle
+from study01.frozen import apparatus
+
+run_evidence = Path(sys.argv[1])
+run_id = sys.argv[2]
+
+t0_path = run_evidence / apparatus.T0_ARTIFACT
+if not t0_path.is_file():
+    raise SystemExit(f"{apparatus.T0_ARTIFACT} not found at {t0_path}")
+t0_value = datetime.fromisoformat(t0_path.read_text(encoding="utf-8").strip().replace("Z", "+00:00"))
+
+for stage, spec in apparatus.CAPTURE_STAGES.items():
+    context_path = run_evidence / spec["context"]
+    lifecycle_path = run_evidence / spec["lifecycle"]
+    if not context_path.is_file() or not lifecycle_path.is_file():
+        raise SystemExit(f"{stage}: context or lifecycle record missing")
+    ctx = context.validate(json.loads(context_path.read_text(encoding="utf-8")), run_id)
+    record = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+    retained = lifecycle.validate(record, t0_value, ctx)
+    if retained["run_id"] != run_id:
+        raise SystemExit(f"{stage}: run_id does not match the evidence directory")
+
+print("capture-lifecycle early check: PASS for ground-truth and sensor")
+'@
+    $tmpScript = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-early-lifecycle-" + [guid]::NewGuid().ToString('N') + '.py')
+    Set-Content -Path $tmpScript -Value $script -Encoding utf8NoBOM
+    try {
+        Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @($tmpScript, $RunEvidence, $RunId, $ScriptsDir) `
+            -Description 'early capture-lifecycle check (frozen capture_lifecycle.validate/capture_context.validate, before runtime PASS is reported)'
+    }
+    finally {
+        Remove-Item $tmpScript -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-K8ShakedownRangeAB {
     param(
         [Parameter(Mandatory)][ValidateSet('a', 'b')][string] $Range
@@ -1141,6 +1356,12 @@ function Invoke-K8ShakedownRangeAB {
         ) -Description "capture helper start: $stage"
     }
 
+    # 7a. Frozen window-start requirement: both stages' listening-check must
+    # have COMPLETED at least 5s before T0 (which the sender is about to
+    # stamp). Waits only the remaining time actually needed; never touches
+    # the sender.
+    Wait-K8CaptureWindowStart -RunEvidence $RunEvidence
+
     # 8. Sender: directory prep -> docker cp -> hash verify -> exactly one invocation.
     $senderContainer = (docker compose -p $RunId -f $ComposePath ps -q sub_a_ied_02 | Out-String).Trim()
     if ([string]::IsNullOrWhiteSpace($senderContainer)) { throw 'sub_a_ied_02 container was not resolved' }
@@ -1161,13 +1382,33 @@ function Invoke-K8ShakedownRangeAB {
         'python3', $C.SenderAssetInContainerPath, '--target-ip', '10.1.10.10', '--target-port', '20000', '--function-code', '5', '--repeat', '1'
     ) -Description 'the one frozen trigger invocation (T0)'
 
-    # 9. Stop/export both captures (covers the settle window internally per capture.py).
+    # 8a. Frozen window-end requirement: `stop-export` must not run before
+    # T0+15s (study01_capture.py's own docstring; stop_export() itself has
+    # no wait). Waits only the remaining time actually needed; never
+    # re-sends the sender.
+    Wait-K8CaptureWindowEnd -RunEvidence $RunEvidence
+
+    # 9. Stop/export both captures. The T0+15s wait is Wait-K8CaptureWindowEnd's
+    # job (above), not this loop's or capture.py's own -- see that function's
+    # docstring for the real VM failure this fixed.
     foreach ($stage in @('ground-truth', 'sensor')) {
         Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @(
             (Join-Path $ScriptsDir 'study01_capture.py'), 'stop-export',
             '--run-id', $RunId, '--run-evidence', $RunEvidence, '--stage', $stage
         ) -Description "capture stop/export: $stage"
     }
+
+    # 9a. Frozen capture-lifecycle check, reusing the same validator functions
+    # study01_collect.py itself uses, scoped to what already exists at this
+    # point (both stages' context+lifecycle records and T0) -- so a timing
+    # violation surfaces here, before this runner ever reports "runtime
+    # evidence PASS", not only later inside Complete's pre-teardown
+    # validate-evidence. Full validate-evidence still cannot run yet
+    # (metadata.md/deviations.md/collector-output/rule-output do not exist
+    # until later steps); this is not a substitute for it, and
+    # Complete-K8ShakedownRangeAB's own pre-teardown validate-evidence call
+    # is unchanged.
+    Test-K8CaptureLifecycleEarly -ScriptsDir $ScriptsDir -RunId $RunId -RunEvidence $RunEvidence
 
     # 10. Instantiate the fixed queries from retained T0. The exact requests,
     # raw responses and mechanical correlations are executed below without

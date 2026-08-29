@@ -698,6 +698,169 @@ finally {
     $env:K8_MOCK_DOCKER_STATE = $originalMockState
 }
 
+# --- 10. T0-relative timing gates (round 5: stop-export-before-T0+15 fix) ----
+#
+# k8shakedown-rangea-20260829-021350 called stop-export ~13.465s before
+# T0+15s; capture_lifecycle.validate() correctly rejected it. These tests
+# invoke the REAL Wait-K8CaptureWindowStart/Wait-K8CaptureWindowEnd
+# functions with real Stopwatch-measured elapsed time -- not mocks -- since
+# neither needs Docker at all (they only read retained JSON/text and sleep).
+
+$capturePyPath = Join-Path $ScriptsDir 'study01_capture.py'
+$lifecyclePyPath = Join-Path $Study01 'studies\study-01-negative-result\scripts\study01\capture_lifecycle.py'
+
+Assert-K8Test 'The 5s/15s window constants match capture_lifecycle.py''s own frozen WINDOW_LEAD/WINDOW_TAIL, not independently guessed' {
+    $lifecycleSrc = Get-Content $lifecyclePyPath -Raw
+    if ($lifecycleSrc -notmatch 'WINDOW_LEAD\s*=\s*timedelta\(seconds=5\)') { throw "capture_lifecycle.py's own WINDOW_LEAD is not 5s -- this test's own pin is stale" }
+    if ($lifecycleSrc -notmatch 'WINDOW_TAIL\s*=\s*timedelta\(seconds=15\)') { throw "capture_lifecycle.py's own WINDOW_TAIL is not 15s -- this test's own pin is stale" }
+    $startBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Wait-K8CaptureWindowStart'
+    if ($startBody -notmatch '\.AddSeconds\(5\)') { throw 'Wait-K8CaptureWindowStart does not use the frozen 5s lead' }
+    $endBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Wait-K8CaptureWindowEnd'
+    if ($endBody -notmatch '\.AddSeconds\(15\)') { throw 'Wait-K8CaptureWindowEnd does not use the frozen 15s tail' }
+}
+
+Assert-K8Test 'study01_capture.py''s own docstring still requires "stop-export only after T0 + 15 s" (the requirement this fix implements)' {
+    $captureSrc = Get-Content $capturePyPath -Raw
+    if ($captureSrc -notmatch 'Run `stop-export` only after `T0 \+ 15 s`') { throw 'frozen docstring wording changed or this pin is stale -- re-check the requirement has not moved' }
+    if ($captureSrc -match 'time\.sleep' ) {
+        # stop_export() itself must still have no wait of its own -- if the
+        # frozen script ever grows one, this Shakedown-side wait would double
+        # up (harmless timing-wise, but worth knowing about, not silently).
+        $stopExportBody = ($captureSrc -split 'def stop_export')[1]
+        $stopExportBody = $stopExportBody.Substring(0, [Math]::Min(2000, $stopExportBody.Length))
+        if ($stopExportBody -match 'time\.sleep') { throw 'stop_export() now contains its own sleep -- re-check whether the Shakedown-side wait is still needed / correctly sized' }
+    }
+}
+
+Assert-K8Test 'Wait-K8CaptureWindowEnd actually waits the remaining time to T0+15s, and not a moment more than needed' {
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-t0end-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    try {
+        $t0 = ([datetimeoffset]::UtcNow).AddSeconds(-13.5)   # T0+15s is 1.5s away
+        $t0.ToString('o') | Set-Content (Join-Path $dir 'metadata-t0.txt') -Encoding utf8NoBOM
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        Wait-K8CaptureWindowEnd -RunEvidence $dir -MarginSeconds 0.1
+        $sw.Stop()
+        if ($sw.Elapsed.TotalSeconds -lt 1.3) { throw "waited only $($sw.Elapsed.TotalSeconds)s; expected roughly 1.5s+margin -- stop-export would have run before T0+15s" }
+        if ($sw.Elapsed.TotalSeconds -gt 4.0) { throw "waited $($sw.Elapsed.TotalSeconds)s -- far more than needed" }
+        if (-not (Test-Path (Join-Path $dir 'environment\capture-window-end-wait.json'))) { throw 'wait result artifact was not retained' }
+    }
+    finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'Wait-K8CaptureWindowEnd does not wait at all once T0+15s has already passed (never depends on how long the sender itself took)' {
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-t0end2-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    try {
+        (([datetimeoffset]::UtcNow).AddSeconds(-30)).ToString('o') | Set-Content (Join-Path $dir 'metadata-t0.txt') -Encoding utf8NoBOM
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        Wait-K8CaptureWindowEnd -RunEvidence $dir -MarginSeconds 0.1
+        $sw.Stop()
+        if ($sw.Elapsed.TotalSeconds -gt 1.0) { throw "waited $($sw.Elapsed.TotalSeconds)s when the window end had already passed -- this must return immediately" }
+    }
+    finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'Wait-K8CaptureWindowEnd STOPs fail-closed on missing or offset-less T0' {
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-t0end3-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    try {
+        $stopped = $false
+        try { Wait-K8CaptureWindowEnd -RunEvidence $dir } catch { $stopped = $true }
+        if (-not $stopped) { throw 'missing T0 file did not STOP' }
+
+        '2026-08-29 02:17:14' | Set-Content (Join-Path $dir 'metadata-t0.txt') -Encoding utf8NoBOM
+        $stopped = $false
+        try { Wait-K8CaptureWindowEnd -RunEvidence $dir } catch { $stopped = $true }
+        if (-not $stopped) { throw 'a T0 value with no UTC offset did not STOP' }
+    }
+    finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'Wait-K8CaptureWindowStart waits for the LATER of ground-truth/sensor listening-check, covering both stages' {
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-t0start-" + [guid]::NewGuid())
+    $gt = Join-Path $dir 'ground-truth\independent-capture'
+    $sensor = Join-Path $dir 'sensor-input\mirror-capture'
+    New-Item -ItemType Directory -Force -Path $gt, $sensor | Out-Null
+    try {
+        @{ steps = @(@{ step = 'listening-check'; completed_at = (([datetimeoffset]::UtcNow).AddSeconds(-3.0)).ToString('o') }) } |
+            ConvertTo-Json -Depth 5 | Set-Content (Join-Path $gt 'capture-lifecycle.json') -Encoding utf8NoBOM
+        @{ steps = @(@{ step = 'listening-check'; completed_at = (([datetimeoffset]::UtcNow).AddSeconds(-1.5)).ToString('o') }) } |
+            ConvertTo-Json -Depth 5 | Set-Content (Join-Path $sensor 'capture-lifecycle.json') -Encoding utf8NoBOM
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        Wait-K8CaptureWindowStart -RunEvidence $dir -MarginSeconds 0.1
+        $sw.Stop()
+        # Needed wait = 5.1 - 1.5 = 3.6s if it correctly used the LATER
+        # (sensor, -1.5s) timestamp; only 5.1 - 3.0 = 2.1s if it wrongly used
+        # ground-truth's earlier one.
+        if ($sw.Elapsed.TotalSeconds -lt 3.0) { throw "waited only $($sw.Elapsed.TotalSeconds)s -- did not use the LATER of the two stages' listening-check completion" }
+        if (-not (Test-Path (Join-Path $dir 'environment\capture-window-start-wait.json'))) { throw 'wait result artifact was not retained' }
+    }
+    finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'Wait-K8CaptureWindowStart does not wait once both stages already cleared the 5s lead, and STOPs on a missing/malformed stage record' {
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-t0start2-" + [guid]::NewGuid())
+    $gt = Join-Path $dir 'ground-truth\independent-capture'
+    $sensor = Join-Path $dir 'sensor-input\mirror-capture'
+    New-Item -ItemType Directory -Force -Path $gt, $sensor | Out-Null
+    try {
+        @{ steps = @(@{ step = 'listening-check'; completed_at = (([datetimeoffset]::UtcNow).AddSeconds(-20)).ToString('o') }) } |
+            ConvertTo-Json -Depth 5 | Set-Content (Join-Path $gt 'capture-lifecycle.json') -Encoding utf8NoBOM
+        @{ steps = @(@{ step = 'listening-check'; completed_at = (([datetimeoffset]::UtcNow).AddSeconds(-10)).ToString('o') }) } |
+            ConvertTo-Json -Depth 5 | Set-Content (Join-Path $sensor 'capture-lifecycle.json') -Encoding utf8NoBOM
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        Wait-K8CaptureWindowStart -RunEvidence $dir -MarginSeconds 0.1
+        $sw.Stop()
+        if ($sw.Elapsed.TotalSeconds -gt 1.0) { throw "waited $($sw.Elapsed.TotalSeconds)s when the 5s lead was already satisfied for both stages" }
+
+        Remove-Item (Join-Path $sensor 'capture-lifecycle.json')
+        $stopped = $false
+        try { Wait-K8CaptureWindowStart -RunEvidence $dir } catch { $stopped = $true }
+        if (-not $stopped) { throw 'missing sensor lifecycle record did not STOP' }
+
+        '{"steps":[{"step":"listening-check","completed_at":"not-a-date"}]}' | Set-Content (Join-Path $sensor 'capture-lifecycle.json') -Encoding utf8NoBOM
+        $stopped = $false
+        try { Wait-K8CaptureWindowStart -RunEvidence $dir } catch { $stopped = $true }
+        if (-not $stopped) { throw 'malformed completed_at did not STOP' }
+    }
+    finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'Wait-K8CaptureWindowStart/End and the early capture-lifecycle check are each called exactly once, unconditionally, in the right order' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+    $startCalls = @([regex]::Matches($body, 'Wait-K8CaptureWindowStart\s+-RunEvidence'))
+    $endCalls = @([regex]::Matches($body, 'Wait-K8CaptureWindowEnd\s+-RunEvidence'))
+    $earlyCalls = @([regex]::Matches($body, 'Test-K8CaptureLifecycleEarly\s+-ScriptsDir'))
+    if ($startCalls.Count -ne 1 -or $endCalls.Count -ne 1 -or $earlyCalls.Count -ne 1) {
+        throw "expected exactly one shared call site each (Range A and B use the same body); found Start=$($startCalls.Count) End=$($endCalls.Count) Early=$($earlyCalls.Count)"
+    }
+    foreach ($call in @($startCalls[0], $endCalls[0], $earlyCalls[0])) {
+        $surrounding = $body.Substring([Math]::Max(0, $call.Index - 200), 200)
+        if ($surrounding -match "Range\s+-eq\s+'[ab]'") { throw 'a T0-timing call site appears to be inside a Range-specific branch; it must be unconditional/shared' }
+    }
+    $senderIndex = $body.IndexOf("(Join-Path `$ScriptsDir 'study01_sender.py')")
+    $stopExportIndex = $body.IndexOf("'stop-export',")
+    if (-not ($startCalls[0].Index -lt $senderIndex -and $senderIndex -lt $endCalls[0].Index -and $endCalls[0].Index -lt $stopExportIndex -and $stopExportIndex -lt $earlyCalls[0].Index)) {
+        throw "wrong order: expected WindowStart -> sender -> WindowEnd -> stop-export -> early-lifecycle-check (indices: start=$($startCalls[0].Index) sender=$senderIndex end=$($endCalls[0].Index) stopExport=$stopExportIndex early=$($earlyCalls[0].Index))"
+    }
+}
+
+Assert-K8Test 'Test-K8CaptureLifecycleEarly reuses the frozen capture_context.validate/capture_lifecycle.validate functions, does not reimplement window-timing math' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Test-K8CaptureLifecycleEarly'
+    foreach ($needle in @('from study01 import capture_context', 'from study01 import capture_lifecycle', 'from study01.frozen import apparatus', 'lifecycle.validate(record, t0_value, ctx)', 'context.validate(json.loads')) {
+        if ($body -notmatch [regex]::Escape($needle)) { throw "does not import/call the frozen validator as expected (missing: $needle)" }
+    }
+    if ($body -match 'WINDOW_LEAD|WINDOW_TAIL|AddSeconds\(1?5\)') { throw 'appears to reimplement window-timing math instead of delegating to the frozen validator' }
+}
+
+Assert-K8Test 'No retry/loop construct was added to the fixed scientific Elasticsearch requests by this round''s changes' {
+    foreach ($name in @('Invoke-K8ElasticsearchRequest', 'Complete-K8ElasticsearchResponse')) {
+        $body = Get-K8FunctionBodyText -Path $CommonPath -Name $name
+        if (Test-K8HasLoopConstruct -FunctionBodyText $body) { throw "$name contains a loop construct -- must remain exactly-once" }
+    }
+}
+
 # --- 7. Study01/ untouched on this branch -------------------------------------
 
 Assert-K8Test 'Study01/ is byte-for-byte unchanged versus origin/main' {
