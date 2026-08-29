@@ -15,9 +15,10 @@
             }
           }
         },
-        {"term": {"signal": "signal-1-zone-violation"}},
-        {"term": {"src_ip": "10.1.20.11"}},
-        {"term": {"dst_ip": "10.1.10.10"}}
+        {"term": {"signal.keyword": "signal-1-zone-violation"}},
+        {"term": {"src_ip.keyword": "10.1.20.11"}},
+        {"term": {"dst_ip.keyword": "10.1.10.10"}},
+        {"terms": {"source_dnp3_doc_id.keyword": "<COLLECTOR_HIT_IDS_JSON>"}}
       ]
     }
   }

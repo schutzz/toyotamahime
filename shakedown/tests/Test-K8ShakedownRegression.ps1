@@ -422,13 +422,30 @@ Assert-K8Test 'Collector retains all hit IDs and Rule source_dnp3_doc_id is corr
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-test-" + [guid]::NewGuid())
     New-Item -ItemType Directory $tmp | Out-Null
     try {
+        # Both Rule hits correlate to the complete accepted Collector set --
+        # this is the shape the query-time source_dnp3_doc_id.keyword terms
+        # filter (fixed this round) guarantees by construction, so this is
+        # now the expected/PASS case, not merely one classification among
+        # others (see the dedicated fail-close test below for the other).
         '{"hits":{"total":{"value":2,"relation":"eq"},"hits":[{"_id":"c1","_source":{}},{"_id":"c2","_source":{}}]}}' | Set-Content (Join-Path $tmp 'c.json')
-        '{"hits":{"total":{"value":2,"relation":"eq"},"hits":[{"_id":"r1","_source":{"source_dnp3_doc_id":"c2"}},{"_id":"r2","_source":{"source_dnp3_doc_id":"missing"}}]}}' | Set-Content (Join-Path $tmp 'r.json')
+        '{"hits":{"total":{"value":2,"relation":"eq"},"hits":[{"_id":"r1","_source":{"source_dnp3_doc_id":"c2"}},{"_id":"r2","_source":{"source_dnp3_doc_id":"c1"}}]}}' | Set-Content (Join-Path $tmp 'r.json')
         & python $helper target-correlation --collector (Join-Path $tmp 'c.json') --rule (Join-Path $tmp 'r.json') --output (Join-Path $tmp 'o.json')
-        if ($LASTEXITCODE -ne 0) { throw 'helper failed' }
+        if ($LASTEXITCODE -ne 0) { throw 'helper failed on a fully-correlating fixture' }
         $result = Get-Content (Join-Path $tmp 'o.json') -Raw | ConvertFrom-Json
         if (($result.accepted_collector_hit_ids -join ',') -ne 'c1,c2') { throw 'complete Collector hit ID set was not retained' }
-        if ($result.rule_correlations[0].correlates_to_accepted_collector_hit -ne $true -or $result.rule_correlations[1].correlates_to_accepted_collector_hit -ne $false) { throw 'Rule correlation decisions incorrect' }
+        if ($result.rule_correlations[0].correlates_to_accepted_collector_hit -ne $true -or $result.rule_correlations[1].correlates_to_accepted_collector_hit -ne $true) { throw 'Rule correlation decisions incorrect' }
+        if ($result.all_rule_hits_correlate -ne $true) { throw 'all_rule_hits_correlate should be true when every hit correlates' }
+    } finally { Remove-Item $tmp -Recurse -Force }
+}
+
+Assert-K8Test 'REGRESSION: a Rule hit whose source_dnp3_doc_id does NOT match any accepted Collector hit fails closed (mechanical verification, not just retention)' {
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-test-badcorr-" + [guid]::NewGuid())
+    New-Item -ItemType Directory $tmp | Out-Null
+    try {
+        '{"hits":{"total":{"value":2,"relation":"eq"},"hits":[{"_id":"c1","_source":{}},{"_id":"c2","_source":{}}]}}' | Set-Content (Join-Path $tmp 'c.json')
+        '{"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_id":"r1","_source":{"source_dnp3_doc_id":"not-a-collector-id"}}]}}' | Set-Content (Join-Path $tmp 'r.json')
+        & python $helper target-correlation --collector (Join-Path $tmp 'c.json') --rule (Join-Path $tmp 'r.json') --output (Join-Path $tmp 'o.json') 2>$null
+        if ($LASTEXITCODE -eq 0) { throw 'a non-correlating Rule hit did not STOP -- if the query-time source_dnp3_doc_id.keyword filter ever fails to do its job, this must be caught, not silently retained' }
     } finally { Remove-Item $tmp -Recurse -Force }
 }
 
@@ -1030,7 +1047,9 @@ Assert-K8Test 'Test-K8ScoringInputArtifactCompleteness: missing artifact STOPs b
             'sensor-input\mirror-capture\c2-mirror-sensor.pcap', 'sensor-input\mirror-capture\capture-lifecycle.json',
             'sensor-input\mirror-capture\capture-context.json', 'sensor-input\mirror-capture\decoded-verification.json',
             'collector-output\collector-response.json', 'collector-output\collector-index-mapping.json',
-            'rule-output\rule-response.json', 'rule-output\rule-index-mapping.json', 'rule-output\collector-rule-correlation.json',
+            'collector-output\collector-selector-mapping-gate.json', 'collector-output\accepted-collector-hit-ids.json',
+            'rule-output\rule-response.json', 'rule-output\rule-index-mapping.json',
+            'rule-output\rule-selector-mapping-gate.json', 'rule-output\collector-rule-correlation.json',
             'contract-output\gateway-interface-resolution.txt', 'contract-output\runtime-contract-record.md',
             'environment\image-inventory.json', 'environment\collector-query.json', 'environment\rule-query.json',
             'metadata-t0.txt', 'metadata.md', 'deviations.md'
@@ -1674,6 +1693,163 @@ Assert-K8Test 'Cross-cutting audit: no other native-command argument in this mod
     # fix, and a naive scan would flag its own documentation.
     $moduleSource = Get-Content $CommonPath -Raw
     if ($moduleSource -match "'separator=\\+[a-zA-Z]'") { throw "found a quoted CLI 'separator=' argument literal using a backslash escape instead of the tool's own documented token (e.g. tshark's /t)" }
+}
+
+# --- 16. Rule query exact-match selector fix (frozen source_dnp3_doc_id) ----
+#
+# Real VM defect, root-caused (k8shakedown-rangea-20260829-084343,
+# independent review): runtime/finalize/scoring all completed but the Rule
+# stage silently came back "No alert." rule-query.template.json used `term`
+# directly on `signal`/`src_ip`/`dst_ip`, but the actual ot-signals-zone-
+# violation-* mapping declares them `text` with a `.keyword` multi-field --
+# a `term` query against the analyzed `text` field does not reliably match
+# the exact stored value (the Amenonuboco dashboard itself queries
+# `signal.keyword`, confirming this). The query also never constrained
+# `source_dnp3_doc_id` at all (freeze-decision-table.md SS3 requires it
+# equal any member of the accepted Collector hit set). Not a scientific
+# finding; the closed run is not rescued/resumed.
+#
+# Fix: `signal.keyword`/`src_ip.keyword`/`dst_ip.keyword` exact-match terms,
+# plus a `terms` filter on `source_dnp3_doc_id.keyword` covering the
+# COMPLETE accepted Collector hit-ID set (every _id the Collector query
+# returned -- never a post hoc single chosen document). The Rule request is
+# now finalized only after the Collector response is known (see
+# Invoke-K8AutomatedQueries), and both index mappings are gated (fail-
+# closed, not just retained) before either query runs.
+
+Assert-K8Test 'rule-query.template.json contains every frozen Rule selector element, all as exact-match .keyword fields' {
+    $ruleTemplate = Get-Content (Join-Path $ToolsDir 'rule-query.template.json') -Raw
+    foreach ($needle in @('"signal.keyword"', '"src_ip.keyword"', '"dst_ip.keyword"', '"source_dnp3_doc_id.keyword"', '<WINDOW_START>', '<WINDOW_END>', '<COLLECTOR_HIT_IDS_JSON>')) {
+        if ($ruleTemplate -notlike "*$needle*") { throw "rule-query.template.json is missing a required frozen selector element: $needle" }
+    }
+    if ($ruleTemplate -match '"term":\s*\{\s*"signal"\s*:' -or $ruleTemplate -match '"term":\s*\{\s*"src_ip"\s*:' -or $ruleTemplate -match '"term":\s*\{\s*"dst_ip"\s*:') {
+        throw 'rule-query.template.json still runs term against the analyzed text field directly (no .keyword) -- the real-VM No-alert defect may be back'
+    }
+    # The template must itself be valid JSON (every placeholder sits inside
+    # a string value), so a naive text edit can never leave it malformed --
+    # this throws on its own if parsing fails, no separate assertion needed.
+    $null = $ruleTemplate | ConvertFrom-Json
+}
+
+Assert-K8Test 'Invoke-K8AutomatedQueries: Rule query is finalized from the Collector RESPONSE, not the pre-window-only template, and both mappings are gated before either query runs' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8AutomatedQueries'
+    foreach ($needle in @('Get-K8CollectorHitIds', 'collector-mapping-gate', 'rule-mapping-gate', 'accepted-collector-hit-ids.json', '<COLLECTOR_HIT_IDS_JSON>')) {
+        if ($body -notmatch [regex]::Escape($needle)) { throw "Invoke-K8AutomatedQueries is missing: $needle" }
+    }
+    $collectorSearchIndex = $body.IndexOf("Method POST -Endpoint 'ot-logs-dnp3-*/_search'")
+    $idsIndex = $body.IndexOf('Get-K8CollectorHitIds')
+    $ruleSearchIndex = $body.IndexOf("Method POST -Endpoint 'ot-signals-zone-violation-*/_search'")
+    if ($collectorSearchIndex -lt 0 -or $idsIndex -lt 0 -or $ruleSearchIndex -lt 0) { throw 'could not locate the Collector search, ID extraction, and Rule search call sites in order' }
+    if (-not ($collectorSearchIndex -lt $idsIndex -and $idsIndex -lt $ruleSearchIndex)) { throw 'the Rule query is not being finalized strictly AFTER the Collector response is known, in order' }
+    $collectorMapGateIndex = $body.IndexOf('collector-mapping-gate')
+    $ruleMapGateIndex = $body.IndexOf('rule-mapping-gate')
+    if ($collectorMapGateIndex -gt $collectorSearchIndex -or $ruleMapGateIndex -gt $ruleSearchIndex) { throw 'a mapping gate runs AFTER its corresponding search, not before -- it cannot fail-closed on drift if it does' }
+}
+
+Assert-K8Test 'Get-K8CollectorHitIds: 1/N accepted Collector hit IDs never unroll into a bare string, and zero hits returns an empty array (not a throw)' {
+    Import-Module $CommonPath -Force
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-collids-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    try {
+        $onePath = Join-Path $tmp 'one.json'
+        '{"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_id":"col-only","_source":{}}]}}' | Set-Content $onePath
+        $one = Get-K8CollectorHitIds -CollectorResponsePath $onePath
+        if ($one.Count -ne 1 -or $one[0] -ne 'col-only') { throw "REGRESSION: a single accepted Collector hit ID must remain a 1-element array, got Count=$($one.Count)" }
+
+        $manyPath = Join-Path $tmp 'many.json'
+        '{"hits":{"total":{"value":3,"relation":"eq"},"hits":[{"_id":"c1","_source":{}},{"_id":"c2","_source":{}},{"_id":"c3","_source":{}}]}}' | Set-Content $manyPath
+        $many = Get-K8CollectorHitIds -CollectorResponsePath $manyPath
+        if (($many -join ',') -ne 'c1,c2,c3') { throw "multiple accepted Collector hit IDs were not all retained in order: $($many -join ',')" }
+
+        $zeroPath = Join-Path $tmp 'zero.json'
+        '{"hits":{"total":{"value":0,"relation":"eq"},"hits":[]}}' | Set-Content $zeroPath
+        $zero = Get-K8CollectorHitIds -CollectorResponsePath $zeroPath
+        if ($zero.Count -ne 0) { throw 'zero Collector hits must return an empty array, not throw or return a null element' }
+    }
+    finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'REGRESSION: the Rule query built for zero AND for multiple accepted Collector IDs embeds a valid terms filter, never invalid JSON' {
+    Import-Module $CommonPath -Force
+    $template = Get-Content (Join-Path $ToolsDir 'rule-query.template.json') -Raw
+    foreach ($case in @(
+        @{ Ids = @(); Expected = '[]' }
+        @{ Ids = @('only-one'); Expected = '["only-one"]' }
+        @{ Ids = @('a', 'b', 'c'); Expected = '["a","b","c"]' }
+    )) {
+        $idsJson = if ($case.Ids.Count -eq 0) { '[]' } else { ($case.Ids | ConvertTo-Json -AsArray -Compress -Depth 3) }
+        if ($idsJson -ne $case.Expected) { throw "collector-IDs-to-JSON for $($case.Ids.Count) id(s) produced '$idsJson', expected '$($case.Expected)'" }
+        $built = $template.Replace('<WINDOW_START>', '2026-01-01T00:00:00Z').Replace('<WINDOW_END>', '2026-01-01T00:00:20Z').Replace('"<COLLECTOR_HIT_IDS_JSON>"', $idsJson)
+        $parsed = $null
+        try { $parsed = $built | ConvertFrom-Json } catch { throw "the built Rule query for $($case.Ids.Count) id(s) is not valid JSON: $($_.Exception.Message)" }
+        # Get-K8ObjectPropertyValue, not direct .terms access: under
+        # Set-StrictMode, a filter clause that is {range:...} or {term:...}
+        # (no `terms` property at all) throws PropertyNotFoundException on
+        # direct access instead of evaluating to $null.
+        $termsClauses = @($parsed.query.bool.filter | Where-Object { Get-K8ObjectPropertyValue -Object $_ -Name 'terms' })
+        if ($termsClauses.Count -ne 1) { throw "expected exactly 1 'terms' filter clause, found $($termsClauses.Count)" }
+        $termsObject = Get-K8ObjectPropertyValue -Object $termsClauses[0] -Name 'terms'
+        $termsValue = Get-K8ObjectPropertyValue -Object $termsObject -Name 'source_dnp3_doc_id.keyword'
+        if (@($termsValue).Count -ne $case.Ids.Count) { throw "the built terms filter does not contain exactly the $($case.Ids.Count) supplied Collector ID(s)" }
+    }
+}
+
+Assert-K8Test 'rule-mapping-gate PASSes on the real reported mapping shape (text + keyword multi-field for signal/src_ip/dst_ip/source_dnp3_doc_id)' {
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-rulemap-good-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    try {
+        $mappingPath = Join-Path $tmp 'mapping.json'
+        @'
+{"ot-signals-zone-violation-2026.08.29":{"mappings":{"properties":{
+  "signal": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+  "src_ip": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+  "dst_ip": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+  "source_dnp3_doc_id": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}}
+}}}}
+'@ | Set-Content $mappingPath
+        & python $helper rule-mapping-gate --mapping $mappingPath --output (Join-Path $tmp 'out.json')
+        if ($LASTEXITCODE -ne 0) { throw 'the real reported text+keyword mapping shape incorrectly FAILED the Rule selector mapping gate' }
+        $result = Get-Content (Join-Path $tmp 'out.json') -Raw | ConvertFrom-Json
+        if (-not $result.mapping_gate_pass) { throw 'mapping_gate_pass was false for a shape that should pass' }
+    }
+    finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'REGRESSION: rule-mapping-gate fails closed when the required .keyword multi-field is missing on any one frozen selector field' {
+    foreach ($missingField in @('signal', 'src_ip', 'dst_ip', 'source_dnp3_doc_id')) {
+        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-rulemap-bad-$missingField-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+        try {
+            $fields = [ordered]@{
+                signal = '{"type": "text", "fields": {"keyword": {"type": "keyword"}}}'
+                src_ip = '{"type": "text", "fields": {"keyword": {"type": "keyword"}}}'
+                dst_ip = '{"type": "text", "fields": {"keyword": {"type": "keyword"}}}'
+                source_dnp3_doc_id = '{"type": "text", "fields": {"keyword": {"type": "keyword"}}}'
+            }
+            $fields[$missingField] = '{"type": "text"}'
+            $mappingJson = '{"ot-signals-zone-violation-2026.08.29":{"mappings":{"properties":{' +
+                ((($fields.Keys | ForEach-Object { "`"$_`":$($fields[$_])" }) -join ',')) + '}}}}'
+            $mappingPath = Join-Path $tmp 'mapping.json'
+            $mappingJson | Set-Content $mappingPath
+            & python $helper rule-mapping-gate --mapping $mappingPath --output (Join-Path $tmp 'out.json') 2>$null
+            if ($LASTEXITCODE -eq 0) { throw "a mapping missing .keyword on '$missingField' incorrectly PASSed the Rule selector mapping gate" }
+        }
+        finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Assert-K8Test 'collector-mapping-gate reuses the existing ot-logs-dnp3-* field set and is called unconditionally for both Range A and B' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8AutomatedQueries'
+    $gateCallIndex = $body.IndexOf('collector-mapping-gate')
+    $rangeBBranchIndex = $body.IndexOf("if (`$Range -eq 'b')")
+    if ($gateCallIndex -lt 0) { throw 'collector-mapping-gate is not called from Invoke-K8AutomatedQueries' }
+    if ($rangeBBranchIndex -ge 0 -and $gateCallIndex -gt $rangeBBranchIndex) { throw 'the Collector selector mapping gate appears to run only inside the Range-B-only branch -- Range A needs it too' }
+}
+
+Assert-K8Test 'Test-K8ScoringInputArtifactCompleteness requires the new Rule/Collector selector-mapping-gate and accepted-hit-id artifacts' {
+    foreach ($needle in @('collector-selector-mapping-gate.json', 'accepted-collector-hit-ids.json', 'rule-selector-mapping-gate.json')) {
+        if ($commonSource -notlike "*$needle*") { throw "completeness gate is missing required artifact: $needle" }
+    }
 }
 
 # --- 7. Study01/ untouched on this branch -------------------------------------

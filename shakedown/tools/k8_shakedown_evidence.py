@@ -64,14 +64,25 @@ def target(args):
         source_id = scalar(get_path(row.get("_source", {}), "source_dnp3_doc_id"))
         rule_rows.append({"rule_id": row["_id"], "source_dnp3_doc_id": source_id,
                           "correlates_to_accepted_collector_hit": source_id in collector_set})
+    all_correlate = all(row["correlates_to_accepted_collector_hit"] for row in rule_rows)
     write(args.output, {
         "mechanical_check": "complete frozen-selector Collector set to Rule source_dnp3_doc_id",
         "collector_hit_count": len(collector_ids),
         "accepted_collector_hit_ids": collector_ids,
         "rule_hit_count": len(rule_rows),
         "rule_correlations": rule_rows,
-        "all_rule_hits_correlate": all(row["correlates_to_accepted_collector_hit"] for row in rule_rows),
+        "all_rule_hits_correlate": all_correlate,
     })
+    # Independent mechanical verification, not just retention: the Rule
+    # query itself now filters server-side on source_dnp3_doc_id.keyword IN
+    # accepted_collector_hit_ids (frozen selector, freeze-decision-table.md
+    # SS3), so every returned Rule hit correlating is an expected
+    # CONSEQUENCE of that filter, not merely an observation. If it is ever
+    # false, the filter did not do what it was built to do (a mapping/query
+    # anomaly), and that must STOP here rather than surface later as a
+    # silently wrong scoring-input transcription.
+    if rule_rows and not all_correlate:
+        raise ValueError("a retained Rule hit does not correlate to any accepted Collector hit -- the frozen Rule selector's source_dnp3_doc_id filter did not behave as built")
 
 
 FIELDS = {
@@ -83,6 +94,24 @@ FIELDS = {
     "layers.dnp3.dnp3_dnp3_al_func": ("text", True),
     "layers.dnp3.dnp3_dnp3_src": ("text", True),
     "layers.dnp3.dnp3_dnp3_dst": ("text", True),
+}
+
+# Rule selector fields (freeze-decision-table.md SS3): `signal`, `src_ip`,
+# `dst_ip`, `source_dnp3_doc_id`. Root cause this exists to fix (real VM
+# run k8shakedown-rangea-20260829-084343): the Rule query used `term` on
+# these fields directly, but the actual ot-signals-zone-violation-* mapping
+# declares them `text` with a `.keyword` multi-field -- a `term` query
+# against the analyzed `text` field itself does not reliably match the
+# exact stored value, and the actual run's Rule stage silently came back
+# "No alert" as a result. This gate mechanically verifies each field is
+# exactly the expected `text`+`.keyword` shape BEFORE the Rule query is
+# ever trusted, fail-closed on drift -- never a silent "No alert" caused by
+# a mapping assumption that quietly stopped holding.
+RULE_FIELDS = {
+    "signal": ("text", True),
+    "src_ip": ("text", True),
+    "dst_ip": ("text", True),
+    "source_dnp3_doc_id": ("text", True),
 }
 
 
@@ -99,24 +128,36 @@ def mapping_field(properties, dotted):
     return None
 
 
-def mapping(args):
-    response = load(args.mapping)
+def mapping_gate(mapping_path: str, output_path: str, fields: dict, gate_label: str):
+    response = load(mapping_path)
     if not response:
         raise ValueError("mapping response contains no indices")
     decisions = []
     for index_name, index_value in response.items():
         properties = get_path(index_value, "mappings.properties")
-        for field, (expected_type, needs_keyword) in FIELDS.items():
+        for field, (expected_type, needs_keyword) in fields.items():
             node = mapping_field(properties, field)
             ok = (isinstance(node, dict) and node.get("type") == expected_type and
                   (not needs_keyword or get_path(node, "fields.keyword.type") == "keyword"))
             decisions.append({"index": index_name, "field": field, "expected_type": expected_type,
                               "keyword_required": needs_keyword, "pass": ok})
-    result = {"mapping_gate_pass": bool(decisions) and all(x["pass"] for x in decisions),
+    result = {"gate": gate_label, "mapping_gate_pass": bool(decisions) and all(x["pass"] for x in decisions),
               "decisions": decisions}
-    write(args.output, result)
+    write(output_path, result)
     if not result["mapping_gate_pass"]:
-        raise ValueError("R-OBS-05 mapping field/type drift detected")
+        raise ValueError(f"{gate_label}: mapping field/type drift detected")
+
+
+def mapping(args):
+    mapping_gate(args.mapping, args.output, FIELDS, "R-OBS-05 exact mapping field/type gate")
+
+
+def collector_mapping(args):
+    mapping_gate(args.mapping, args.output, FIELDS, "Collector selector exact-match mapping gate (ot-logs-dnp3-*)")
+
+
+def rule_mapping(args):
+    mapping_gate(args.mapping, args.output, RULE_FIELDS, "Rule selector exact-match mapping gate (signal/src_ip/dst_ip/source_dnp3_doc_id)")
 
 
 DECIMAL = re.compile(r"^(?P<seconds>-?\d+)(?:\.(?P<fraction>\d{1,9}))?$")
@@ -199,6 +240,10 @@ def main():
     p.set_defaults(func=target)
     p = sub.add_parser("mapping-gate")
     p.add_argument("--mapping", required=True); p.add_argument("--output", required=True); p.set_defaults(func=mapping)
+    p = sub.add_parser("collector-mapping-gate")
+    p.add_argument("--mapping", required=True); p.add_argument("--output", required=True); p.set_defaults(func=collector_mapping)
+    p = sub.add_parser("rule-mapping-gate")
+    p.add_argument("--mapping", required=True); p.add_argument("--output", required=True); p.set_defaults(func=rule_mapping)
     p = sub.add_parser("r-obs-05")
     p.add_argument("--response", required=True); p.add_argument("--frames", required=True)
     p.add_argument("--window-start", required=True); p.add_argument("--window-end", required=True); p.add_argument("--output", required=True)

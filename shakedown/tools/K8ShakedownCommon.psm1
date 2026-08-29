@@ -1317,7 +1317,65 @@ function Write-K8TargetCaptureDecode {
     Write-K8ShakedownLog -Message "$Stage capture decode retained: $($rows.Count) matching frame(s) at $outPath (zero is retained as observed, not treated as failure -- README SS6.2 governs the scoring judgment)."
 }
 
+function Get-K8CollectorHitIds {
+    <#
+        Extracts every hit's document _id from a retained Collector response
+        (ot-logs-dnp3-* search result). Every _id here is, by construction,
+        an ACCEPTED Collector hit: the Collector query itself already
+        enforces the complete frozen Collector selector
+        (freeze-decision-table.md SS3), so this never re-derives, narrows,
+        or judges that -- it only reads back what the Collector query
+        already decided. Returns the COMPLETE matching-hit set, never a
+        post hoc single chosen document (frozen: "Multiple matching
+        collector documents do not fail the criterion and may not be
+        reduced to a post hoc chosen document"). Zero hits is a valid
+        observed Collector state and returns an empty array, not a throw --
+        deciding whether the Collector stage itself passes remains the
+        operator's scoring-input judgment (README SS6.2); this function only
+        reads IDs back for the Rule query filter.
+    #>
+    param([Parameter(Mandatory)][string] $CollectorResponsePath)
+    $response = Get-Content $CollectorResponsePath -Raw | ConvertFrom-Json
+    $hitsBlock = Get-K8ObjectPropertyValue -Object $response -Name 'hits'
+    if (-not $hitsBlock) { throw "Collector response at $CollectorResponsePath has no 'hits' block; cannot resolve the accepted Collector hit set for the Rule selector." }
+    $rows = Get-K8ObjectPropertyValue -Object $hitsBlock -Name 'hits'
+    $ids = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $rows) {
+        # `@($null)` is a 1-element array CONTAINING null, not an empty
+        # array -- guard explicitly rather than iterate blindly.
+        foreach ($row in @($rows)) {
+            if ($null -eq $row) { continue }
+            $id = Get-K8ObjectPropertyValue -Object $row -Name '_id'
+            if (-not [string]::IsNullOrWhiteSpace([string]$id)) { $ids.Add([string]$id) }
+        }
+    }
+    return ,$ids.ToArray()
+}
+
 function Invoke-K8AutomatedQueries {
+    <#
+        Root cause this closes (real VM run k8shakedown-rangea-20260829-084343,
+        independent review): the Rule query used `term` directly on `signal`
+        /`src_ip`/`dst_ip`, but the actual ot-signals-zone-violation-*
+        mapping declares them `text` with a `.keyword` multi-field -- a
+        `term` query against the analyzed `text` field does not reliably
+        match the exact stored value, so the Rule stage silently came back
+        "No alert" regardless of whether zone_violation.py had actually
+        written a matching document. The query ALSO never constrained
+        `source_dnp3_doc_id` at all, so even a successful match would not
+        have mechanically enforced the frozen correlation requirement.
+
+        Fix: `signal.keyword`/`src_ip.keyword`/`dst_ip.keyword` exact-match
+        terms, AND a `terms` filter on `source_dnp3_doc_id.keyword` set to
+        the COMPLETE accepted Collector hit-ID set (every _id the Collector
+        query returned -- never a post hoc single chosen document, per
+        freeze-decision-table.md SS3). This makes the frozen Rule selector's
+        correlation requirement part of the query itself, not something
+        checked only afterward. Both index mappings are gated (fail-closed,
+        not just retained) BEFORE either query runs, so a future mapping
+        drift STOPs here with a clear diagnostic instead of silently
+        producing another false "No alert".
+    #>
     param(
         [Parameter(Mandatory)][ValidateSet('a','b')][string] $Range,
         [Parameter(Mandatory)][string] $RunId,
@@ -1329,15 +1387,41 @@ function Invoke-K8AutomatedQueries {
     $envDir = Join-Path $RunEvidence 'environment'
     $collectorResponse = Join-Path $RunEvidence 'collector-output\collector-response.json'
     $ruleResponse = Join-Path $RunEvidence 'rule-output\rule-response.json'
+    $collectorMapping = Join-Path $RunEvidence 'collector-output\collector-index-mapping.json'
+    $ruleMapping = Join-Path $RunEvidence 'rule-output\rule-index-mapping.json'
     # README SS5.1 step 6: "retain the Collector and Rule queries with their
-    # responses and mappings" -- retention only (no pass/fail gate is asked
-    # for here; a real VM run reached scoring-input with neither mapping
-    # retained for the main scientific queries, only for R-OBS-05's).
-    Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method GET -Endpoint 'ot-logs-dnp3-*/_mapping' -OutputPath (Join-Path $RunEvidence 'collector-output\collector-index-mapping.json')
-    Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method GET -Endpoint 'ot-signals-zone-violation-*/_mapping' -OutputPath (Join-Path $RunEvidence 'rule-output\rule-index-mapping.json')
+    # responses and mappings."
+    Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method GET -Endpoint 'ot-logs-dnp3-*/_mapping' -OutputPath $collectorMapping
+    Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method GET -Endpoint 'ot-signals-zone-violation-*/_mapping' -OutputPath $ruleMapping
+
+    # Mechanically verify the frozen selector's exact-match fields BEFORE
+    # either query is trusted -- fail-closed on drift, for both ranges (not
+    # only when Range B's R-OBS-05 happens to share the same ot-logs-dnp3-*
+    # index and field set).
+    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'collector-mapping-gate', '--mapping', $collectorMapping, '--output', (Join-Path $RunEvidence 'collector-output\collector-selector-mapping-gate.json')) -Description 'Collector selector exact-match mapping gate'
+    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'rule-mapping-gate', '--mapping', $ruleMapping, '--output', (Join-Path $RunEvidence 'rule-output\rule-selector-mapping-gate.json')) -Description 'Rule selector exact-match mapping gate (signal/src_ip/dst_ip/source_dnp3_doc_id)'
+
     Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method POST -Endpoint 'ot-logs-dnp3-*/_search' -Body (Get-Content (Join-Path $envDir 'collector-query.json') -Raw) -OutputPath $collectorResponse
-    Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method POST -Endpoint 'ot-signals-zone-violation-*/_search' -Body (Get-Content (Join-Path $envDir 'rule-query.json') -Raw) -OutputPath $ruleResponse
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'target-correlation', '--collector', $collectorResponse, '--rule', $ruleResponse, '--output', (Join-Path $RunEvidence 'rule-output\collector-rule-correlation.json')) -Description 'retain complete Collector hit IDs and mechanically correlate every Rule hit'
+
+    # The Rule query cannot be finalized until the Collector response is
+    # known: it must filter on the COMPLETE accepted Collector hit-ID set,
+    # read back mechanically, never a post hoc single chosen document.
+    $collectorIds = Get-K8CollectorHitIds -CollectorResponsePath $collectorResponse
+    # `ConvertTo-Json -AsArray` on an EMPTY input produces an empty STRING,
+    # not the literal `[]` -- a zero-Collector-hit run is a valid observed
+    # state (see Get-K8CollectorHitIds), and substituting an empty string
+    # into the Rule query would produce invalid JSON, not a valid "match
+    # nothing" terms filter. Must special-case zero explicitly.
+    $collectorIdsJson = if ($collectorIds.Count -eq 0) { '[]' } else { ($collectorIds | ConvertTo-Json -AsArray -Compress -Depth 3) }
+    $collectorIdsJson | Set-Content -Path (Join-Path $RunEvidence 'collector-output\accepted-collector-hit-ids.json') -Encoding utf8NoBOM
+    $ruleQuery = (Get-Content (Join-Path $PSScriptRoot 'rule-query.template.json') -Raw).
+        Replace('<WINDOW_START>', $WindowStart).Replace('<WINDOW_END>', $WindowEnd).
+        Replace('"<COLLECTOR_HIT_IDS_JSON>"', $collectorIdsJson)
+    $ruleQuery | Set-Content -Path (Join-Path $envDir 'rule-query.json') -Encoding utf8NoBOM
+    Write-K8ShakedownLog -Message "Rule request finalized against $($collectorIds.Count) accepted Collector hit ID(s)."
+
+    Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method POST -Endpoint 'ot-signals-zone-violation-*/_search' -Body $ruleQuery -OutputPath $ruleResponse
+    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'target-correlation', '--collector', $collectorResponse, '--rule', $ruleResponse, '--output', (Join-Path $RunEvidence 'rule-output\collector-rule-correlation.json')) -Description 'retain complete Collector hit IDs and mechanically verify every Rule hit correlates'
     if ($Range -eq 'b') {
         $mappingPath = Join-Path $RunEvidence 'contract-output\r-obs-05-mapping-response.json'
         $mappingDecision = Join-Path $RunEvidence 'contract-output\r-obs-05-mapping-gate.json'
@@ -1640,8 +1724,11 @@ function Test-K8ScoringInputArtifactCompleteness {
         'sensor-input\mirror-capture\decoded-verification.json'
         'collector-output\collector-response.json'
         'collector-output\collector-index-mapping.json'
+        'collector-output\collector-selector-mapping-gate.json'
+        'collector-output\accepted-collector-hit-ids.json'
         'rule-output\rule-response.json'
         'rule-output\rule-index-mapping.json'
+        'rule-output\rule-selector-mapping-gate.json'
         'rule-output\collector-rule-correlation.json'
         'contract-output\gateway-interface-resolution.txt'
         'contract-output\runtime-contract-record.md'
@@ -1883,9 +1970,15 @@ function Invoke-K8ShakedownRangeAB {
 
     $collectorQuery = (Get-Content (Join-Path $PSScriptRoot 'collector-query.template.json') -Raw).Replace('<WINDOW_START>', $windowStart).Replace('<WINDOW_END>', $windowEnd)
     $collectorQuery | Set-Content -Path (Join-Path $envDir 'collector-query.json') -Encoding utf8NoBOM
-    $ruleQuery = (Get-Content (Join-Path $PSScriptRoot 'rule-query.template.json') -Raw).Replace('<WINDOW_START>', $windowStart).Replace('<WINDOW_END>', $windowEnd)
-    $ruleQuery | Set-Content -Path (Join-Path $envDir 'rule-query.json') -Encoding utf8NoBOM
-    Write-K8ShakedownLog -Message "Fixed Collector and Rule requests retained with T0 window [$windowStart, $windowEnd]."
+    # The Rule request is NOT finalized/written here: freeze-decision-
+    # table.md SS3 requires its source_dnp3_doc_id filter to cover the
+    # COMPLETE accepted Collector hit-ID set, which is only known once the
+    # Collector query has actually run. Invoke-K8AutomatedQueries below
+    # reads rule-query.template.json itself, resolves the real IDs from the
+    # Collector response, and writes the one true environment/rule-query.json
+    # -- writing an incomplete window-only version here first would leave a
+    # stale, misleading artifact between this line and that one.
+    Write-K8ShakedownLog -Message "Fixed Collector request retained with T0 window [$windowStart, $windowEnd]. Rule request will be retained once the accepted Collector hit-ID set is resolved."
 
     if ($Range -eq 'b') {
         $r0query = (Get-Content (Join-Path $PSScriptRoot 'r-obs-05-query.template.json') -Raw).Replace('<WINDOW_START>', $windowStart).Replace('<WINDOW_END>', $windowEnd)
