@@ -21,6 +21,14 @@
          not-forced outcome).
       6. Fail-closed readiness/image/finalize ordering and mechanical evidence gates.
       7. Study01/ is byte-for-byte unmodified on this branch versus origin/main.
+      8. Elasticsearch application-readiness gate (the curl-exit-7 root-cause
+         fix): runs before capture/trigger, shared by Range A and Range B from
+         one call site, has a finite timeout, and is structurally distinct
+         from (never merged into a retry loop for) the exactly-once
+         Collector/Rule/R-OBS-05 requests, which must contain no retry/loop
+         construct of their own. Also covers the StrictMode-safe property
+         access and structured (non-text-match) service-state checks this
+         audit added alongside it.
 
     Exits 0 if all checks pass, 1 otherwise. Prints PASS/FAIL per check.
 
@@ -442,6 +450,93 @@ Assert-K8Test 'R-OBS-05 mapping drift stops the helper' {
         & python $helper mapping-gate --mapping (Join-Path $tmp 'mapping.json') --output (Join-Path $tmp 'decision.json') 2>$null
         if ($LASTEXITCODE -eq 0) { throw 'mapping drift incorrectly PASSed' }
     } finally { Remove-Item $tmp -Recurse -Force }
+}
+
+# --- 8. Elasticsearch application-readiness gate (curl exit 7 root cause) ----
+
+function Get-K8FunctionBodyText {
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $Name)
+    $tokens = $null; $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
+    if ($errors.Count -gt 0) { throw "parse errors in $Path`: $($errors -join '; ')" }
+    $function = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $Name }, $true)
+    if (-not $function) { throw "function '$Name' not found in $Path" }
+    return $function.Extent.Text
+}
+
+function Test-K8HasLoopConstruct {
+    param([Parameter(Mandatory)][string] $FunctionBodyText)
+    # Parse just this function body as its own script and look for real loop
+    # AST nodes (WhileStatementAst/DoWhileStatementAst/DoUntilStatementAst/
+    # ForStatementAst/ForEachStatementAst) -- not a text/keyword search, which
+    # a comment or string literal could trivially defeat or false-positive on.
+    $tokens = $null; $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($FunctionBodyText, [ref]$tokens, [ref]$errors)
+    $loopTypes = @(
+        [System.Management.Automation.Language.WhileStatementAst],
+        [System.Management.Automation.Language.DoWhileStatementAst],
+        [System.Management.Automation.Language.DoUntilStatementAst],
+        [System.Management.Automation.Language.ForStatementAst],
+        [System.Management.Automation.Language.ForEachStatementAst]
+    )
+    $found = $ast.FindAll({ param($n) $loopTypes -contains $n.GetType() }, $true)
+    return ($found.Count -gt 0)
+}
+
+Assert-K8Test 'Wait-K8ElasticsearchReady exists, has a finite timeout, and actually polls (loop present)' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Wait-K8ElasticsearchReady'
+    if ($body -notmatch '\[int\]\s*\$TimeoutSeconds\s*=\s*\d+') { throw 'no finite, defaulted $TimeoutSeconds parameter found' }
+    if (-not (Test-K8HasLoopConstruct -FunctionBodyText $body)) { throw 'no loop construct found -- this must poll, not check once' }
+    if ($body -notmatch '_cluster/health') { throw 'gate does not target the Elasticsearch health endpoint' }
+    if ($body -notmatch 'elasticsearch-readiness\.json') { throw 'gate does not retain its result' }
+}
+
+Assert-K8Test 'The Elasticsearch application-readiness gate runs once, shared, before interface resolution and the sender trigger' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+    $gateCalls = @([regex]::Matches($body, 'Wait-K8ElasticsearchReady\s+-RunId'))
+    if ($gateCalls.Count -ne 1) { throw "expected exactly one shared call site in Invoke-K8ShakedownRangeAB (used by both Range A and Range B); found $($gateCalls.Count)" }
+    $gateIndex = $gateCalls[0].Index
+    $interfaceIndex = $body.IndexOf('Resolve-K8GatewayInterface -RunId')
+    $senderIndex = $body.IndexOf("(Join-Path `$ScriptsDir 'study01_sender.py')")
+    if ($interfaceIndex -lt 0 -or $senderIndex -lt 0) { throw 'could not locate gateway-resolution or sender call sites to order against' }
+    if (-not ($gateIndex -lt $interfaceIndex -and $gateIndex -lt $senderIndex)) {
+        throw "Elasticsearch readiness gate (index $gateIndex) must precede both interface resolution ($interfaceIndex) and the sender trigger ($senderIndex)"
+    }
+    # Guard against reintroducing a Range-specific branch around the call --
+    # this must be unconditional, identical for 'a' and 'b'.
+    $surrounding = $body.Substring([Math]::Max(0, $gateIndex - 200), 200)
+    if ($surrounding -match "Range\s+-eq\s+'[ab]'") { throw 'Elasticsearch readiness gate call site appears to be inside a Range-specific branch; it must be unconditional/shared' }
+}
+
+Assert-K8Test 'Scientific Elasticsearch requests (Collector/Rule/R-OBS-05/mapping) contain no retry/loop construct' {
+    foreach ($name in @('Invoke-K8ElasticsearchRequest', 'Complete-K8ElasticsearchResponse')) {
+        $body = Get-K8FunctionBodyText -Path $CommonPath -Name $name
+        if (Test-K8HasLoopConstruct -FunctionBodyText $body) {
+            throw "$name contains a loop construct -- the fixed scientific request must be exactly-once, never retried after failure"
+        }
+    }
+}
+
+Assert-K8Test 'Test-K8ComposeServiceReadiness accesses Service/State/Health only via Get-K8ObjectPropertyValue (StrictMode-safe)' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Test-K8ComposeServiceReadiness'
+    if ($body -match '\$byService\[[^\]]+\]\.(Service|State|Health)\b') {
+        throw 'direct property access on a compose ps row found -- this throws under Set-StrictMode if the JSON row omits that key entirely (observed to vary by Compose version)'
+    }
+    if (([regex]::Matches($body, 'Get-K8ObjectPropertyValue')).Count -lt 2) {
+        throw 'expected State and Health to both be read via Get-K8ObjectPropertyValue'
+    }
+}
+
+Assert-K8Test 'no leftover PSAvoidAssignmentToAutomaticVariable shadowing ($matches / $args) in the module' {
+    if ($commonSource -match '(?m)^\s*\$matches\s*=') { throw 'a bare $matches assignment was reintroduced (shadows the automatic -match results variable)' }
+    if ($commonSource -match '(?m)^\s*\$args\s*=') { throw 'a bare $args assignment was reintroduced (shadows the automatic unbound-arguments variable)' }
+}
+
+Assert-K8Test 'Range B runtime-contract record uses structured service-state checks, not compose-ps text/substring matching' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Write-K8RuntimeContractRecord'
+    if ($body -match '\$psText\s+-(not)?match') { throw 'runtime-contract-record still decides readiness by text/substring-matching `compose ps` display output' }
+    if ($body -notmatch 'Test-K8ComposeServiceReadiness') { throw 'runtime-contract-record does not use the structured readiness check' }
+    if ($body -match "docker exec .*curl.*9200") { throw 'runtime-contract-record still runs its own ad hoc Elasticsearch curl check -- this must be removed now that Wait-K8ElasticsearchReady is shared and already ran before this function is called (duplicated/inconsistent Range A vs B readiness logic is exactly the defect class this audit fixed)' }
 }
 
 # --- 7. Study01/ untouched on this branch -------------------------------------

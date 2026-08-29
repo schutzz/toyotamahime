@@ -350,7 +350,7 @@ function Resolve-K8ComposeImageRows {
     foreach ($service in $ExpectedServices) {
         $dashName = '^{0}-{1}-[0-9]+$' -f [regex]::Escape($RunId), [regex]::Escape($service)
         $underscoreName = '^{0}_{1}_[0-9]+$' -f [regex]::Escape($RunId), [regex]::Escape($service)
-        $matches = @($ImageRows | Where-Object {
+        $imageMatches = @($ImageRows | Where-Object {
             $declaredService = Get-K8ObjectPropertyValue -Object $_ -Name 'Service'
             if (-not [string]::IsNullOrWhiteSpace([string]$declaredService)) {
                 return ([string]$declaredService -ceq $service)
@@ -359,27 +359,124 @@ function Resolve-K8ComposeImageRows {
             return (-not [string]::IsNullOrWhiteSpace([string]$containerName) -and
                 (([string]$containerName -cmatch $dashName) -or ([string]$containerName -cmatch $underscoreName)))
         })
-        if ($matches.Count -ne 1) {
-            throw "image inventory must resolve exactly one image for expected service '$service'; found $($matches.Count)"
+        if ($imageMatches.Count -ne 1) {
+            throw "image inventory must resolve exactly one image for expected service '$service'; found $($imageMatches.Count)"
         }
-        $resolved[$service] = $matches[0]
+        $resolved[$service] = $imageMatches[0]
     }
     return $resolved
 }
 
 function Test-K8ComposeServiceReadiness {
+    <#
+        Container-state readiness only: every expected service present,
+        State 'running', and -- for a service that DOES declare a Docker
+        healthcheck -- Health 'healthy'. A service with NO healthcheck
+        (Health blank/absent) is deliberately treated as ready on State alone,
+        because that is the only signal Docker itself exposes for it; this is
+        a conscious scope limit, not an oversight, and it is exactly why
+        Elasticsearch -- which is slow to actually accept HTTP connections
+        after its container reaches 'running', and had no healthcheck in the
+        generated manifest -- needed its OWN application-level gate
+        (Wait-K8ElasticsearchReady) rather than being trusted on State alone.
+        See that function's docstring.
+
+        Uses Get-K8ObjectPropertyValue rather than direct .Service/.State/
+        .Health property access: under Set-StrictMode, a `compose ps --format
+        json` row that omits a key entirely (observed to vary across Compose
+        versions -- Health in particular) would throw
+        PropertyNotFoundException on direct access instead of evaluating to
+        $null.
+    #>
     param([Parameter(Mandatory)][string[]] $Expected, [Parameter(Mandatory)][object[]] $Services)
     $byService = @{}
     foreach ($service in $Services) {
-        if (-not $service.Service) { throw 'compose ps row has no Service field' }
-        $byService[$service.Service] = $service
+        $name = Get-K8ObjectPropertyValue -Object $service -Name 'Service'
+        if ([string]::IsNullOrWhiteSpace([string]$name)) { throw 'compose ps row has no Service field' }
+        $byService[[string]$name] = $service
     }
     $missing = @($Expected | Where-Object { -not $byService.ContainsKey($_) })
-    $notRunning = @($Expected | Where-Object { $byService.ContainsKey($_) -and $byService[$_].State -ne 'running' })
+    $notRunning = @($Expected | Where-Object {
+        $byService.ContainsKey($_) -and (Get-K8ObjectPropertyValue -Object $byService[$_] -Name 'State') -ne 'running'
+    })
     $notHealthy = @($Expected | Where-Object {
-        $byService.ContainsKey($_) -and $byService[$_].Health -and $byService[$_].Health -ne 'healthy'
+        if (-not $byService.ContainsKey($_)) { return $false }
+        $health = Get-K8ObjectPropertyValue -Object $byService[$_] -Name 'Health'
+        (-not [string]::IsNullOrWhiteSpace([string]$health)) -and $health -ne 'healthy'
     })
     return [pscustomobject]@{ Ready=($missing.Count -eq 0 -and $notRunning.Count -eq 0 -and $notHealthy.Count -eq 0); Missing=$missing; NotRunning=$notRunning; NotHealthy=$notHealthy }
+}
+
+function Wait-K8ElasticsearchReady {
+    <#
+        APPLICATION-level readiness gate for Elasticsearch, distinct from and
+        in addition to Test-K8ComposeServiceReadiness's container-state check.
+
+        ROOT CAUSE this exists to fix: a real VM Shakedown run
+        (k8shakedown-rangea-20260829-010502) reached the fixed Collector
+        request and got curl exit 7 (transport/connect failure) against
+        http://localhost:9200 from inside the elasticsearch container.
+        Wait-K8ComposeReady had already reported the container 'running'
+        (Elasticsearch has no Docker healthcheck in the generated manifest,
+        so Test-K8ComposeServiceReadiness's State-only fallback passed it).
+        A JVM-backed service reaching container 'running' state proves the
+        process started, not that it has finished initializing and is
+        actually accepting HTTP connections on 9200 -- that gap is exactly
+        what produced the transport failure, on whichever Range reached the
+        query first (Range A here; Range B's Runtime Contract record used to
+        run its own ad hoc, non-polling `curl` check after the fault, which
+        would have caught this by accident on Range B but never gated Range A
+        and was not a real finite-timeout readiness gate).
+
+        Contract (all required by the K8-3 Shakedown audit that added this):
+          - Runs BEFORE T0/the sender trigger, for BOTH Range A and Range B,
+            from one shared call site -- not duplicated, not Range-B-only.
+          - Finite timeout; never blocks forever.
+          - Polls only $Endpoint ('_cluster/health'); never changes the
+            endpoint, an index pattern, or any frozen selector to "make it
+            work."
+          - On timeout, throws (STOP before capture/sender/trigger) and
+            retains every poll attempt's diagnostic -- never silently
+            continues with an unconfirmed endpoint.
+          - Retains its PASS result too, so a review can see the gate ran.
+          - Never retried after the fact and never reused to retry a
+            SCIENTIFIC request (the Collector/Rule/R-OBS-05 calls in
+            Invoke-K8ElasticsearchRequest/Complete-K8ElasticsearchResponse
+            remain exactly-once with no retry loop; grepping either of those
+            two function bodies for a loop construct must find none -- see
+            Test-K8ShakedownRegression.ps1).
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string] $ComposePath,
+        [Parameter(Mandatory)][string] $RunEvidence,
+        [int] $TimeoutSeconds = 240,
+        [int] $PollSeconds = 3
+    )
+    $envDir = Join-Path $RunEvidence 'environment'
+    $container = (docker compose -p $RunId -f $ComposePath ps -q elasticsearch | Out-String).Trim()
+    if ([string]::IsNullOrWhiteSpace($container)) {
+        throw 'Elasticsearch container could not be resolved for the application-readiness gate; not proceeding to capture/trigger.'
+    }
+    $attempts = @()
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $attemptStart = (Get-Date).ToUniversalTime().ToString('o')
+        $statusOutput = @(docker exec $container curl -sS -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:9200/_cluster/health 2>&1)
+        $curlExit = $LASTEXITCODE
+        $status = ($statusOutput | Out-String).Trim()
+        $attempts += [ordered]@{ attempt_utc=$attemptStart; curl_exit=$curlExit; http_status=$status }
+        if ($curlExit -eq 0 -and $status -match '^2[0-9][0-9]$') {
+            [ordered]@{ gate='elasticsearch-application-readiness'; result='PASS'; container=$container; attempts=$attempts } |
+                ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $envDir 'elasticsearch-readiness.json') -Encoding utf8NoBOM
+            Write-K8ShakedownLog -Message "Elasticsearch application readiness PASS after $($attempts.Count) attempt(s) (HTTP $status)."
+            return
+        }
+        Start-Sleep -Seconds $PollSeconds
+    }
+    [ordered]@{ gate='elasticsearch-application-readiness'; result='TIMEOUT'; container=$container; attempts=$attempts } |
+        ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $envDir 'elasticsearch-readiness.json') -Encoding utf8NoBOM
+    throw "Elasticsearch application-readiness gate timed out after ${TimeoutSeconds}s ($($attempts.Count) attempt(s), none returned a 2xx HTTP status on /_cluster/health). Not proceeding to capture/trigger. See environment/elasticsearch-readiness.json. This is the pre-trigger gate for the curl-exit-7 class of failure; it is not retried here, and the fixed Collector/Rule/R-OBS-05 requests downstream are still never retried either."
 }
 
 function Complete-K8ElasticsearchResponse {
@@ -425,10 +522,10 @@ function Invoke-K8ElasticsearchRequest {
     $remoteBody = "/tmp/k8-es-$([guid]::NewGuid().ToString('N')).body"
     # Old curl compatibility: one HTTP request writes the body separately and
     # emits only the status. No newer curl failure-body flag, retry, or resend.
-    $args = @('exec', $container, 'curl', '-sS', '-o', $remoteBody, '-w', '%{http_code}', '-X', $Method,
+    $curlArgs = @('exec', $container, 'curl', '-sS', '-o', $remoteBody, '-w', '%{http_code}', '-X', $Method,
         "http://localhost:9200/$Endpoint", '-H', 'Content-Type: application/json')
-    if ($Body) { $args += @('--data-binary', $Body) }
-    $statusOutput = @(docker @args 2>&1)
+    if ($Body) { $curlArgs += @('--data-binary', $Body) }
+    $statusOutput = @(docker @curlArgs 2>&1)
     $curlExit = $LASTEXITCODE
     $bodyOutput = @(docker exec $container cat $remoteBody 2>&1)
     $bodyExit = $LASTEXITCODE
@@ -609,6 +706,14 @@ function Invoke-K8ShakedownRangeAB {
     # "establish readiness ... before the event window opens"). Fails closed
     # on timeout rather than proceeding against a half-up stack.
     Wait-K8ComposeReady -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
+
+    # 4a-2. APPLICATION readiness for Elasticsearch, shared identically by
+    # Range A and Range B, and run this early (before image inventory, the
+    # fault, capture, and the sender trigger) precisely because container
+    # 'running' state does not prove its HTTP endpoint is accepting
+    # connections yet. See Wait-K8ElasticsearchReady's docstring for the real
+    # VM failure (curl exit 7) this closes.
+    Wait-K8ElasticsearchReady -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
 
     # 4b. Full image inventory (c2-dnp3-image-inventory.md SS4), before trigger:
     # per-service image reference/ID from `compose images`, THEN `docker image
@@ -846,14 +951,21 @@ function Write-K8RuntimeContractRecord {
 
         For Range B, c2-dnp3-step4-range-b-fault-pilot.md SS3 lists four
         required nontriviality checks. Checks 1-3 are mechanized here (service
-        state, target-interface mirror filter removal, Elasticsearch
-        health/zone_detector liveness via docker exec -- no host port-mapping
-        knowledge required). Check 2's "one unrelated observed gateway
-        interface still has a mirred egress mirror filter" and check 4's
-        sensor-capture unrelated-frame content are explicitly NOT mechanized
-        here (they need generated-topology / pcap-content knowledge this
-        script does not have) and are marked "REQUIRES MANUAL CONFIRMATION"
-        rather than guessed at.
+        state via structured `compose ps --format json`, target-interface
+        mirror filter removal, zone_detector liveness). Elasticsearch's own
+        endpoint readiness is NOT re-checked here -- it already ran, shared
+        identically for Range A and Range B, in
+        Wait-K8ElasticsearchReady before this function is ever called;
+        duplicating that curl call here (as an earlier revision did, with its
+        own separate non-polling check) is exactly the kind of Range A/B
+        readiness-logic inconsistency that let Range A reach the fixed
+        Collector query with no Elasticsearch gate at all. Check 2's "one
+        unrelated observed gateway interface still has a mirred egress mirror
+        filter" is mechanized via Assert-K8UnrelatedMirrorFilter (called by
+        the caller before this function). Check 4's sensor-capture
+        unrelated-frame content is mechanized after capture export via
+        Write-K8UnrelatedPcapRows; this function only points at where that
+        result lands, since the pcap does not exist yet at this call site.
     #>
     param(
         [Parameter(Mandatory)][ValidateSet('a', 'b')][string] $Range,
@@ -864,6 +976,9 @@ function Write-K8RuntimeContractRecord {
     )
     $contractDir = Join-Path $RunEvidence 'contract-output'
     $psText = (docker compose -p $RunId -f $ComposePath ps 2>&1 | Out-String)
+    $psJson = (docker compose -p $RunId -f $ComposePath ps --all --format json 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw 'docker compose ps --format json failed while building the runtime contract record' }
+    $services = @(ConvertFrom-K8ComposePsJson -Raw $psJson)
     $lines = @()
     $lines += "# Runtime contract observational record -- $RunId"
     $lines += ''
@@ -876,25 +991,20 @@ function Write-K8RuntimeContractRecord {
 
     if ($Range -eq 'b') {
         $requiredServices = @('wan_router', 'tap_observer', 'log_structurer', 'elasticsearch', 'zone_detector')
-        $missing = @($requiredServices | Where-Object { $psText -notmatch [regex]::Escape($_) })
+        # Structured lookup, not a text/substring match against `compose ps`
+        # display output: a service name can appear as a substring of a
+        # container/image name unrelated to whether that SERVICE row itself
+        # is present and running.
+        $readinessCheck = Test-K8ComposeServiceReadiness -Expected $requiredServices -Services $services
         $lines += ''
         $lines += '## c2-dnp3-step4-range-b-fault-pilot.md SS3 nontriviality checks'
         $lines += ''
-        $lines += "1. Required services present in \`compose ps\`: $(if ($missing.Count -eq 0) { 'PASS (all of ' + ($requiredServices -join ', ') + ' found)' } else { 'FAIL -- missing: ' + ($missing -join ', ') })"
-        $lines += "2. Target-interface ($($Gateway.Interface)) mirror filter removed: see qdisc-pre-fault.txt / qdisc-post-fault.txt. Unrelated mirror-filter gate: see unrelated-mirror-filters.txt (runner stops unless another interface retains mirred egress mirror)."
-        try {
-            $esContainer = (docker compose -p $RunId -f $ComposePath ps -q elasticsearch | Out-String).Trim()
-            if ($esContainer) {
-                $esHealth = (docker exec $esContainer curl -s -o /dev/null -w '%{http_code}' http://localhost:9200/_cluster/health 2>&1 | Out-String).Trim()
-                $zoneDetectorUp = $psText -match 'zone_detector' -and $psText -notmatch 'zone_detector.*Exit'
-                if ($esHealth -ne '200' -or -not $zoneDetectorUp) { throw "Range B service-health gate failed (Elasticsearch HTTP $esHealth; zone_detector running: $zoneDetectorUp)" }
-                $lines += "3. Elasticsearch health check (docker exec -> curl localhost:9200/_cluster/health): HTTP $esHealth; zone_detector running: $zoneDetectorUp -- PASS"
-            }
-            else {
-                throw 'Range B service-health gate failed: elasticsearch container not resolved via compose ps -q'
-            }
+        if (-not $readinessCheck.Ready) {
+            throw "Range B service-state gate failed -- missing: $($readinessCheck.Missing -join ', '); not running: $($readinessCheck.NotRunning -join ', '); unhealthy: $($readinessCheck.NotHealthy -join ', ')"
         }
-        catch { throw "Range B service-health gate failed: $($_.Exception.Message)" }
+        $lines += "1. Required services present/running in structured \`compose ps\`: PASS (all of $($requiredServices -join ', ') found)"
+        $lines += "2. Target-interface ($($Gateway.Interface)) mirror filter removed: see qdisc-pre-fault.txt / qdisc-post-fault.txt. Unrelated mirror-filter gate: see unrelated-mirror-filters.txt (runner stops unless another interface retains mirred egress mirror)."
+        $lines += '3. Elasticsearch endpoint readiness: see environment/elasticsearch-readiness.json (shared Wait-K8ElasticsearchReady gate, already PASS before this record was written -- not re-queried here). zone_detector service state: PASS (checked structurally above, not by text-matching `compose ps` display output).'
         $lines += '4. Sensor unrelated-flow frame and Collector correlation are checked after capture export; see r-obs-05-pcap-rows.json and r-obs-05-correlation.json (runner stops unless the gate passes).'
     }
 
