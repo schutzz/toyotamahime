@@ -142,7 +142,7 @@ def mapping_gate(mapping_path: str, output_path: str, fields: dict, gate_label: 
             decisions.append({"index": index_name, "field": field, "expected_type": expected_type,
                               "keyword_required": needs_keyword, "pass": ok})
     result = {"gate": gate_label, "mapping_gate_pass": bool(decisions) and all(x["pass"] for x in decisions),
-              "decisions": decisions}
+              "index_present": True, "decisions": decisions}
     write(output_path, result)
     if not result["mapping_gate_pass"]:
         raise ValueError(f"{gate_label}: mapping field/type drift detected")
@@ -157,6 +157,50 @@ def collector_mapping(args):
 
 
 def rule_mapping(args):
+    """
+    Root cause this exists to fix (real VM run k8shakedown-rangeb-
+    20260829-111026, closed, not rescued): confirmed against the pinned
+    Amenonuboco source (78fc17746b5d663fafec9dffe563d79fe9ea02b7,
+    scenarios/legacy-power-grid-signals/zone_violation.py) that the Rule
+    alert index (ot-signals-zone-violation-*) is created LAZILY -- only by
+    zone_violation.py's own `_bulk` write on its FIRST actual alert, inside
+    an `if bulk_lines:` guard that is never entered when zero violations
+    fire in a poll cycle. There is no startup-time index creation and no
+    index template. A genuinely negative run -- Range B's own FROZEN,
+    EXPECTED Rule output is "No alert" (scoring.md SS3) -- therefore has NO
+    index to map at all, and Elasticsearch returns HTTP 200 with an empty
+    `{}` body for a wildcard `_mapping` pattern that resolves to zero
+    concrete indices. This is not an error and not a scientific finding:
+    no frozen Study 01 document requires the Rule index to exist (unlike
+    the Collector/R-OBS-05 ot-logs-dnp3-* mapping gate, which IS frozen by
+    k6-r-obs-05-collector-query-contract.md SS2 and is deliberately left
+    unaffected by this change -- that index is populated continuously by
+    ALL structured traffic, not only alerts, and its existence is already
+    guaranteed by the pre-T0 functional-readiness canary).
+
+    Treating index-absence as a mapping-gate FAILURE made a genuine
+    negative Rule observation impossible to ever complete -- a Shakedown
+    observer defect introduced when this gate was added, not a runtime
+    defect and not a frozen-procedure violation. An index that DOES exist
+    but has a required field missing its `.keyword` multi-field remains a
+    hard fail-close below: that is the actual defect class this gate
+    exists to catch (see Invoke-K8AutomatedQueries's docstring for the
+    original root cause).
+
+    "Index absent" and "index present with 0 hits" are retained as
+    distinguishable states (`index_present: false` vs. `true`) precisely
+    so a later reader never conflates them into one undifferentiated
+    "No alert" without knowing which one actually occurred.
+    """
+    response = load(args.mapping)
+    if not response:
+        write(args.output, {
+            "gate": "Rule selector exact-match mapping gate (signal/src_ip/dst_ip/source_dnp3_doc_id)",
+            "mapping_gate_pass": True,
+            "index_present": False,
+            "decisions": [],
+        })
+        return
     mapping_gate(args.mapping, args.output, RULE_FIELDS, "Rule selector exact-match mapping gate (signal/src_ip/dst_ip/source_dnp3_doc_id)")
 
 

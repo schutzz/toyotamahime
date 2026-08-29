@@ -2001,6 +2001,203 @@ Assert-K8Test 'Cross-cutting audit: no other native-CLI-output parsing in this m
     if ($found.Count -ne 1) { throw "expected exactly 1 whitespace-split-then-fixed-index site (Resolve-K8GatewayInterface's own, now-corrected one), found $($found.Count)" }
 }
 
+# --- 24. Rule index lazy-creation observer defect (rule-mapping-gate) -------
+#
+# Real VM STOP, root-caused (k8shakedown-rangeb-20260829-111026, closed,
+# not rescued): `rule-mapping-gate: ValueError: mapping response contains
+# no indices`. Independent investigation confirmed against the pinned
+# Amenonuboco source (78fc17746b5d663fafec9dffe563d79fe9ea02b7,
+# scenarios/legacy-power-grid-signals/zone_violation.py) that the Rule
+# alert index (ot-signals-zone-violation-*) is created LAZILY -- only on
+# zone_violation.py's own `_bulk` write on its FIRST actual alert, inside
+# an `if bulk_lines:` guard never entered when zero violations fire. There
+# is no startup-time creation and no index template. Range B's own FROZEN,
+# EXPECTED Rule output is "No alert" (scoring.md SS3), which genuinely
+# means this index may never exist for a correctly-behaving run. No frozen
+# Study 01 document requires the Rule index to exist -- only
+# k6-r-obs-05-collector-query-contract.md SS2 freezes a mapping-gate
+# requirement, and only for the Collector/R-OBS-05 ot-logs-dnp3-* index
+# (populated continuously by ALL structured traffic, unaffected by this
+# defect, and left completely unchanged by this round's fix).
+#
+# Classification: this is a SHAKEDOWN OBSERVER DEFECT, introduced when
+# rule-mapping-gate was added in an earlier round to fix a real Rule-query
+# exact-match defect -- it over-generalized from the genuinely-frozen
+# R-OBS-05 mapping-gate contract without accounting for the asymmetry
+# between a continuously-populated index and an alert-triggered one. It is
+# NOT a scientific finding and NOT an Amenonuboco runtime defect: the
+# pinned zone_detector code behaves exactly as designed. Fixed entirely in
+# Shakedown tooling (k8_shakedown_evidence.py); no Study 01 frozen file
+# changed, no dummy alert generated, no additional trigger event added.
+#
+# Fix: rule-mapping-gate now PASSes (retaining `index_present: false`,
+# never throwing) when the mapping response is the empty `{}` ES returns
+# for a wildcard pattern matching zero concrete indices -- and still fails
+# closed exactly as before when the index DOES exist but a required field
+# is missing its `.keyword` multi-field. "Index absent" and "index present
+# with 0 hits" are retained as distinguishable states so they are never
+# conflated into one undifferentiated "No alert" downstream.
+
+Assert-K8Test 'REGRESSION: rule-mapping-gate PASSes (index_present: false) when the Rule index does not exist yet -- an empty {} ES response is a valid state, not a failure' {
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-rulemap-absent-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    try {
+        '{}' | Set-Content (Join-Path $tmp 'mapping.json')
+        & python $helper rule-mapping-gate --mapping (Join-Path $tmp 'mapping.json') --output (Join-Path $tmp 'out.json')
+        if ($LASTEXITCODE -ne 0) { throw 'an empty {} mapping response (no matching indices) incorrectly failed the Rule selector mapping gate -- this makes a genuine negative Rule observation impossible' }
+        $result = Get-Content (Join-Path $tmp 'out.json') -Raw | ConvertFrom-Json
+        if ($result.index_present -ne $false) { throw "index_present should be false for an absent index, got '$($result.index_present)'" }
+        if (-not $result.mapping_gate_pass) { throw 'mapping_gate_pass should be true when there is no index to have wrong field types in' }
+    }
+    finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'REGRESSION: rule-mapping-gate PASSes (index_present: true) on the real reported text+keyword mapping shape when the index DOES exist' {
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-rulemap-present-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    try {
+        @'
+{"ot-signals-zone-violation-2026.08.29":{"mappings":{"properties":{
+  "signal": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+  "src_ip": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+  "dst_ip": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+  "source_dnp3_doc_id": {"type": "text", "fields": {"keyword": {"type": "keyword"}}}
+}}}}
+'@ | Set-Content (Join-Path $tmp 'mapping.json')
+        & python $helper rule-mapping-gate --mapping (Join-Path $tmp 'mapping.json') --output (Join-Path $tmp 'out.json')
+        if ($LASTEXITCODE -ne 0) { throw 'a correct, present mapping incorrectly failed the gate' }
+        $result = Get-Content (Join-Path $tmp 'out.json') -Raw | ConvertFrom-Json
+        if ($result.index_present -ne $true) { throw "index_present should be true when the index exists, got '$($result.index_present)'" }
+    }
+    finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'REGRESSION: rule-mapping-gate still fails closed when the index EXISTS but a required field is missing its .keyword multi-field (the real defect class this gate exists to catch)' {
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-rulemap-drift-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    try {
+        @'
+{"ot-signals-zone-violation-2026.08.29":{"mappings":{"properties":{
+  "signal": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+  "src_ip": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+  "dst_ip": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+  "source_dnp3_doc_id": {"type": "text"}
+}}}}
+'@ | Set-Content (Join-Path $tmp 'mapping.json')
+        & python $helper rule-mapping-gate --mapping (Join-Path $tmp 'mapping.json') --output (Join-Path $tmp 'out.json') 2>$null
+        if ($LASTEXITCODE -eq 0) { throw 'an existing index missing a required .keyword multi-field incorrectly PASSed -- fixing the false negative must not weaken the real field/type drift gate' }
+    }
+    finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'REGRESSION: collector-mapping-gate and the R-OBS-05 mapping-gate are UNCHANGED -- both still fail closed on an empty {} mapping response (the frozen k6-r-obs-05-collector-query-contract.md SS2 requirement, deliberately not relaxed)' {
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-collectormap-unchanged-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    try {
+        '{}' | Set-Content (Join-Path $tmp 'mapping.json')
+        & python $helper collector-mapping-gate --mapping (Join-Path $tmp 'mapping.json') --output (Join-Path $tmp 'c-out.json') 2>$null
+        if ($LASTEXITCODE -eq 0) { throw 'collector-mapping-gate must still fail closed on an empty mapping response -- ot-logs-dnp3-* is not subject to the Rule-index lazy-creation exception' }
+        & python $helper mapping-gate --mapping (Join-Path $tmp 'mapping.json') --output (Join-Path $tmp 'r-out.json') 2>$null
+        if ($LASTEXITCODE -eq 0) { throw 'the frozen R-OBS-05 mapping-gate must still fail closed on an empty mapping response' }
+    }
+    finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+$ruleIndexMockDir = Join-Path $ShakedownDir 'tests\mock-docker'
+$ruleIndexOriginalPath = $env:PATH
+try {
+    $env:PATH = "$ruleIndexMockDir;$env:PATH"
+    Import-Module $CommonPath -Force
+
+    Assert-K8Test 'REGRESSION (end-to-end, Range A): Invoke-K8AutomatedQueries completes with 0 Rule hits when the Rule index does not exist yet, never throwing' {
+        $env:K8_MOCK_DOCKER_STATE = 'rule-index-absent'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-aq-absent-a-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir 'environment'), (Join-Path $dir 'collector-output'), (Join-Path $dir 'rule-output') | Out-Null
+        '{"size":10}' | Set-Content (Join-Path $dir 'environment\collector-query.json')
+        try {
+            $ws = ([datetimeoffset]::UtcNow).AddSeconds(-100).ToString('o'); $we = ([datetimeoffset]::UtcNow).AddSeconds(100).ToString('o')
+            Invoke-K8AutomatedQueries -Range 'a' -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -WindowStart $ws -WindowEnd $we *>$null
+            $mappingGate = Get-Content (Join-Path $dir 'rule-output\rule-selector-mapping-gate.json') -Raw | ConvertFrom-Json
+            if ($mappingGate.index_present -ne $false) { throw 'expected index_present=false to be retained' }
+            $ruleResponse = Get-Content (Join-Path $dir 'rule-output\rule-response.json') -Raw | ConvertFrom-Json
+            if ($ruleResponse.hits.total.value -ne 0) { throw "expected 0 Rule hits, got $($ruleResponse.hits.total.value)" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION (end-to-end, Range B up to the Rule stage): the same Rule-index-absent scenario resolves identically for Range B before R-OBS-05''s own, separately-tested logic runs' {
+        # Scoped to the Rule mapping-gate + Rule query portion specifically
+        # (R-OBS-05's own document/pcap correlation is a separate, already
+        # regression-tested gate with its own strict exact-field-match
+        # requirement unrelated to this defect -- exercising it fully here
+        # would only duplicate that existing coverage, not add confidence
+        # in the fix under test).
+        $env:K8_MOCK_DOCKER_STATE = 'rule-index-absent'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-aq-absent-b-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir 'environment'), (Join-Path $dir 'collector-output'), (Join-Path $dir 'rule-output') | Out-Null
+        '{"size":10}' | Set-Content (Join-Path $dir 'environment\collector-query.json')
+        try {
+            $ws = ([datetimeoffset]::UtcNow).AddSeconds(-100).ToString('o'); $we = ([datetimeoffset]::UtcNow).AddSeconds(100).ToString('o')
+            # Range B additionally runs R-OBS-05 (unrelated pcap/document
+            # correlation), which needs fixtures this test does not set up;
+            # only the Rule-stage artifacts, already written before that
+            # point, are asserted.
+            try { Invoke-K8AutomatedQueries -Range 'b' -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -WindowStart $ws -WindowEnd $we *>$null } catch { }
+            $mappingGate = Get-Content (Join-Path $dir 'rule-output\rule-selector-mapping-gate.json') -Raw | ConvertFrom-Json
+            if ($mappingGate.index_present -ne $false) { throw 'expected index_present=false to be retained for Range B too' }
+            $ruleResponse = Get-Content (Join-Path $dir 'rule-output\rule-response.json') -Raw | ConvertFrom-Json
+            if ($ruleResponse.hits.total.value -ne 0) { throw "expected 0 Rule hits for Range B, got $($ruleResponse.hits.total.value)" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'rule-mapping-gate is called unconditionally for both Range A and B (not inside a Range-B-only or Range-A-only branch)' {
+        $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8AutomatedQueries'
+        $gateCallIndex = $body.IndexOf('rule-mapping-gate')
+        $rangeBBranchIndex = $body.IndexOf("if (`$Range -eq 'b')")
+        if ($gateCallIndex -lt 0) { throw 'rule-mapping-gate is not called from Invoke-K8AutomatedQueries' }
+        if ($rangeBBranchIndex -ge 0 -and $gateCallIndex -gt $rangeBBranchIndex) { throw 'rule-mapping-gate appears to run only inside the Range-B-only branch -- Range A needs it too' }
+    }
+
+    Assert-K8Test 'REGRESSION (end-to-end): Invoke-K8AutomatedQueries completes with a correlating Rule hit when the Rule index exists and is correctly mapped' {
+        $env:K8_MOCK_DOCKER_STATE = 'rule-index-present-good'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-aq-good-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir 'environment'), (Join-Path $dir 'collector-output'), (Join-Path $dir 'rule-output') | Out-Null
+        '{"size":10}' | Set-Content (Join-Path $dir 'environment\collector-query.json')
+        try {
+            $ws = ([datetimeoffset]::UtcNow).AddSeconds(-100).ToString('o'); $we = ([datetimeoffset]::UtcNow).AddSeconds(100).ToString('o')
+            Invoke-K8AutomatedQueries -Range 'a' -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -WindowStart $ws -WindowEnd $we *>$null
+            $mappingGate = Get-Content (Join-Path $dir 'rule-output\rule-selector-mapping-gate.json') -Raw | ConvertFrom-Json
+            if ($mappingGate.index_present -ne $true) { throw 'expected index_present=true when the index genuinely exists' }
+            $correlation = Get-Content (Join-Path $dir 'rule-output\collector-rule-correlation.json') -Raw | ConvertFrom-Json
+            if ($correlation.rule_hit_count -ne 1 -or -not $correlation.all_rule_hits_correlate) { throw "expected 1 fully-correlating Rule hit: $($correlation | ConvertTo-Json -Compress)" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION (end-to-end): Invoke-K8AutomatedQueries fails closed when the Rule index exists but is missing a required .keyword multi-field' {
+        $env:K8_MOCK_DOCKER_STATE = 'rule-index-present-bad-mapping'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-aq-bad-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir 'environment'), (Join-Path $dir 'collector-output'), (Join-Path $dir 'rule-output') | Out-Null
+        '{"size":10}' | Set-Content (Join-Path $dir 'environment\collector-query.json')
+        try {
+            $ws = ([datetimeoffset]::UtcNow).AddSeconds(-100).ToString('o'); $we = ([datetimeoffset]::UtcNow).AddSeconds(100).ToString('o')
+            $stopped = $false
+            try { Invoke-K8AutomatedQueries -Range 'a' -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -WindowStart $ws -WindowEnd $we *>$null } catch { $stopped = $true }
+            if (-not $stopped) { throw 'a present-but-mistyped Rule index did not STOP the pipeline' }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+finally { $env:PATH = $ruleIndexOriginalPath }
+
+Assert-K8Test 'Invoke-K8AutomatedQueries logs the index_present distinction so the console transcript states the same thing the retained JSON does' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8AutomatedQueries'
+    foreach ($needle in @('index_present', 'does not exist yet')) {
+        if ($body -notmatch [regex]::Escape($needle)) { throw "Invoke-K8AutomatedQueries no longer logs the index-present/absent distinction: missing '$needle'" }
+    }
+}
+
 # --- 7. Study01/ untouched on this branch -------------------------------------
 
 Assert-K8Test 'Study01/ is byte-for-byte unchanged versus origin/main' {

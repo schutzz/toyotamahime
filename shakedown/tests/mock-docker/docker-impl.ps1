@@ -145,6 +145,50 @@ if ($joined -match '^logs\b') {
 }
 
 if ($joined -match '\bexec\b') {
+    # Invoke-K8ElasticsearchRequest's real shape: `curl -o <path> -w
+    # '%{http_code}' ...` (status only on stdout, body written to a file),
+    # followed by a SEPARATE `cat <path>` to read the body back. Faithfully
+    # mocked end to end (never exercised behaviorally before this round,
+    # which is exactly the class of untested-code-path gap this whole
+    # Shakedown effort exists to close): the "container" file is a real
+    # local file under a fake-fs directory, keyed by the exact temp path
+    # curl/cat both reference, so `-o` "writing" and the later `cat`
+    # "reading" round-trip correctly regardless of call order.
+    $fakeFsDir = Join-Path $env:TEMP 'k8-mock-fake-fs'
+    if ($joined -match '\bcurl\b' -and $joined -match '\s-o\s+(\S+)') {
+        $remotePath = $Matches[1]
+        $localPath = Join-Path $fakeFsDir (Split-Path $remotePath -Leaf)
+        New-Item -ItemType Directory -Force -Path $fakeFsDir | Out-Null
+        $isRuleMapping = $joined -match 'ot-signals-zone-violation.*_mapping'
+        $isCollectorMapping = (-not $isRuleMapping) -and $joined -match 'ot-logs-dnp3.*_mapping'
+        $isRuleSearch = $joined -match 'ot-signals-zone-violation.*_search'
+        $isCollectorSearch = (-not $isRuleSearch) -and $joined -match 'ot-logs-dnp3.*_search'
+        $body = switch ($env:K8_MOCK_DOCKER_STATE) {
+            { $isRuleMapping -and $_ -in @('rule-index-absent', 'rangeb-fresh-no-alert') } { '{}' }
+            { $isRuleMapping -and $_ -eq 'rule-index-present-good' } { '{"ot-signals-zone-violation-2026.08.29":{"mappings":{"properties":{"signal":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"src_ip":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"dst_ip":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"source_dnp3_doc_id":{"type":"text","fields":{"keyword":{"type":"keyword"}}}}}}}' }
+            { $isRuleMapping -and $_ -eq 'rule-index-present-bad-mapping' } { '{"ot-signals-zone-violation-2026.08.29":{"mappings":{"properties":{"signal":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"src_ip":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"dst_ip":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"source_dnp3_doc_id":{"type":"text"}}}}}' }
+            { $isCollectorMapping -and $_ -in @('rule-index-absent', 'rule-index-present-good', 'rule-index-present-bad-mapping', 'rangeb-fresh-no-alert') } {
+                '{"ot-logs-dnp3-2026.08.29":{"mappings":{"properties":{"layers":{"properties":{"frame":{"properties":{"frame_frame_time":{"type":"date"}}},"ip":{"properties":{"ip_ip_src":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"ip_ip_dst":{"type":"text","fields":{"keyword":{"type":"keyword"}}}}},"tcp":{"properties":{"tcp_tcp_srcport":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"tcp_tcp_dstport":{"type":"text","fields":{"keyword":{"type":"keyword"}}}}},"dnp3":{"properties":{"dnp3_dnp3_al_func":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"dnp3_dnp3_src":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"dnp3_dnp3_dst":{"type":"text","fields":{"keyword":{"type":"keyword"}}}}}}}}}}}'
+            }
+            { $isCollectorSearch -and $_ -in @('rule-index-absent', 'rule-index-present-good', 'rangeb-fresh-no-alert') } {
+                '{"hits":{"total":{"value":2,"relation":"eq"},"hits":[{"_id":"collector-hit-1","_source":{}},{"_id":"collector-hit-2","_source":{}}]}}'
+            }
+            { ($isRuleSearch -and $_ -in @('rule-index-absent', 'rangeb-fresh-no-alert')) } { '{"hits":{"total":{"value":0,"relation":"eq"},"hits":[]}}' }
+            { $isRuleSearch -and $_ -eq 'rule-index-present-good' } {
+                '{"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_id":"rule-hit-1","_source":{"signal":"signal-1-zone-violation","src_ip":"10.1.20.11","dst_ip":"10.1.10.10","source_dnp3_doc_id":"collector-hit-1"}}]}}'
+            }
+            default { '{}' }
+        }
+        $body | Set-Content -Path $localPath -Encoding utf8NoBOM -NoNewline
+        Write-Output '200'
+        exit 0
+    }
+    if ($joined -match '^exec\s+\S+\s+cat\s+(\S+)') {
+        $remotePath = $Matches[1]
+        $localPath = Join-Path $fakeFsDir (Split-Path $remotePath -Leaf)
+        if (Test-Path $localPath) { Get-Content $localPath -Raw }
+        exit 0
+    }
     if ($joined -match '\bcurl\b' -and $joined -match '_cluster/health') {
         switch ($env:K8_MOCK_DOCKER_STATE) {
             'es-ready-yellow' { Write-Output '{"status":"yellow"}'; Write-Output 'K8_HTTP_STATUS:200'; exit 0 }
@@ -168,10 +212,42 @@ if ($joined -match '\bexec\b') {
             default { Write-Output $emptyHits; Write-Output 'K8_HTTP_STATUS:200'; exit 0 }
         }
     }
+    if ($joined -match '\bcurl\b' -and $joined -match 'ot-signals-zone-violation.*_mapping') {
+        # Rule index-mapping retention: real VM reproduction states for the
+        # k8shakedown-rangeb-20260829-111026 STOP (rule-mapping-gate:
+        # "mapping response contains no indices"). The Rule alert index is
+        # created lazily on zone_violation.py's first alert write, so a
+        # genuinely negative Range B run legitimately has NO index yet --
+        # ES returns HTTP 200 with an empty `{}` body for a wildcard
+        # pattern matching zero concrete indices, not an error.
+        switch ($env:K8_MOCK_DOCKER_STATE) {
+            { $_ -in @('rule-index-absent', 'rangeb-fresh-no-alert') } { Write-Output '{}'; Write-Output 'K8_HTTP_STATUS:200'; exit 0 }
+            'rule-index-present-good' {
+                Write-Output '{"ot-signals-zone-violation-2026.08.29":{"mappings":{"properties":{"signal":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"src_ip":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"dst_ip":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"source_dnp3_doc_id":{"type":"text","fields":{"keyword":{"type":"keyword"}}}}}}}'
+                Write-Output 'K8_HTTP_STATUS:200'
+                exit 0
+            }
+            'rule-index-present-bad-mapping' {
+                Write-Output '{"ot-signals-zone-violation-2026.08.29":{"mappings":{"properties":{"signal":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"src_ip":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"dst_ip":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"source_dnp3_doc_id":{"type":"text"}}}}}'
+                Write-Output 'K8_HTTP_STATUS:200'
+                exit 0
+            }
+            default { Write-Output '{}'; Write-Output 'K8_HTTP_STATUS:200'; exit 0 }
+        }
+    }
     if ($joined -match '\bcurl\b' -and $joined -match '_mapping') {
-        # Collector/Rule index-mapping retention (README SS5.1 step 6).
+        # Collector index-mapping retention (README SS5.1 step 6). Always
+        # populated for these states: ot-logs-dnp3-* is populated
+        # continuously by all structured traffic, guaranteed present by
+        # the pre-T0 functional-readiness canary -- unaffected by the
+        # Rule-index lazy-creation defect class above.
         switch ($env:K8_MOCK_DOCKER_STATE) {
             'mapping-transport-error' { exit 7 }
+            { $_ -in @('rule-index-absent', 'rule-index-present-good', 'rule-index-present-bad-mapping', 'rangeb-fresh-no-alert') } {
+                Write-Output '{"ot-logs-dnp3-2026.08.29":{"mappings":{"properties":{"layers":{"properties":{"frame":{"properties":{"frame_frame_time":{"type":"date"}}},"ip":{"properties":{"ip_ip_src":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"ip_ip_dst":{"type":"text","fields":{"keyword":{"type":"keyword"}}}}},"tcp":{"properties":{"tcp_tcp_srcport":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"tcp_tcp_dstport":{"type":"text","fields":{"keyword":{"type":"keyword"}}}}},"dnp3":{"properties":{"dnp3_dnp3_al_func":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"dnp3_dnp3_src":{"type":"text","fields":{"keyword":{"type":"keyword"}}},"dnp3_dnp3_dst":{"type":"text","fields":{"keyword":{"type":"keyword"}}}}}}}}}}}'
+                Write-Output 'K8_HTTP_STATUS:200'
+                exit 0
+            }
             default { Write-Output '{"index":{"mappings":{"properties":{}}}}'; Write-Output 'K8_HTTP_STATUS:200'; exit 0 }
         }
     }
@@ -180,7 +256,14 @@ if ($joined -match '\bexec\b') {
         # Write-K8UnrelatedPcapRows), distinct from the /proc-probe strings
         # below which merely contain the word "tshark" as canned output text.
         switch ($env:K8_MOCK_DOCKER_STATE) {
-            'decode-hit'   { Write-Output "1`t1767225615.0`t10.1.20.11`t10.1.10.10`t54321`t20000`t5`t1024`t1"; exit 0 }
+            { $_ -in @('decode-hit', 'rule-index-absent', 'rule-index-present-good', 'rule-index-present-bad-mapping', 'rangeb-fresh-no-alert') } {
+                # For the rule-index-* states this is only R-OBS-05's own
+                # unrelated-flow decode (a separate, already-covered gate);
+                # it is not part of the Rule-index lazy-creation scenario
+                # under test, so any valid single hit keeps it out of the
+                # way.
+                Write-Output "1`t1767225615.0`t10.1.20.11`t10.1.10.10`t54321`t20000`t5`t1024`t1"; exit 0
+            }
             'decode-empty' { exit 0 }
             'decode-transport-error' { exit 2 }
             # Multiple hits, real TAB-separated (0x09) rows -- as tshark

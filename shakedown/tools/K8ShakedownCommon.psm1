@@ -1410,7 +1410,25 @@ function Invoke-K8AutomatedQueries {
     # only when Range B's R-OBS-05 happens to share the same ot-logs-dnp3-*
     # index and field set).
     Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'collector-mapping-gate', '--mapping', $collectorMapping, '--output', (Join-Path $RunEvidence 'collector-output\collector-selector-mapping-gate.json')) -Description 'Collector selector exact-match mapping gate'
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'rule-mapping-gate', '--mapping', $ruleMapping, '--output', (Join-Path $RunEvidence 'rule-output\rule-selector-mapping-gate.json')) -Description 'Rule selector exact-match mapping gate (signal/src_ip/dst_ip/source_dnp3_doc_id)'
+    # `rule-mapping-gate` PASSes (exit 0) both when the Rule index exists
+    # with correct field types AND when it does not exist at all -- the
+    # Rule alert index is created LAZILY by zone_violation.py only on its
+    # first actual alert write (confirmed against the pinned Amenonuboco
+    # source), so a genuinely negative run (Range B's frozen expected Rule
+    # output is "No alert", scoring.md SS3) never creates it. Only a
+    # real field/type drift on an EXISTING index still fails closed. The
+    # retained gate file's own `index_present` field is the authoritative
+    # record of which case occurred; log it here so the console transcript
+    # states the same distinction the retained JSON does, not just PASS.
+    $ruleMappingGatePath = Join-Path $RunEvidence 'rule-output\rule-selector-mapping-gate.json'
+    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'rule-mapping-gate', '--mapping', $ruleMapping, '--output', $ruleMappingGatePath) -Description 'Rule selector exact-match mapping gate (signal/src_ip/dst_ip/source_dnp3_doc_id)'
+    $ruleMappingGateResult = Get-Content $ruleMappingGatePath -Raw | ConvertFrom-Json
+    if (Get-K8ObjectPropertyValue -Object $ruleMappingGateResult -Name 'index_present') {
+        Write-K8ShakedownLog -Message 'Rule selector mapping gate PASS: ot-signals-zone-violation-* exists with the required signal/src_ip/dst_ip/source_dnp3_doc_id .keyword shape.'
+    }
+    else {
+        Write-K8ShakedownLog -Message 'Rule selector mapping gate PASS: ot-signals-zone-violation-* does not exist yet (no alert has ever been written) -- this is a valid state, not a failure; the Rule query below will observe 0 hits, not an error.'
+    }
 
     Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method POST -Endpoint 'ot-logs-dnp3-*/_search' -Body (Get-Content (Join-Path $envDir 'collector-query.json') -Raw) -OutputPath $collectorResponse
 
