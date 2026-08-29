@@ -228,6 +228,88 @@ if ($joined -match '\bexec\b') {
         Write-Output 'http://elasticsearch:9200'
         exit 0
     }
+    if ($joined -match '\bip\b.*-o.*-4.*addr.*show') {
+        # Resolve-K8GatewayInterface's `ip -o -4 addr show [dev <name>]` --
+        # real VM false-negative reproduction states for the Range B
+        # "Cannot find device \"UP\"" defect (k8shakedown-rangea-
+        # 20260829-... , commit 5a70273 STOP). Realistic oneline-format
+        # rows: `<idx>: <ifname>[@peer]    inet <addr>/<prefix> ...`.
+        $loRow   = '1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever'
+        $gwRow   = '6: eth6@if5890    inet 10.1.20.254/24 brd 10.1.20.255 scope global eth6\       valid_lft forever preferred_lft forever'
+        $otherRow = '7: eth7@if5892    inet 172.19.0.5/16 brd 172.19.255.255 scope global eth7\       valid_lft forever preferred_lft forever'
+        $dupGwRow = '8: eth8@if5894    inet 10.1.20.254/24 brd 10.1.20.255 scope global eth8\       valid_lft forever preferred_lft forever'
+        $isDevQuery = $joined -match '\bdev\b'
+        switch ($env:K8_MOCK_DOCKER_STATE) {
+            'gateway-resolve-ok' {
+                if ($isDevQuery) {
+                    # Independent re-verification query for the resolved
+                    # 'eth6' -- must show the SAME row confirming the CIDR.
+                    if ($joined -match '\beth6\b') { Write-Output $gwRow } else { Write-Output $otherRow }
+                }
+                else { Write-Output $loRow; Write-Output $gwRow; Write-Output $otherRow }
+                exit 0
+            }
+            'gateway-resolve-zero-match' {
+                if (-not $isDevQuery) { Write-Output $loRow; Write-Output $otherRow }
+                exit 0
+            }
+            'gateway-resolve-multi-match' {
+                if (-not $isDevQuery) { Write-Output $loRow; Write-Output $gwRow; Write-Output $dupGwRow }
+                exit 0
+            }
+            'gateway-resolve-exit-nonzero' {
+                [Console]::Error.WriteLine('ip: command failed')
+                exit 1
+            }
+            'gateway-resolve-stderr-noise' {
+                [Console]::Error.WriteLine('net_ns: warning: nonstandard namespace label')
+                if ($isDevQuery) { Write-Output $gwRow } else { Write-Output $loRow; Write-Output $gwRow; Write-Output $otherRow }
+                exit 0
+            }
+            'gateway-resolve-state-token-regression' {
+                # Contrived: simulates the EXACT original defect symptom
+                # (a state token landing in the position an interface name
+                # would be) even if some future edit reintroduces a wrong
+                # command/column choice -- the denylist must catch this
+                # independent of the structural `ip -o -4 addr show` fix.
+                if (-not $isDevQuery) { Write-Output '6: UP    inet 10.1.20.254/24 brd 10.1.20.255 scope global UP\       valid_lft forever preferred_lft forever' }
+                exit 0
+            }
+            'gateway-resolve-verify-fails' {
+                # The initial scan finds a plausible match, but the
+                # independent re-verification query for that SAME name
+                # comes back empty -- must fail-closed anyway, never trust
+                # the first pass alone.
+                if ($isDevQuery) { exit 0 } else { Write-Output $loRow; Write-Output $gwRow; Write-Output $otherRow }
+                exit 0
+            }
+            default { exit 0 }
+        }
+    }
+    if ($joined -match '\btc\b.*\bfilter\b.*\bshow\b') {
+        # Assert-K8UnrelatedMirrorFilter's per-interface tc filter query.
+        switch ($env:K8_MOCK_DOCKER_STATE) {
+            'gateway-resolve-ok' {
+                if ($joined -match '\beth7\b') {
+                    Write-Output 'filter parent ffff: protocol all pref 1 u32 action mirred (Egress Mirror to device eth5)'
+                }
+                exit 0
+            }
+            default { exit 0 }
+        }
+    }
+    if ($joined -match '\bip\b.*-o.*\blink\b.*\bshow\b') {
+        # Assert-K8UnrelatedMirrorFilter's interface enumeration.
+        switch ($env:K8_MOCK_DOCKER_STATE) {
+            'gateway-resolve-ok' {
+                Write-Output '1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000'
+                Write-Output '6: eth6@if5890: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP mode DEFAULT group default'
+                Write-Output '7: eth7@if5892: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP mode DEFAULT group default'
+                exit 0
+            }
+            default { exit 0 }
+        }
+    }
     if ($joined -match '\bpython3\b' -and $joined -match 'ot-logs-dnp3.*_search|_search.*wildcard') {
         # zone_detector's own literal search, from inside its own container.
         switch ($env:K8_MOCK_DOCKER_STATE) {

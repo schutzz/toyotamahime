@@ -1129,17 +1129,28 @@ function Invoke-K8ElasticsearchRequest {
 }
 
 function Assert-K8UnrelatedMirrorFilter {
+    <#
+        Interface enumeration uses `ip -o link show` and extracts each name
+        via an ANCHORED regex capture group (^\d+:\s+([^:@]+)), never a
+        fixed whitespace-split column index -- this was already immune to
+        the ip-br-addr-style positional-column defect audited and fixed in
+        Resolve-K8GatewayInterface this round, but STDOUT/STDERR are now
+        also captured separately (same audit) so a stray stderr line can
+        never be mistaken for a real interface-listing line.
+    #>
     param([Parameter(Mandatory)] $Gateway, [Parameter(Mandatory)][string] $RunEvidence)
     $contractDir = Join-Path $RunEvidence 'contract-output'
-    $links = @(docker exec $Gateway.Router ip -o link show 2>&1)
-    if ($LASTEXITCODE -ne 0) { throw 'could not enumerate gateway interfaces for the unrelated mirror-filter gate' }
+    $linksCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $Gateway.Router, 'ip', '-o', 'link', 'show')
+    if ($linksCapture.ExitCode -ne 0) { throw "could not enumerate gateway interfaces for the unrelated mirror-filter gate (exit $($linksCapture.ExitCode)). stderr: $($linksCapture.Stderr.Trim())" }
+    $links = @($linksCapture.Stdout)
     $records = @()
     $found = $false
     foreach ($line in $links) {
         if ($line -notmatch '^\d+:\s+([^:@]+)') { continue }
         $interface = $Matches[1]
         if ($interface -eq 'lo' -or $interface -eq $Gateway.Interface) { continue }
-        $filter = (docker exec $Gateway.Router tc filter show dev $interface parent ffff: 2>&1 | Out-String)
+        $filterCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $Gateway.Router, 'tc', 'filter', 'show', 'dev', $interface, 'parent', 'ffff:')
+        $filter = ($filterCapture.Stdout | Out-String)
         $records += "### $interface`n$filter"
         if ($filter -match 'mirred\s+.*egress\s+mirror') { $found = $true }
     }
@@ -1435,7 +1446,55 @@ function Invoke-K8AutomatedQueries {
 }
 
 function Resolve-K8GatewayInterface {
-    <# Literal transcription of c2-dnp3-capture-procedure.md SS3. #>
+    <#
+        Frozen procedure: c2-dnp3-range-derivation.md SS3 resolves the
+        unique wan_router interface carrying $C.GatewayCidr via
+        `ip -o -4 addr show | awk '/<cidr>/ {print $2}' | head -n 1`. This
+        is NOT the same procedure as c2-dnp3-capture-procedure.md's own
+        `ip -br addr`-based capture-context resolution -- that is a
+        different command, for a different purpose (Ground Truth/
+        tap_observer capture context), executed by the frozen
+        study01_capture.py `resolve` subcommand itself and never
+        reimplemented here.
+
+        Root cause this closes (real VM Range B fault STOP: "Cannot find
+        device \"UP\""): this function's prior implementation borrowed
+        `ip -br addr`'s column layout (<ifname> <state> <addr>...) instead
+        of the actually-frozen `ip -o -4 addr show` oneline layout, and
+        read column index [1] -- `ip -br addr`'s STATE field
+        ("UP"/"DOWN"/"UNKNOWN"), not an interface name. Every `tc qdisc
+        del` therefore targeted a Linux operstate token, never a real
+        device -- confirmed against real iproute2 output shapes, not
+        assumed.
+
+        Fix: the actually-frozen `ip -o -4 addr show` (oneline format,
+        field index [1] 0-based == the interface token, matching the
+        frozen `awk '{print $2}'` 1-indexed field exactly), parsed IN
+        POWERSHELL rather than through a nested `sh -lc '... | awk ... |
+        head -n1'` pipeline -- this avoids the docker-exec/sh/awk quoting
+        fragility entirely, and keeps stdout/stderr genuinely separated
+        (Invoke-K8SeparatedNativeCapture) instead of merged via `2>&1`, so
+        a stray container-startup stderr line can never be mistaken for a
+        candidate address line. `head -n 1` in the frozen illustrative
+        snippet silently takes the first of several candidates; this
+        implementation instead requires EXACTLY ONE matching line and
+        fails closed on zero or multiple, matching the frozen wording
+        itself ("the UNIQUE wan_router interface", c2-dnp3-step4-range-b-
+        fault-pilot.md) and the parallel zero-or-multiple-fails-closed rule
+        already frozen for Ground Truth's own resolution.
+
+        Beyond the frozen procedure (Shakedown-added defense, not a
+        protocol change): the resolved token must not be empty and must
+        not be one of the well-known Linux operstate tokens (UP/DOWN/
+        UNKNOWN/etc. -- exactly the defect class that reached a real VM),
+        AND a SEPARATE, independent `ip -o -4 addr show dev <token>` query
+        must confirm the token names a real interface that actually
+        carries the target CIDR, before this value is ever handed to `tc
+        qdisc del`. This general-purpose re-verification is the real
+        backstop: it would have caught "UP" (no such interface exists)
+        even without the specific-token denylist, and it catches any other
+        parsing anomaly this function's own author did not anticipate.
+    #>
     param(
         [Parameter(Mandatory)][string] $RunId,
         [Parameter(Mandatory)][string] $ComposePath,
@@ -1447,21 +1506,49 @@ function Resolve-K8GatewayInterface {
     if ([string]::IsNullOrWhiteSpace($router) -or [string]::IsNullOrWhiteSpace($observer)) {
         throw "wan_router or tap_observer container was not resolved for $RunId; not starting a helper, not triggering."
     }
-    $addrOutput = docker exec $router sh -lc 'ip -br addr' 2>&1
     $contractDir = Join-Path $RunEvidence 'contract-output'
     New-Item -ItemType Directory -Force -Path $contractDir | Out-Null
-    $addrOutput | Set-Content -Path (Join-Path $contractDir 'gateway-interface-resolution.txt') -Encoding utf8NoBOM
+    $evidencePath = Join-Path $contractDir 'gateway-interface-resolution.txt'
 
-    $gatewayMatches = @($addrOutput | Where-Object { $_ -match [regex]::Escape($C.GatewayCidr) })
+    # STDOUT/STDERR captured SEPARATELY: a stray stderr line must never be
+    # treated as a candidate address line.
+    $addrCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $router, 'ip', '-o', '-4', 'addr', 'show')
+    $addrLines = @($addrCapture.Stdout)
+    "exit $($addrCapture.ExitCode)`nstdout:`n$($addrLines -join "`n")`nstderr:`n$($addrCapture.Stderr.Trim())" |
+        Set-Content -Path $evidencePath -Encoding utf8NoBOM
+    if ($addrCapture.ExitCode -ne 0) {
+        throw "'ip -o -4 addr show' failed inside wan_router (exit $($addrCapture.ExitCode)); not starting a helper, not triggering. See $evidencePath."
+    }
+
+    $gatewayMatches = @($addrLines | Where-Object { $_ -match [regex]::Escape($C.GatewayCidr) })
     if ($gatewayMatches.Count -ne 1) {
-        throw "Gateway interface resolution: expected exactly 1 line containing $($C.GatewayCidr), found $($gatewayMatches.Count). Not starting a helper, not triggering. See $contractDir\gateway-interface-resolution.txt."
+        throw "Gateway interface resolution: expected exactly 1 line containing $($C.GatewayCidr), found $($gatewayMatches.Count). Not starting a helper, not triggering. See $evidencePath."
     }
-    $token = ($gatewayMatches[0] -split '\s+' | Where-Object { $_ })[1]
+    $fields = @($gatewayMatches[0] -split '\s+' | Where-Object { $_ })
+    if ($fields.Count -lt 2) {
+        throw "Gateway interface resolution: matching line does not have the expected 'ip -o -4 addr show' field shape ('<idx>: <ifname> inet <addr>/<prefix> ...'): $($gatewayMatches[0]). See $evidencePath."
+    }
+    $token = $fields[1]
     $resolvedIf = ($token -split '@', 2)[0]
-    if ([string]::IsNullOrWhiteSpace($resolvedIf)) {
-        throw 'capture device name was not resolved'
+
+    $badTokens = @('UP', 'DOWN', 'UNKNOWN', 'LOWERLAYERDOWN', 'DORMANT', 'NOTPRESENT', 'TESTING', 'inet', 'inet6')
+    if ([string]::IsNullOrWhiteSpace($resolvedIf) -or $badTokens -ccontains $resolvedIf) {
+        throw "Gateway interface resolution produced an implausible value ('$resolvedIf') from token '$token' -- this looks like a state/address-family token, not an interface name. Not starting a helper, not triggering. See $evidencePath."
     }
-    Write-K8ShakedownLog -Message "Resolved gateway interface: $resolvedIf (from token '$token')"
+
+    # Independent re-verification, BEFORE this value is trusted for fault
+    # injection: query the resolved NAME directly and confirm it is a real
+    # interface that actually carries the target CIDR.
+    $verifyCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $router, 'ip', '-o', '-4', 'addr', 'show', 'dev', $resolvedIf)
+    $verifyLines = @($verifyCapture.Stdout)
+    $verifyOk = ($verifyCapture.ExitCode -eq 0) -and (@($verifyLines | Where-Object { $_ -match [regex]::Escape($C.GatewayCidr) }).Count -gt 0)
+    "exit $($addrCapture.ExitCode)`nstdout:`n$($addrLines -join "`n")`nstderr:`n$($addrCapture.Stderr.Trim())`n`n--- independent re-verification: ip -o -4 addr show dev $resolvedIf ---`nexit $($verifyCapture.ExitCode)`nstdout:`n$($verifyLines -join "`n")`nstderr:`n$($verifyCapture.Stderr.Trim())" |
+        Set-Content -Path $evidencePath -Encoding utf8NoBOM
+    if (-not $verifyOk) {
+        throw "Gateway interface resolution: resolved value '$resolvedIf' could not be independently re-verified as a real interface carrying $($C.GatewayCidr) (exit $($verifyCapture.ExitCode)). Not starting a helper, not triggering. See $evidencePath."
+    }
+
+    Write-K8ShakedownLog -Message "Resolved and independently re-verified gateway interface: $resolvedIf (from token '$token')"
     return [pscustomobject]@{ Router = $router; Observer = $observer; Interface = $resolvedIf }
 }
 

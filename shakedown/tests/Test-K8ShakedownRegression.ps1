@@ -1852,6 +1852,155 @@ Assert-K8Test 'Test-K8ScoringInputArtifactCompleteness requires the new Rule/Col
     }
 }
 
+# --- 17. Gateway interface resolution fix (frozen ip -o -4 addr show) -------
+#
+# Real VM defect, root-caused (Range B fault STOP: "Cannot find device
+# \"UP\""), against exact commit 5a70273: Resolve-K8GatewayInterface used
+# `ip -br addr` (a DIFFERENT command from a DIFFERENT frozen procedure --
+# c2-dnp3-capture-procedure.md's Ground Truth capture-context resolution,
+# executed by the frozen study01_capture.py itself, never this function)
+# and read column index [1] -- `ip -br addr`'s STATE field
+# ("UP"/"DOWN"/"UNKNOWN"), not an interface name. The actually-frozen
+# procedure for Range B (c2-dnp3-range-derivation.md SS3) resolves the
+# gateway via `ip -o -4 addr show | awk '/<cidr>/ {print $2}' | head -n 1`
+# -- a structurally different oneline format where field 2 (1-indexed,
+# field index [1] 0-indexed) genuinely IS the interface token. Not a
+# scientific finding; the closed run is not rescued/resumed.
+#
+# Fix: adopts the actually-frozen `ip -o -4 addr show`, parsed IN
+# POWERSHELL (never through a nested `sh -lc '... | awk ... | head -n1'`
+# pipeline, avoiding docker-exec/sh/awk quoting entirely) via
+# Invoke-K8SeparatedNativeCapture (stdout/stderr genuinely separated).
+# Requires EXACTLY ONE matching line (fail-closed on zero or multiple,
+# matching the frozen "the UNIQUE wan_router interface" wording -- `head
+# -n 1` in the illustrative frozen snippet silently takes the first of
+# several candidates instead). Beyond the frozen procedure: rejects known
+# Linux operstate tokens and empty values by name, AND independently
+# re-verifies the resolved value via a SEPARATE `ip -o -4 addr show dev
+# <name>` query confirming it is a real interface actually carrying the
+# target CIDR, before ever returning it for fault injection.
+
+$gwMockDir = Join-Path $ShakedownDir 'tests\mock-docker'
+$gwOriginalPath = $env:PATH
+try {
+    $env:PATH = "$gwMockDir;$env:PATH"
+    Import-Module $CommonPath -Force
+
+    Assert-K8Test 'REGRESSION: Resolve-K8GatewayInterface resolves the unique ip -o -4 addr show match (never the ip -br addr STATE column)' {
+        $env:K8_MOCK_DOCKER_STATE = 'gateway-resolve-ok'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-gw-ok-" + [guid]::NewGuid())
+        try {
+            $gw = Resolve-K8GatewayInterface -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir
+            if ($gw.Interface -ne 'eth6') { throw "expected 'eth6', got '$($gw.Interface)'" }
+            if (-not (Test-Path (Join-Path $dir 'contract-output\gateway-interface-resolution.txt'))) { throw 'gateway-interface-resolution.txt was not retained' }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION: zero matching interfaces fails closed; multiple matching interfaces fails closed (frozen: the UNIQUE interface, never head -n 1 silently choosing one)' {
+        $env:K8_MOCK_DOCKER_STATE = 'gateway-resolve-zero-match'
+        $dir1 = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-gw-zero-" + [guid]::NewGuid())
+        $stopped1 = $false
+        try { Resolve-K8GatewayInterface -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir1 } catch { $stopped1 = $true }
+        finally { Remove-Item $dir1 -Recurse -Force -ErrorAction SilentlyContinue }
+        if (-not $stopped1) { throw 'zero matching interfaces did not STOP' }
+
+        $env:K8_MOCK_DOCKER_STATE = 'gateway-resolve-multi-match'
+        $dir2 = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-gw-multi-" + [guid]::NewGuid())
+        $stopped2 = $false
+        try { Resolve-K8GatewayInterface -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir2 } catch { $stopped2 = $true }
+        finally { Remove-Item $dir2 -Recurse -Force -ErrorAction SilentlyContinue }
+        if (-not $stopped2) { throw 'multiple matching interfaces did not STOP' }
+    }
+
+    Assert-K8Test 'REGRESSION: ip -o -4 addr show transport failure (nonzero exit) fails closed with the exit code in the diagnostic' {
+        $env:K8_MOCK_DOCKER_STATE = 'gateway-resolve-exit-nonzero'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-gw-exit-" + [guid]::NewGuid())
+        try {
+            $stopped = $false; $msg = ''
+            try { Resolve-K8GatewayInterface -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir } catch { $stopped = $true; $msg = $_.Exception.Message }
+            if (-not $stopped) { throw 'a transport failure did not STOP' }
+            if ($msg -notmatch 'exit 1') { throw "the exit code was not surfaced in the failure message: $msg" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION: a stray stderr line never contaminates gateway interface resolution (stdout/stderr genuinely separated)' {
+        $env:K8_MOCK_DOCKER_STATE = 'gateway-resolve-stderr-noise'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-gw-noise-" + [guid]::NewGuid())
+        try {
+            $gw = Resolve-K8GatewayInterface -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir
+            if ($gw.Interface -ne 'eth6') { throw "expected 'eth6' despite stderr noise, got '$($gw.Interface)'" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION: a known Linux operstate token (UP/DOWN/UNKNOWN/etc.) is rejected by name, independent of the structural command fix' {
+        $env:K8_MOCK_DOCKER_STATE = 'gateway-resolve-state-token-regression'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-gw-stoken-" + [guid]::NewGuid())
+        try {
+            $stopped = $false; $msg = ''
+            try { Resolve-K8GatewayInterface -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir } catch { $stopped = $true; $msg = $_.Exception.Message }
+            if (-not $stopped) { throw "a state-token value ('UP') incorrectly resolved as a real interface -- this is the EXACT real VM defect symptom" }
+            if ($msg -notmatch "'UP'") { throw "failure message does not name the rejected value: $msg" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION: independent re-verification catches a resolved value that does not actually carry the target CIDR when queried directly (the general-purpose backstop)' {
+        $env:K8_MOCK_DOCKER_STATE = 'gateway-resolve-verify-fails'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-gw-verifyfail-" + [guid]::NewGuid())
+        try {
+            $stopped = $false
+            try { Resolve-K8GatewayInterface -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir } catch { $stopped = $true }
+            if (-not $stopped) { throw 'a resolved value that fails independent re-verification did not STOP' }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'Assert-K8UnrelatedMirrorFilter still finds an unrelated mirror filter after its stdout/stderr separation fix' {
+        $env:K8_MOCK_DOCKER_STATE = 'gateway-resolve-ok'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-mirror-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir 'contract-output') | Out-Null
+        try {
+            Assert-K8UnrelatedMirrorFilter -Gateway ([pscustomobject]@{Router = 'mock-container-id'; Interface = 'eth6'}) -RunEvidence $dir
+            if (-not (Test-Path (Join-Path $dir 'contract-output\unrelated-mirror-filters.txt'))) { throw 'unrelated-mirror-filters.txt was not retained' }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+finally { $env:PATH = $gwOriginalPath }
+
+Assert-K8Test 'Resolve-K8GatewayInterface uses ip -o -4 addr show (frozen c2-dnp3-range-derivation.md SS3), never ip -br addr (a different frozen procedure for a different purpose)' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Resolve-K8GatewayInterface'
+    if ($body -match "'ip -br addr'") { throw "Resolve-K8GatewayInterface still uses 'ip -br addr' -- the real-VM 'Cannot find device UP' defect may be back" }
+    foreach ($needle in @("'ip', '-o', '-4', 'addr', 'show'", 'Invoke-K8SeparatedNativeCapture', 'badTokens', '-ccontains')) {
+        if ($body -notmatch [regex]::Escape($needle)) { throw "Resolve-K8GatewayInterface is missing: $needle" }
+    }
+    # Exactly one match required, not head -n1's silent first-of-many.
+    if ($body -notmatch '\$gatewayMatches\.Count\s*-ne\s*1') { throw 'Resolve-K8GatewayInterface no longer requires an exact, unique match' }
+}
+
+Assert-K8Test 'Resolve-K8GatewayInterface independently re-verifies the resolved interface via a SEPARATE dev-scoped query before returning it' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Resolve-K8GatewayInterface'
+    if ($body -notmatch "'dev',\s*\`$resolvedIf") { throw 'no separate dev-scoped re-verification query was found' }
+    $verifyIndex = $body.IndexOf('$verifyCapture')
+    $returnIndex = $body.IndexOf('return [pscustomobject]')
+    if ($verifyIndex -lt 0 -or $returnIndex -lt 0 -or $verifyIndex -gt $returnIndex) { throw 're-verification does not run before the resolved interface is returned' }
+}
+
+Assert-K8Test 'Cross-cutting audit: no other native-CLI-output parsing in this module uses a fixed whitespace-split column index (the ip-br-addr-style defect class)' {
+    # The one remaining `-split` + fixed-index shape in the whole module is
+    # this function's own fix, which now indexes ip -o -4 addr show's
+    # (verified, documented) field layout -- not a fragile guess. Every
+    # OTHER native-output parser in this module either uses an anchored
+    # regex capture group (Assert-K8UnrelatedMirrorFilter's
+    # ^\d+:\s+([^:@]+)) or structured JSON, never bare positional splitting.
+    $needle = "-split '" + '\s+' + "'"   # the literal source text: -split '\s+'
+    $found = @([regex]::Matches($commonSource, [regex]::Escape($needle)))
+    if ($found.Count -ne 1) { throw "expected exactly 1 whitespace-split-then-fixed-index site (Resolve-K8GatewayInterface's own, now-corrected one), found $($found.Count)" }
+}
+
 # --- 7. Study01/ untouched on this branch -------------------------------------
 
 Assert-K8Test 'Study01/ is byte-for-byte unchanged versus origin/main' {
