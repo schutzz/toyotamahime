@@ -926,6 +926,54 @@ function Assert-K8UnrelatedMirrorFilter {
     if (-not $found) { throw 'Range B R-OBS-05 gate failed: no unrelated gateway interface retained a mirred egress mirror filter' }
 }
 
+function Invoke-K8TsharkFieldDecode {
+    <#
+        Shared low-level pcap decode: copies a retained pcap into the
+        already-running log_structurer container (which already has tshark
+        installed for its own DNP3 structuring pipeline -- no new install on
+        the Windows host, no operator-run analysis), runs tshark there with
+        a caller-supplied display filter against the SAME fixed field set
+        every decode in this module uses, and returns the parsed rows. The
+        remote copy is always removed afterward, success or failure.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $Container,
+        [Parameter(Mandatory)][string] $LocalPcapPath,
+        [Parameter(Mandatory)][string] $DisplayFilter,
+        [Parameter(Mandatory)][string] $RemoteNameHint
+    )
+    if (-not (Test-Path $LocalPcapPath)) { throw "pcap not found for decode: $LocalPcapPath" }
+    $remote = "/tmp/$RemoteNameHint.pcap"
+    & docker cp $LocalPcapPath "${Container}:$remote" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "could not copy $LocalPcapPath into log_structurer for decode" }
+    try {
+        $raw = @(docker exec $Container tshark -r $remote -Y $DisplayFilter -T fields -E 'separator=\t' -e frame.number -e frame.time_epoch -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e dnp3.al.func -e dnp3.src -e dnp3.dst 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "tshark decode failed for $LocalPcapPath`: $($raw -join ' ')" }
+    }
+    finally {
+        docker exec $Container rm -f $remote 2>&1 | Out-Null
+    }
+    $rows = @()
+    foreach ($line in $raw) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        # NOT `-split "`t", -1`: a -1 limit to the -split operator does not
+        # mean "unlimited" (it degenerately returns the whole line unsplit,
+        # count 1) -- confirmed by direct testing, not assumed. Omitting the
+        # limit (or passing 0) is what actually returns all 9 fields.
+        $columns = @($line -split "`t")
+        if ($columns.Count -ne 9) { throw "unexpected tshark row shape for $LocalPcapPath`: $line" }
+        $rows += [ordered]@{ frame_number=$columns[0]; frame_time_epoch=$columns[1]; ip_src=$columns[2]; ip_dst=$columns[3]; tcp_srcport=$columns[4]; tcp_dstport=$columns[5]; dnp3_al_func=$columns[6]; dnp3_src=$columns[7]; dnp3_dst=$columns[8] }
+    }
+    # `,$rows` (not bare `$rows`): PowerShell unrolls an array onto the
+    # output pipeline element-by-element, so a ONE-hit decode (the common
+    # case) would otherwise hand the caller the bare [ordered] hashtable
+    # instead of a one-element array -- confirmed by direct testing, not
+    # assumed (a real invocation returned .Count=9, the FIELD count of that
+    # single row, not the intended row count). The comma forces this
+    # function to always return one array, whatever its length.
+    return ,$rows
+}
+
 function Write-K8UnrelatedPcapRows {
     param(
         [Parameter(Mandatory)][string] $RunId,
@@ -933,25 +981,94 @@ function Write-K8UnrelatedPcapRows {
         [Parameter(Mandatory)][string] $RunEvidence
     )
     $pcap = Join-Path $RunEvidence 'sensor-input\mirror-capture\c2-mirror-sensor.pcap'
-    if (-not (Test-Path $pcap)) { throw "Range B sensor pcap missing: $pcap" }
     $container = (docker compose -p $RunId -f $ComposePath ps -q log_structurer | Out-String).Trim()
     if (-not $container) { throw 'log_structurer container could not be resolved for frozen pcap decode' }
-    $remote = "/tmp/$RunId-r-obs-05.pcap"
-    & docker cp $pcap "${container}:$remote" 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'could not copy the retained sensor pcap for decode' }
     $display = '(ip.src == 10.1.10.10 && ip.dst == 10.1.40.10 && tcp.dstport == 20000 && (dnp3.al.func == 1 || dnp3.al.func == 5) && dnp3.src == 1 && dnp3.dst == 20) || (ip.src == 10.1.40.10 && ip.dst == 10.1.10.10 && tcp.srcport == 20000 && dnp3.al.func == 129 && dnp3.src == 20 && dnp3.dst == 1)'
-    $raw = @(docker exec $container tshark -r $remote -Y $display -T fields -E 'separator=\t' -e frame.number -e frame.time_epoch -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e dnp3.al.func -e dnp3.src -e dnp3.dst 2>&1)
-    if ($LASTEXITCODE -ne 0) { throw "tshark unrelated-flow decode failed: $($raw -join ' ')" }
-    $rows = @()
-    foreach ($line in $raw) {
-        $columns = @($line -split "`t", -1)
-        if ($columns.Count -ne 9) { throw "unexpected tshark row shape: $line" }
-        $rows += [ordered]@{ frame_number=$columns[0]; frame_time_epoch=$columns[1]; ip_src=$columns[2]; ip_dst=$columns[3]; tcp_srcport=$columns[4]; tcp_dstport=$columns[5]; dnp3_al_func=$columns[6]; dnp3_src=$columns[7]; dnp3_dst=$columns[8] }
-    }
+    $rows = Invoke-K8TsharkFieldDecode -Container $container -LocalPcapPath $pcap -DisplayFilter $display -RemoteNameHint "$RunId-r-obs-05"
     $path = Join-Path $RunEvidence 'contract-output\r-obs-05-pcap-rows.json'
     ConvertTo-Json -InputObject @($rows) -Depth 4 | Set-Content -Path $path -Encoding utf8NoBOM
     if ($rows.Count -eq 0) { throw 'Range B R-OBS-05 gate failed: sensor pcap contains no unrelated-flow frame' }
     return $path
+}
+
+function Write-K8TargetCaptureDecode {
+    <#
+        README Study01/README.md SS5.1 step 6 requires "decode them" right
+        after capture stop/export; c2-dnp3-capture-procedure.md SS5 requires
+        retaining "decoded verification" alongside each stage's artifact;
+        c2-dnp3-sender-procedure.md SS4 condition 3 requires the independent
+        original-path pcap to satisfy the frozen Ground Truth selector in
+        freeze-decision-table.md SS3, which also fixes the Sensor selector
+        ("same tuple/function/link-address constraints ... in the
+        mirror-side pcap"). A real VM run reached scoring-input with no
+        machine-readable decode of either pcap at all -- this was entirely
+        missing, not merely incomplete.
+
+        Uses the EXACT frozen selector from freeze-decision-table.md SS3,
+        copied verbatim, never approximated or independently invented:
+        source 10.1.20.11, destination 10.1.10.10, TCP destination port
+        20000, DNP3 function 5, link source 1024, link destination 1.
+        Decoded via Invoke-K8TsharkFieldDecode -- the same log_structurer-
+        container tshark mechanism as Write-K8UnrelatedPcapRows -- so no new
+        tool install on the Windows host and no operator-run analysis.
+
+        Retains the decoded hit count and every hit's fields/timestamp, and
+        flags (informationally only) whether each frame's time falls inside
+        the frozen [T0-5s, T0+15s] window -- this in-window flag is
+        advisory, not a scientific gate: it does NOT use the same
+        exact-integer-nanosecond comparison k8_shakedown_evidence.py uses
+        for the R-OBS-05 correlation, because this artifact makes no
+        pass/fail claim for it to gate. A decoded hit count of zero is
+        retained exactly as observed and does NOT throw -- deciding whether
+        the Ground Truth/Sensor predicate is satisfied remains the
+        operator's scoring-input judgment (README SS6.2); this only removes
+        the mechanical burden of running tshark and transcribing its output
+        by hand. Must run while log_structurer is still up (before
+        Complete's teardown) and before Complete's finalize-evidence, and
+        writes into the same stage directory study01_capture.py itself
+        writes into, so it is covered by validate-evidence's per-directory
+        check and by the eventual hashes.sha256.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string] $ComposePath,
+        [Parameter(Mandatory)][string] $RunEvidence,
+        [Parameter(Mandatory)][ValidateSet('ground-truth', 'sensor')][string] $Stage,
+        [Parameter(Mandatory)][string] $WindowStartIso,
+        [Parameter(Mandatory)][string] $WindowEndIso
+    )
+    $stagePaths = @{
+        'ground-truth' = @{ pcap = 'ground-truth\independent-capture\c2-original-path.pcap'; out = 'ground-truth\independent-capture\decoded-verification.json' }
+        'sensor'       = @{ pcap = 'sensor-input\mirror-capture\c2-mirror-sensor.pcap'; out = 'sensor-input\mirror-capture\decoded-verification.json' }
+    }
+    $pcap = Join-Path $RunEvidence $stagePaths[$Stage].pcap
+    $container = (docker compose -p $RunId -f $ComposePath ps -q log_structurer | Out-String).Trim()
+    if (-not $container) { throw "log_structurer container could not be resolved for the $Stage capture decode" }
+    # freeze-decision-table.md SS3, Ground Truth/Sensor row, verbatim.
+    $display = 'ip.src==10.1.20.11 && ip.dst==10.1.10.10 && tcp.dstport==20000 && dnp3.al.func==5 && dnp3.src==1024 && dnp3.dst==1'
+    $rows = Invoke-K8TsharkFieldDecode -Container $container -LocalPcapPath $pcap -DisplayFilter $display -RemoteNameHint "$RunId-$Stage-decode"
+
+    $windowStart = [datetimeoffset]::Parse($WindowStartIso)
+    $windowEnd = [datetimeoffset]::Parse($WindowEndIso)
+    foreach ($row in $rows) {
+        $inWindow = $false
+        $parsedTime = 0.0
+        if ([double]::TryParse($row.frame_time_epoch, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsedTime)) {
+            $frameInstant = [datetimeoffset]::FromUnixTimeMilliseconds([long]($parsedTime * 1000))
+            $inWindow = ($frameInstant -ge $windowStart -and $frameInstant -le $windowEnd)
+        }
+        $row['in_frozen_window_advisory'] = $inWindow
+    }
+    $outPath = Join-Path $RunEvidence $stagePaths[$Stage].out
+    [ordered]@{
+        stage = $Stage
+        selector = 'freeze-decision-table.md SS3: src=10.1.20.11 dst=10.1.10.10 tcp.dstport=20000 dnp3.al.func=5 dnp3.src=1024 dnp3.dst=1'
+        window_start = $WindowStartIso; window_end = $WindowEndIso
+        decoded_hit_count = $rows.Count
+        hits_in_frozen_window_advisory = @($rows | Where-Object { $_.in_frozen_window_advisory }).Count
+        rows = $rows
+    } | ConvertTo-Json -Depth 6 | Set-Content -Path $outPath -Encoding utf8NoBOM
+    Write-K8ShakedownLog -Message "$Stage capture decode retained: $($rows.Count) matching frame(s) at $outPath (zero is retained as observed, not treated as failure -- README SS6.2 governs the scoring judgment)."
 }
 
 function Invoke-K8AutomatedQueries {
@@ -966,6 +1083,12 @@ function Invoke-K8AutomatedQueries {
     $envDir = Join-Path $RunEvidence 'environment'
     $collectorResponse = Join-Path $RunEvidence 'collector-output\collector-response.json'
     $ruleResponse = Join-Path $RunEvidence 'rule-output\rule-response.json'
+    # README SS5.1 step 6: "retain the Collector and Rule queries with their
+    # responses and mappings" -- retention only (no pass/fail gate is asked
+    # for here; a real VM run reached scoring-input with neither mapping
+    # retained for the main scientific queries, only for R-OBS-05's).
+    Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method GET -Endpoint 'ot-logs-dnp3-*/_mapping' -OutputPath (Join-Path $RunEvidence 'collector-output\collector-index-mapping.json')
+    Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method GET -Endpoint 'ot-signals-zone-violation-*/_mapping' -OutputPath (Join-Path $RunEvidence 'rule-output\rule-index-mapping.json')
     Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method POST -Endpoint 'ot-logs-dnp3-*/_search' -Body (Get-Content (Join-Path $envDir 'collector-query.json') -Raw) -OutputPath $collectorResponse
     Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method POST -Endpoint 'ot-signals-zone-violation-*/_search' -Body (Get-Content (Join-Path $envDir 'rule-query.json') -Raw) -OutputPath $ruleResponse
     Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'target-correlation', '--collector', $collectorResponse, '--rule', $ruleResponse, '--output', (Join-Path $RunEvidence 'rule-output\collector-rule-correlation.json')) -Description 'retain complete Collector hit IDs and mechanically correlate every Rule hit'
@@ -1227,6 +1350,82 @@ print("capture-lifecycle early check: PASS for ground-truth and sensor")
     }
 }
 
+function Test-K8ScoringInputArtifactCompleteness {
+    <#
+        Shakedown-specific completeness gate (independent review round 6,
+        BLOCKER): a real VM run reached scoring-input with runtime/
+        validate-evidence/finalize/teardown/verify-integrity all already
+        PASS, only to discover then that README SS5.1 step 6's "decode
+        them" had never been implemented at all -- no per-stage
+        machine-readable decode of either capture existed anywhere in the
+        run. study01_collect.py's validate-evidence cannot catch this
+        class of gap: it has no notion that README requires a pcap decode
+        artifact, only that the schema-defined directories are non-empty
+        and the capture-lifecycle/procedure-conformance records are
+        internally consistent -- all of which were already true.
+
+        This checks, by file path, every primary artifact README SS5/SS6.2
+        actually requires before scoring-input can be started, for BOTH
+        Range A and Range B from one shared list, plus Range B's own
+        R-OBS-05-specific set. It is intentionally a Shakedown-only
+        convenience check, not a frozen-protocol validator: it never scores
+        anything, never decides Pass/Fail for any stage, and a file's mere
+        presence is not asserted to prove its content correct (that is what
+        the frozen validators, and ultimately the operator's own scoring-
+        input transcription, are for). It exists solely so a missing
+        primary artifact is caught here, before "runtime evidence PASS" is
+        ever printed, rather than only much later when an operator reaches
+        scoring-input on an already-closed, already-torn-down run.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('a', 'b')][string] $Range,
+        [Parameter(Mandatory)][string] $RunEvidence
+    )
+    $required = @(
+        'ground-truth\independent-capture\c2-original-path.pcap'
+        'ground-truth\independent-capture\capture-lifecycle.json'
+        'ground-truth\independent-capture\capture-context.json'
+        'ground-truth\independent-capture\decoded-verification.json'
+        'ground-truth\sender-record.txt'
+        'ground-truth\procedure-conformance.json'
+        'sensor-input\mirror-capture\c2-mirror-sensor.pcap'
+        'sensor-input\mirror-capture\capture-lifecycle.json'
+        'sensor-input\mirror-capture\capture-context.json'
+        'sensor-input\mirror-capture\decoded-verification.json'
+        'collector-output\collector-response.json'
+        'collector-output\collector-index-mapping.json'
+        'rule-output\rule-response.json'
+        'rule-output\rule-index-mapping.json'
+        'rule-output\collector-rule-correlation.json'
+        'contract-output\gateway-interface-resolution.txt'
+        'contract-output\runtime-contract-record.md'
+        'environment\image-inventory.json'
+        'environment\collector-query.json'
+        'environment\rule-query.json'
+        'metadata-t0.txt'
+        'metadata.md'
+        'deviations.md'
+    )
+    if ($Range -eq 'b') {
+        $required += @(
+            'contract-output\qdisc-pre-fault.txt'
+            'contract-output\qdisc-post-fault.txt'
+            'contract-output\unrelated-mirror-filters.txt'
+            'contract-output\r-obs-05-mapping-response.json'
+            'contract-output\r-obs-05-mapping-gate.json'
+            'contract-output\r-obs-05-response.json'
+            'contract-output\r-obs-05-pcap-rows.json'
+            'contract-output\r-obs-05-correlation.json'
+            'environment\r-obs-05-query.json'
+        )
+    }
+    $missing = @($required | Where-Object { -not (Test-Path (Join-Path $RunEvidence $_)) })
+    if ($missing.Count -gt 0) {
+        throw "Scoring-input artifact completeness gate failed -- missing $($missing.Count) required file(s), before this run is ever reported as runtime-PASS or handed to Complete: $($missing -join ', ')"
+    }
+    Write-K8ShakedownLog -Message "Scoring-input artifact completeness gate PASS: all $($required.Count) required primary artifact(s) present for Range $($Range.ToUpper())."
+}
+
 function Invoke-K8ShakedownRangeAB {
     param(
         [Parameter(Mandatory)][ValidateSet('a', 'b')][string] $Range
@@ -1421,6 +1620,13 @@ function Invoke-K8ShakedownRangeAB {
     $windowStart = ([datetimeoffset]::Parse($t0)).AddSeconds(-5).ToString('o')
     $windowEnd = ([datetimeoffset]::Parse($t0)).AddSeconds(15).ToString('o')
 
+    # 9b. README SS5.1 step 6: "decode them" -- both retained pcaps, against
+    # the frozen Ground Truth/Sensor selector (freeze-decision-table.md SS3).
+    # Must run before Complete's teardown (log_structurer must still be up)
+    # and before finalize-evidence (so the artifact is hashed).
+    Write-K8TargetCaptureDecode -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence -Stage 'ground-truth' -WindowStartIso $windowStart -WindowEndIso $windowEnd
+    Write-K8TargetCaptureDecode -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence -Stage 'sensor' -WindowStartIso $windowStart -WindowEndIso $windowEnd
+
     $collectorQuery = (Get-Content (Join-Path $PSScriptRoot 'collector-query.template.json') -Raw).Replace('<WINDOW_START>', $windowStart).Replace('<WINDOW_END>', $windowEnd)
     $collectorQuery | Set-Content -Path (Join-Path $envDir 'collector-query.json') -Encoding utf8NoBOM
     $ruleQuery = (Get-Content (Join-Path $PSScriptRoot 'rule-query.template.json') -Raw).Replace('<WINDOW_START>', $windowStart).Replace('<WINDOW_END>', $windowEnd)
@@ -1465,6 +1671,15 @@ See environment/, ground-truth/, sensor-input/, contract-output/ for the machine
         "# Deviations -- $RunId`n`nNo unplanned deviations recorded by this runner.`n"
     }
     $deviationsBody | Set-Content -Path (Join-Path $RunEvidence 'deviations.md') -Encoding utf8NoBOM
+
+    # 11a. Shakedown-specific completeness gate: every primary artifact
+    # README SS5/SS6.2 requires before scoring-input can even be started
+    # must exist BEFORE this runner ever reports "runtime evidence PASS" --
+    # not discovered only once the operator reaches scoring-input on an
+    # already-closed run. study01_collect.py validate-evidence does not
+    # catch this class of gap (it does not know README requires a pcap
+    # decode at all); this is a Shakedown-side check on top of it.
+    Test-K8ScoringInputArtifactCompleteness -Range $Range -RunEvidence $RunEvidence
 
     # 12. Leave the range running only until Complete performs the mandatory
     # pre-teardown validate/finalize gate. No operator query/curl step remains.

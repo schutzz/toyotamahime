@@ -367,7 +367,9 @@ Assert-K8Test 'Elasticsearch request uses old-curl-compatible single request sta
         if ($text -notlike "*$needle*") { throw "old-curl single-request marker missing: $needle" }
     }
     $callerCount = ([regex]::Matches($commonSource, 'Invoke-K8ElasticsearchRequest\s+-RunId')).Count
-    if ($callerCount -ne 4) { throw "expected Collector, Rule, mapping, and R-OBS-05 to share one helper; found $callerCount call sites" }
+    # Collector mapping, Rule mapping, Collector search, Rule search,
+    # R-OBS-05 mapping, R-OBS-05 search -- all sharing one helper.
+    if ($callerCount -ne 6) { throw "expected Collector/Rule mapping+search and R-OBS-05 mapping+search to share one helper (6 call sites); found $callerCount" }
 }
 
 Assert-K8Test 'Elasticsearch response gate accepts only 2xx valid JSON and retains failure diagnostics' {
@@ -783,17 +785,19 @@ Assert-K8Test 'Wait-K8CaptureWindowStart waits for the LATER of ground-truth/sen
     $sensor = Join-Path $dir 'sensor-input\mirror-capture'
     New-Item -ItemType Directory -Force -Path $gt, $sensor | Out-Null
     try {
-        @{ steps = @(@{ step = 'listening-check'; completed_at = (([datetimeoffset]::UtcNow).AddSeconds(-3.0)).ToString('o') }) } |
+        # A large, timing-jitter-tolerant gap between the two fixtures:
+        # ground-truth already clears the 5s lead on its own (-8s), sensor
+        # does not (-0.5s). Correct behavior (uses the LATER, sensor) waits
+        # ~4.6s; using the wrong (ground-truth) timestamp would wait ~0s --
+        # an unambiguous difference regardless of test-run overhead.
+        @{ steps = @(@{ step = 'listening-check'; completed_at = (([datetimeoffset]::UtcNow).AddSeconds(-8.0)).ToString('o') }) } |
             ConvertTo-Json -Depth 5 | Set-Content (Join-Path $gt 'capture-lifecycle.json') -Encoding utf8NoBOM
-        @{ steps = @(@{ step = 'listening-check'; completed_at = (([datetimeoffset]::UtcNow).AddSeconds(-1.5)).ToString('o') }) } |
+        @{ steps = @(@{ step = 'listening-check'; completed_at = (([datetimeoffset]::UtcNow).AddSeconds(-0.5)).ToString('o') }) } |
             ConvertTo-Json -Depth 5 | Set-Content (Join-Path $sensor 'capture-lifecycle.json') -Encoding utf8NoBOM
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         Wait-K8CaptureWindowStart -RunEvidence $dir -MarginSeconds 0.1
         $sw.Stop()
-        # Needed wait = 5.1 - 1.5 = 3.6s if it correctly used the LATER
-        # (sensor, -1.5s) timestamp; only 5.1 - 3.0 = 2.1s if it wrongly used
-        # ground-truth's earlier one.
-        if ($sw.Elapsed.TotalSeconds -lt 3.0) { throw "waited only $($sw.Elapsed.TotalSeconds)s -- did not use the LATER of the two stages' listening-check completion" }
+        if ($sw.Elapsed.TotalSeconds -lt 2.0) { throw "waited only $($sw.Elapsed.TotalSeconds)s -- did not use the LATER of the two stages' listening-check completion" }
         if (-not (Test-Path (Join-Path $dir 'environment\capture-window-start-wait.json'))) { throw 'wait result artifact was not retained' }
     }
     finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
@@ -859,6 +863,198 @@ Assert-K8Test 'No retry/loop construct was added to the fixed scientific Elastic
         $body = Get-K8FunctionBodyText -Path $CommonPath -Name $name
         if (Test-K8HasLoopConstruct -FunctionBodyText $body) { throw "$name contains a loop construct -- must remain exactly-once" }
     }
+}
+
+# --- 11. Ground Truth/Sensor decode, mapping retention, completeness gate ---
+#
+# Root cause: k8shakedown-rangea-20260829-024343 passed runtime/validate-
+# evidence/finalize/teardown/verify-integrity, then discovered at
+# scoring-input that README SS5.1 step 6's "decode them" had never been
+# implemented at all for either capture. This section also regression-tests
+# two REAL bugs found while fixing that (both previously undiscovered
+# because Write-K8UnrelatedPcapRows/Invoke-K8TsharkFieldDecode were never
+# actually exercised behaviorally before this round): a `-split "`t", -1`
+# expression that does not mean "unlimited substrings" (it returns the
+# whole line unsplit), and a single-row array silently unrolling into a
+# bare hashtable when returned bare from a function.
+
+Assert-K8Test 'REGRESSION: -split with a -1 limit does not mean unlimited (must use 0 or omit the limit)' {
+    # This is the exact bug that made Write-K8UnrelatedPcapRows /
+    # Write-K8TargetCaptureDecode throw "unexpected tshark row shape" on
+    # EVERY real decoded line, discovered only by an actual invocation, not
+    # by reading the code. Pins the correct behavior so it cannot silently
+    # regress back to `-1`.
+    $line = "1`t2`t3`t4`t5`t6`t7`t8`t9"
+    if (@($line -split "`t", -1).Count -ne 1) { throw 'expected behavior of a -1 split limit changed; the module''s own comment explaining why -1 is wrong may need updating' }
+    if (@($line -split "`t").Count -ne 9) { throw 'omitting the split limit no longer returns all fields -- this is what the fixed code now relies on' }
+    $moduleBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8TsharkFieldDecode'
+    # Match only the actual assignment statement, not this function's own
+    # explanatory comment about the bug it fixed (which legitimately quotes
+    # the old buggy pattern in prose).
+    if ($moduleBody -match '\$columns\s*=\s*@\(\$line\s*-split\s*"`t",\s*-1\)') { throw 'the fixed -1 split-limit bug was reintroduced in Invoke-K8TsharkFieldDecode' }
+}
+
+Assert-K8Test 'REGRESSION: Invoke-K8TsharkFieldDecode returns a real array even for exactly one decoded row' {
+    # PowerShell unrolls a bare array onto the pipeline; a function that
+    # ends with `return $arrayVar` (no leading comma) hands a ONE-element
+    # array's caller the bare element instead -- for an [ordered] hashtable
+    # row, that surfaces as .Count returning the FIELD count (9), not the
+    # intended ROW count (1). Confirmed by an actual invocation, not
+    # reasoned about in the abstract.
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8TsharkFieldDecode'
+    if ($body -notmatch 'return\s+,\$rows') { throw 'Invoke-K8TsharkFieldDecode no longer force-returns an array (the single-row unroll bug may have been reintroduced)' }
+}
+
+$mockDockerDir2 = Join-Path $ShakedownDir 'tests\mock-docker'
+$decodeOriginalPath = $env:PATH
+try {
+    $env:PATH = "$mockDockerDir2;$env:PATH"
+    Import-Module $CommonPath -Force
+
+    Assert-K8Test 'Write-K8TargetCaptureDecode: one real hit is retained with count 1, not 9 (the array-unroll regression, end to end)' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-decode-e2e-" + [guid]::NewGuid())
+        $gt = Join-Path $dir 'ground-truth\independent-capture'
+        New-Item -ItemType Directory -Force -Path $gt | Out-Null
+        'fake' | Set-Content (Join-Path $gt 'c2-original-path.pcap')
+        try {
+            $env:K8_MOCK_DOCKER_STATE = 'decode-hit'
+            $ws = ([datetimeoffset]::UtcNow).AddSeconds(-100).ToString('o'); $we = ([datetimeoffset]::UtcNow).AddSeconds(100).ToString('o')
+            Write-K8TargetCaptureDecode -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -Stage 'ground-truth' -WindowStartIso $ws -WindowEndIso $we
+            $result = Get-Content (Join-Path $gt 'decoded-verification.json') -Raw | ConvertFrom-Json
+            if ($result.decoded_hit_count -ne 1) { throw "decoded_hit_count was $($result.decoded_hit_count), expected 1 -- the array-unroll bug may be back" }
+            if ($result.rows.Count -ne 1) { throw "rows array had $($result.rows.Count) entries, expected 1" }
+            if ($result.selector -notmatch '10\.1\.20\.11.*10\.1\.10\.10.*20000.*al\.func=5.*src=1024.*dst=1') { throw 'retained selector text does not match freeze-decision-table.md SS3' }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'Write-K8TargetCaptureDecode: zero decoded hits is retained as observed, never thrown as a failure' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-decode-empty-" + [guid]::NewGuid())
+        $sensor = Join-Path $dir 'sensor-input\mirror-capture'
+        New-Item -ItemType Directory -Force -Path $sensor | Out-Null
+        'fake' | Set-Content (Join-Path $sensor 'c2-mirror-sensor.pcap')
+        try {
+            $env:K8_MOCK_DOCKER_STATE = 'decode-empty'
+            $ws = ([datetimeoffset]::UtcNow).AddSeconds(-100).ToString('o'); $we = ([datetimeoffset]::UtcNow).AddSeconds(100).ToString('o')
+            Write-K8TargetCaptureDecode -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -Stage 'sensor' -WindowStartIso $ws -WindowEndIso $we
+            $result = Get-Content (Join-Path $sensor 'decoded-verification.json') -Raw | ConvertFrom-Json
+            if ($result.decoded_hit_count -ne 0) { throw "expected decoded_hit_count 0, got $($result.decoded_hit_count)" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'Write-K8TargetCaptureDecode: transport/tshark failure STOPs (not silently retained as zero hits)' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-decode-err-" + [guid]::NewGuid())
+        $gt = Join-Path $dir 'ground-truth\independent-capture'
+        New-Item -ItemType Directory -Force -Path $gt | Out-Null
+        'fake' | Set-Content (Join-Path $gt 'c2-original-path.pcap')
+        try {
+            $env:K8_MOCK_DOCKER_STATE = 'decode-transport-error'
+            $ws = ([datetimeoffset]::UtcNow).AddSeconds(-100).ToString('o'); $we = ([datetimeoffset]::UtcNow).AddSeconds(100).ToString('o')
+            $stopped = $false
+            try { Write-K8TargetCaptureDecode -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -Stage 'ground-truth' -WindowStartIso $ws -WindowEndIso $we } catch { $stopped = $true }
+            if (-not $stopped) { throw 'a tshark transport failure did not STOP' }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'Write-K8UnrelatedPcapRows (R-OBS-05) still works correctly after the shared decode-helper fix' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-robs-e2e-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir 'sensor-input\mirror-capture'), (Join-Path $dir 'contract-output') | Out-Null
+        'fake' | Set-Content (Join-Path $dir 'sensor-input\mirror-capture\c2-mirror-sensor.pcap')
+        try {
+            $env:K8_MOCK_DOCKER_STATE = 'decode-hit'
+            $path = Write-K8UnrelatedPcapRows -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir
+            $rows = Get-Content $path -Raw | ConvertFrom-Json
+            if ($rows.Count -ne 1) { throw "expected 1 retained row, got $($rows.Count) -- the shared decode helper fix may have broken this caller" }
+            $env:K8_MOCK_DOCKER_STATE = 'decode-empty'
+            $stopped = $false
+            try { Write-K8UnrelatedPcapRows -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir } catch { $stopped = $true }
+            if (-not $stopped) { throw 'zero unrelated-flow hits did not STOP (R-OBS-05 requires at least one, unlike the target decode)' }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+finally { $env:PATH = $decodeOriginalPath }
+
+Assert-K8Test 'Ground Truth/Sensor decode uses the frozen freeze-decision-table.md SS3 selector, not an invented one, and never gates on hit count' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Write-K8TargetCaptureDecode'
+    foreach ($needle in @('10.1.20.11', '10.1.10.10', '20000', 'dnp3.al.func==5', 'dnp3.src==1024', 'dnp3.dst==1')) {
+        if ($body -notmatch [regex]::Escape($needle)) { throw "decode does not reference the frozen selector element: $needle" }
+    }
+    if ($body -match "if\s*\(\s*\`$rows\.Count\s*-eq\s*0\s*\)\s*\{\s*throw") { throw 'decode throws on zero hits -- README SS6.2 reserves that scientific judgment for the operator, this must retain and continue' }
+    # Check only for an actual verdict-like variable assignment, not the
+    # word appearing in this function's own docstring explaining that it
+    # does NOT assign one.
+    if ($body -match '\$(verdict|scientificResult|passFail)\s*=') { throw 'decode function appears to assign a scientific verdict -- it must only retain observed data' }
+}
+
+Assert-K8Test 'Both ground-truth and sensor decode calls run before finalize-evidence, while log_structurer is still up (before Complete''s teardown)' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+    $gtCall = $body.IndexOf("-Stage 'ground-truth' -WindowStartIso")
+    $sensorCall = $body.IndexOf("-Stage 'sensor' -WindowStartIso")
+    if ($gtCall -lt 0 -or $sensorCall -lt 0) { throw 'could not find both decode call sites in Invoke-K8ShakedownRangeAB' }
+    $completeBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Complete-K8ShakedownRangeAB'
+    if ($completeBody -match 'Write-K8TargetCaptureDecode') { throw 'decode must run in Invoke-K8ShakedownRangeAB (range still up), not in Complete (after teardown)' }
+}
+
+Assert-K8Test 'Collector and Rule index mappings are retained (README SS5.1 step 6: "with their responses and mappings"), for both Range A and B' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8AutomatedQueries'
+    foreach ($needle in @('collector-index-mapping.json', 'rule-index-mapping.json', "'ot-logs-dnp3-\*/_mapping'", "'ot-signals-zone-violation-\*/_mapping'")) {
+        if ($body -notmatch $needle) { throw "mapping retention marker missing: $needle" }
+    }
+    # Must not be inside the `if ($Range -eq 'b')` branch -- both ranges need it.
+    $mappingIndex = $body.IndexOf('collector-index-mapping.json')
+    $rangeBBranchIndex = $body.IndexOf("if (`$Range -eq 'b')")
+    if ($rangeBBranchIndex -ge 0 -and $mappingIndex -gt $rangeBBranchIndex) { throw 'Collector/Rule mapping retention appears to be inside the Range-B-only branch' }
+}
+
+Assert-K8Test 'Test-K8ScoringInputArtifactCompleteness: missing artifact STOPs before runtime PASS; complete set PASSes; Range B needs the R-OBS-05 set too' {
+    Import-Module $CommonPath -Force
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-complete-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    try {
+        $stopped = $false
+        try { Test-K8ScoringInputArtifactCompleteness -Range a -RunEvidence $dir } catch { $stopped = $true }
+        if (-not $stopped) { throw 'an entirely empty evidence tree did not STOP' }
+
+        $required = @(
+            'ground-truth\independent-capture\c2-original-path.pcap', 'ground-truth\independent-capture\capture-lifecycle.json',
+            'ground-truth\independent-capture\capture-context.json', 'ground-truth\independent-capture\decoded-verification.json',
+            'ground-truth\sender-record.txt', 'ground-truth\procedure-conformance.json',
+            'sensor-input\mirror-capture\c2-mirror-sensor.pcap', 'sensor-input\mirror-capture\capture-lifecycle.json',
+            'sensor-input\mirror-capture\capture-context.json', 'sensor-input\mirror-capture\decoded-verification.json',
+            'collector-output\collector-response.json', 'collector-output\collector-index-mapping.json',
+            'rule-output\rule-response.json', 'rule-output\rule-index-mapping.json', 'rule-output\collector-rule-correlation.json',
+            'contract-output\gateway-interface-resolution.txt', 'contract-output\runtime-contract-record.md',
+            'environment\image-inventory.json', 'environment\collector-query.json', 'environment\rule-query.json',
+            'metadata-t0.txt', 'metadata.md', 'deviations.md'
+        )
+        foreach ($rel in $required) {
+            $full = Join-Path $dir $rel
+            New-Item -ItemType Directory -Force -Path (Split-Path $full -Parent) | Out-Null
+            'x' | Set-Content $full
+        }
+        $failed = $false
+        try { Test-K8ScoringInputArtifactCompleteness -Range a -RunEvidence $dir } catch { $failed = $true; Write-Host "  (unexpected: $($_.Exception.Message))" }
+        if ($failed) { throw 'a complete Range A artifact set did not PASS' }
+
+        $stopped = $false
+        try { Test-K8ScoringInputArtifactCompleteness -Range b -RunEvidence $dir } catch { $stopped = $true }
+        if (-not $stopped) { throw 'Range B did not additionally require the R-OBS-05 artifact set' }
+    }
+    finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'The completeness gate runs before "runtime evidence PASS" is ever reported, for both Range A and B from one shared call site' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+    $gateCalls = @([regex]::Matches($body, 'Test-K8ScoringInputArtifactCompleteness\s+-Range'))
+    if ($gateCalls.Count -ne 1) { throw "expected exactly one shared call site; found $($gateCalls.Count)" }
+    # Search for the actual Write-K8ShakedownLog call site specifically
+    # (not just the phrase, which also legitimately appears in this
+    # function's own explanatory comments preceding the gate call).
+    $passLogIndex = $body.IndexOf('=== Shakedown Range $($Range.ToUpper()) runtime evidence PASS')
+    if ($passLogIndex -lt 0 -or $gateCalls[0].Index -gt $passLogIndex) { throw 'completeness gate does not run before the "runtime evidence PASS" log line' }
 }
 
 # --- 7. Study01/ untouched on this branch -------------------------------------

@@ -18,6 +18,11 @@ if ($joined -match '\bcompose\b.*\bps\b.*-q') {
     exit 0
 }
 
+if ($joined -match '^cp\b') {
+    # docker cp <local> <container>:<remote> -- pcap-into-log_structurer copy.
+    exit 0
+}
+
 if ($joined -match '^logs\b') {
     # docker logs --tail N <container> -- zone_detector recent-stderr best-effort check.
     switch ($env:K8_MOCK_DOCKER_STATE) {
@@ -48,6 +53,24 @@ if ($joined -match '\bexec\b') {
             'canary-transport-error' { exit 7 }
             'canary-matches-target-selector' { Write-Output $targetHit; Write-Output 'K8_HTTP_STATUS:200'; exit 0 }
             default { Write-Output $emptyHits; Write-Output 'K8_HTTP_STATUS:200'; exit 0 }
+        }
+    }
+    if ($joined -match '\bcurl\b' -and $joined -match '_mapping') {
+        # Collector/Rule index-mapping retention (README SS5.1 step 6).
+        switch ($env:K8_MOCK_DOCKER_STATE) {
+            'mapping-transport-error' { exit 7 }
+            default { Write-Output '{"index":{"mappings":{"properties":{}}}}'; Write-Output 'K8_HTTP_STATUS:200'; exit 0 }
+        }
+    }
+    if ($joined -match '\btshark\b' -and $joined -match '\s-r\s') {
+        # Real target-capture decode (Write-K8TargetCaptureDecode /
+        # Write-K8UnrelatedPcapRows), distinct from the /proc-probe strings
+        # below which merely contain the word "tshark" as canned output text.
+        switch ($env:K8_MOCK_DOCKER_STATE) {
+            'decode-hit'   { Write-Output "1`t1767225615.0`t10.1.20.11`t10.1.10.10`t54321`t20000`t5`t1024`t1"; exit 0 }
+            'decode-empty' { exit 0 }
+            'decode-transport-error' { exit 2 }
+            default { exit 0 }
         }
     }
     if ($joined -match 'ES_URL') {
