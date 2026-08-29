@@ -299,6 +299,36 @@ function Install-K8RangeCDependencies {
 # raw tshark/ES output is always retained alongside the computed result
 # specifically so a human can redo the exact SS4 decimal-nanosecond
 # comparison by hand if this code's approximation is ever in doubt.
+#
+# CROSS-SERVICE STARTUP-RACE AUDIT (independent review round 2, after the
+# curl-exit-7 failure): every generator in the pinned Amenonuboco commit
+# (78fc17746b5d663fafec9dffe563d79fe9ea02b7) that runs an install step
+# before its real payload was enumerated by grepping
+# platform/generators/*.py for apt-get/apt/pip/apk install, at that exact
+# commit -- not guessed. Exactly three exist:
+#   1. structuring.py (log_structurer): apt-get tshark/python3, then the
+#      tshark|bulk_loader.py DNP3 pipeline -- BLOCKER, gated by
+#      Wait-K8LogStructurerReady.
+#   2. plugins.py (zone_detector): pip install <requires>, then the
+#      signal-1-zone-violation plugin -- BLOCKER, gated by
+#      Wait-K8ZoneDetectorReady.
+#   3. compose.py's _INSTALL_IPROUTE2 (any non-gateway asset needing
+#      `ip route add`, and wan_router itself for its own mirror/qdisc
+#      setup): `(command -v ip || apt-get install iproute2 || apk add
+#      iproute2)`. NOT separately gated here, and deliberately so: unlike
+#      the two above, this race fails LOUDLY rather than silently. Every
+#      Shakedown command against wan_router that depends on `ip`/`tc`
+#      (Resolve-K8GatewayInterface, the Range B fault) already throws
+#      immediately if the binary is not yet present -- e.g.
+#      Resolve-K8GatewayInterface's own "found $($gatewayMatches.Count)"
+#      check throws on zero matches, which is exactly what an
+#      `ip: not found` stderr line inside $addrOutput produces. A loud,
+#      immediate STOP is not the silent-scientific-corruption shape the
+#      other two gates exist to prevent, so no additional gate was added
+#      for it; this is a recorded audit conclusion, not an oversight.
+# No other generator (mirroring.py, impairment.py, attack.py, shell.py,
+# visualization/*) contains an install-then-exec pattern at this pinned
+# commit.
 # ---------------------------------------------------------------------------
 
 function Get-K8ExpectedServices {
@@ -445,6 +475,19 @@ function Wait-K8ElasticsearchReady {
             remain exactly-once with no retry loop; grepping either of those
             two function bodies for a loop construct must find none -- see
             Test-K8ShakedownRegression.ps1).
+
+        PASS condition (independent review round 2: HTTP 200 alone is an
+        HTTP-listener check, not evidence the cluster can actually index/
+        search -- a JVM that has bound the port but not yet formed a cluster
+        can still answer HTTP before it can serve _search/_bulk correctly).
+        The response BODY is retained and parsed, not discarded: PASS
+        requires HTTP 2xx, a JSON body, and its "status" field to be
+        "yellow" or "green". "red" means at least one primary shard is
+        unassigned -- not accepted as ready. "yellow" (not "green") is
+        accepted because this scenario is a single-node cluster with default
+        replica settings, where "green" is not a normally reachable steady
+        state; requiring it would make every run fail on a fully healthy
+        single-node cluster, which is not what this gate is for.
     #>
     param(
         [Parameter(Mandatory)][string] $RunId,
@@ -458,25 +501,170 @@ function Wait-K8ElasticsearchReady {
     if ([string]::IsNullOrWhiteSpace($container)) {
         throw 'Elasticsearch container could not be resolved for the application-readiness gate; not proceeding to capture/trigger.'
     }
+    $marker = 'K8_HTTP_STATUS'
     $attempts = @()
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         $attemptStart = (Get-Date).ToUniversalTime().ToString('o')
-        $statusOutput = @(docker exec $container curl -sS -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:9200/_cluster/health 2>&1)
+        $raw = (docker exec $container curl -sS --max-time 5 -w "`n${marker}:%{http_code}" http://localhost:9200/_cluster/health 2>&1 | Out-String)
         $curlExit = $LASTEXITCODE
-        $status = ($statusOutput | Out-String).Trim()
-        $attempts += [ordered]@{ attempt_utc=$attemptStart; curl_exit=$curlExit; http_status=$status }
-        if ($curlExit -eq 0 -and $status -match '^2[0-9][0-9]$') {
-            [ordered]@{ gate='elasticsearch-application-readiness'; result='PASS'; container=$container; attempts=$attempts } |
-                ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $envDir 'elasticsearch-readiness.json') -Encoding utf8NoBOM
-            Write-K8ShakedownLog -Message "Elasticsearch application readiness PASS after $($attempts.Count) attempt(s) (HTTP $status)."
+        $record = [ordered]@{ attempt_utc=$attemptStart; curl_exit=$curlExit; http_status=$null; cluster_status=$null; body_parsed=$false }
+        if ($curlExit -eq 0 -and $raw -match "(?s)^(.*)\r?\n${marker}:(\d+)\s*$") {
+            $bodyText = $Matches[1]
+            $record.http_status = $Matches[2]
+            if ($record.http_status -match '^2[0-9][0-9]$') {
+                try {
+                    $parsed = $bodyText | ConvertFrom-Json
+                    $record.body_parsed = $true
+                    $record.cluster_status = Get-K8ObjectPropertyValue -Object $parsed -Name 'status'
+                    if ($record.cluster_status -in @('yellow', 'green')) {
+                        $attempts += $record
+                        [ordered]@{ gate='elasticsearch-application-readiness'; result='PASS'; container=$container; pass_condition='HTTP 2xx, parsed JSON body, cluster status in {yellow, green}'; final_body=$parsed; attempts=$attempts } |
+                            ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $envDir 'elasticsearch-readiness.json') -Encoding utf8NoBOM
+                        Write-K8ShakedownLog -Message "Elasticsearch application readiness PASS after $($attempts.Count) attempt(s) (HTTP $($record.http_status), cluster status '$($record.cluster_status)')."
+                        return
+                    }
+                }
+                catch { }
+            }
+        }
+        $attempts += $record
+        Start-Sleep -Seconds $PollSeconds
+    }
+    [ordered]@{ gate='elasticsearch-application-readiness'; result='TIMEOUT'; container=$container; pass_condition='HTTP 2xx, parsed JSON body, cluster status in {yellow, green}'; attempts=$attempts } |
+        ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $envDir 'elasticsearch-readiness.json') -Encoding utf8NoBOM
+    throw "Elasticsearch application-readiness gate timed out after ${TimeoutSeconds}s ($($attempts.Count) attempt(s); none returned HTTP 2xx with a parsed _cluster/health body whose status was yellow or green). Not proceeding to capture/trigger. See environment/elasticsearch-readiness.json. This is the pre-trigger gate for the curl-exit-7 class of failure; it is not retried here, and the fixed Collector/Rule/R-OBS-05 requests downstream are still never retried either."
+}
+
+function Wait-K8LogStructurerReady {
+    <#
+        APPLICATION-level readiness gate for log_structurer's DNP3
+        tshark|bulk_loader.py pipeline -- the pipeline that actually feeds
+        the ot-logs-dnp3-* index the fixed Collector request reads.
+
+        Root cause this closes (independent review round 2, BLOCKER):
+        Amenonuboco platform/generators/structuring.py, pinned
+        78fc17746b5d663fafec9dffe563d79fe9ea02b7, generates log_structurer's
+        OWN container startup script to run
+        `apt-get update && apt-get install -y tshark python3` FIRST, and only
+        after that succeeds does it launch, per declared protocol,
+        `tshark -i $IF -T ek -Y "dnp3" -l | python3 /app/bulk_loader.py
+        --index "ot-logs-dnp3-*" ...` as a background pipeline (source
+        reviewed directly at the pinned commit, not assumed). Container
+        'running' only proves that install step's shell started; a Collector
+        query fired before the pipeline is actually live would not error --
+        it would return zero/incomplete hits that look exactly like a
+        legitimate negative scientific result. That silent-corruption shape
+        (vs. wan_router's own iproute2 install, which fails LOUDLY when `ip`/
+        `tc` are not yet present, because Resolve-K8GatewayInterface's own
+        line-count check throws on zero matches) is why this one is a
+        BLOCKER and wan_router's install race is not; see the cross-service
+        audit note in this module's top-of-file comment.
+
+        Mechanism: checked via /proc/*/cmdline (present on any Linux
+        container regardless of whether ps/pgrep are installed -- this image
+        installs only tshark/python3, not procps) for a live process whose
+        argv contains BOTH 'tshark' and 'dnp3' (the launched tshark), and a
+        second live process whose argv contains BOTH 'bulk_loader.py' and
+        'dnp3' (the launched loader, `--index "ot-logs-dnp3-*"`). Sender
+        argument quoting is stripped by the shell that execs these processes
+        (compose.py wraps every generated command in `sh -c "..."`), so
+        their real /proc/PID/cmdline never contains the source's own
+        double-quote characters -- confirmed by reading compose.py's command
+        assembly, not assumed.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string] $ComposePath,
+        [Parameter(Mandatory)][string] $RunEvidence,
+        [int] $TimeoutSeconds = 240,
+        [int] $PollSeconds = 3
+    )
+    $envDir = Join-Path $RunEvidence 'environment'
+    $container = (docker compose -p $RunId -f $ComposePath ps -q log_structurer | Out-String).Trim()
+    if ([string]::IsNullOrWhiteSpace($container)) {
+        throw 'log_structurer container could not be resolved for the application-readiness gate; not proceeding to capture/trigger.'
+    }
+    $probe = 'for p in /proc/[0-9]*/cmdline; do tr "\0" " " < "$p" 2>/dev/null; printf "\n"; done'
+    $attempts = @()
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $attemptStart = (Get-Date).ToUniversalTime().ToString('o')
+        $dump = @((docker exec $container sh -lc $probe 2>&1 | Out-String) -split "`n")
+        $tsharkLive = [bool]($dump | Where-Object { $_ -match 'tshark' -and $_ -match 'dnp3' })
+        $bulkLoaderLive = [bool]($dump | Where-Object { $_ -match 'bulk_loader\.py' -and $_ -match 'dnp3' })
+        $attempts += [ordered]@{ attempt_utc=$attemptStart; tshark_dnp3_process_found=$tsharkLive; bulk_loader_dnp3_process_found=$bulkLoaderLive }
+        if ($tsharkLive -and $bulkLoaderLive) {
+            [ordered]@{ gate='log-structurer-dnp3-pipeline-readiness'; result='PASS'; container=$container; attempts=$attempts } |
+                ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $envDir 'log-structurer-readiness.json') -Encoding utf8NoBOM
+            Write-K8ShakedownLog -Message "log_structurer DNP3 tshark|bulk_loader pipeline PASS after $($attempts.Count) attempt(s)."
             return
         }
         Start-Sleep -Seconds $PollSeconds
     }
-    [ordered]@{ gate='elasticsearch-application-readiness'; result='TIMEOUT'; container=$container; attempts=$attempts } |
-        ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $envDir 'elasticsearch-readiness.json') -Encoding utf8NoBOM
-    throw "Elasticsearch application-readiness gate timed out after ${TimeoutSeconds}s ($($attempts.Count) attempt(s), none returned a 2xx HTTP status on /_cluster/health). Not proceeding to capture/trigger. See environment/elasticsearch-readiness.json. This is the pre-trigger gate for the curl-exit-7 class of failure; it is not retried here, and the fixed Collector/Rule/R-OBS-05 requests downstream are still never retried either."
+    [ordered]@{ gate='log-structurer-dnp3-pipeline-readiness'; result='TIMEOUT'; container=$container; attempts=$attempts } |
+        ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $envDir 'log-structurer-readiness.json') -Encoding utf8NoBOM
+    throw "log_structurer's DNP3 tshark|bulk_loader pipeline did not start within ${TimeoutSeconds}s (its apt-get tshark/python3 install may still be running). Not proceeding to capture/trigger -- a Collector query against an unstarted structuring pipeline would return an empty/incomplete result that looks like a legitimate negative finding rather than a startup race. See environment/log-structurer-readiness.json."
+}
+
+function Wait-K8ZoneDetectorReady {
+    <#
+        APPLICATION-level readiness gate for zone_detector's
+        signal-1-zone-violation detection plugin process -- the process that
+        actually populates ot-signals-zone-violation-*, which the fixed Rule
+        request reads.
+
+        Root cause this closes (independent review round 2, BLOCKER):
+        Amenonuboco platform/generators/plugins.py, pinned
+        78fc17746b5d663fafec9dffe563d79fe9ea02b7, generates the detection
+        plugin host's startup script to run
+        `pip install --quiet --no-cache-dir <requires>` FIRST, and only
+        after that succeeds does it launch
+        `python3 /app/plugins/signal-1-zone-violation.py &` (source reviewed
+        directly at the pinned commit; plugin container path/name confirmed
+        against c2-dnp3-step3-pilot.md's own record of the mount target).
+        Container 'running' only proves the pip-install shell started, not
+        that the detector process is live. A Rule query fired before it
+        starts would return zero hits indistinguishable from a genuine
+        'No alert' scientific result.
+
+        Mechanism: same /proc/*/cmdline approach as
+        Wait-K8LogStructurerReady, for the same reason (this image's own
+        startup script installs only what `requires` declares, not procps).
+        PASS requires a live process whose argv contains both 'python3' and
+        'signal-1-zone-violation'.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string] $ComposePath,
+        [Parameter(Mandatory)][string] $RunEvidence,
+        [int] $TimeoutSeconds = 240,
+        [int] $PollSeconds = 3
+    )
+    $envDir = Join-Path $RunEvidence 'environment'
+    $container = (docker compose -p $RunId -f $ComposePath ps -q zone_detector | Out-String).Trim()
+    if ([string]::IsNullOrWhiteSpace($container)) {
+        throw 'zone_detector container could not be resolved for the application-readiness gate; not proceeding to capture/trigger.'
+    }
+    $probe = 'for p in /proc/[0-9]*/cmdline; do tr "\0" " " < "$p" 2>/dev/null; printf "\n"; done'
+    $attempts = @()
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $attemptStart = (Get-Date).ToUniversalTime().ToString('o')
+        $dump = @((docker exec $container sh -lc $probe 2>&1 | Out-String) -split "`n")
+        $pluginLive = [bool]($dump | Where-Object { $_ -match 'python3' -and $_ -match 'signal-1-zone-violation' })
+        $attempts += [ordered]@{ attempt_utc=$attemptStart; signal1_plugin_process_found=$pluginLive }
+        if ($pluginLive) {
+            [ordered]@{ gate='zone-detector-signal1-plugin-readiness'; result='PASS'; container=$container; attempts=$attempts } |
+                ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $envDir 'zone-detector-readiness.json') -Encoding utf8NoBOM
+            Write-K8ShakedownLog -Message "zone_detector Signal1 plugin process PASS after $($attempts.Count) attempt(s)."
+            return
+        }
+        Start-Sleep -Seconds $PollSeconds
+    }
+    [ordered]@{ gate='zone-detector-signal1-plugin-readiness'; result='TIMEOUT'; container=$container; attempts=$attempts } |
+        ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $envDir 'zone-detector-readiness.json') -Encoding utf8NoBOM
+    throw "zone_detector's signal-1-zone-violation plugin process did not start within ${TimeoutSeconds}s (its pip install may still be running). Not proceeding to capture/trigger -- a Rule query against an unstarted detector would return zero hits indistinguishable from a genuine 'No alert' result. See environment/zone-detector-readiness.json."
 }
 
 function Complete-K8ElasticsearchResponse {
@@ -707,13 +895,23 @@ function Invoke-K8ShakedownRangeAB {
     # on timeout rather than proceeding against a half-up stack.
     Wait-K8ComposeReady -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
 
-    # 4a-2. APPLICATION readiness for Elasticsearch, shared identically by
-    # Range A and Range B, and run this early (before image inventory, the
-    # fault, capture, and the sender trigger) precisely because container
-    # 'running' state does not prove its HTTP endpoint is accepting
-    # connections yet. See Wait-K8ElasticsearchReady's docstring for the real
-    # VM failure (curl exit 7) this closes.
+    # 4a-2. APPLICATION readiness, shared identically by Range A and Range B,
+    # run this early (before image inventory, the fault, capture, and the
+    # sender trigger) precisely because container 'running' state proves
+    # none of these three: that Elasticsearch's HTTP endpoint is accepting
+    # connections and can serve a search (Wait-K8ElasticsearchReady), that
+    # log_structurer's own apt-get-installed tshark|bulk_loader DNP3 pipeline
+    # has actually started (Wait-K8LogStructurerReady), or that
+    # zone_detector's own pip-installed signal-1-zone-violation plugin
+    # process has actually started (Wait-K8ZoneDetectorReady). All three
+    # services are present in BOTH Range A and Range B's generated manifest
+    # (same base manifest per c2-dnp3-range-derivation.md SS1), so all three
+    # gates run for both Ranges from these same three call sites -- not
+    # duplicated, not Range-specific. See each function's own docstring for
+    # the real VM failure / pinned-source root cause it closes.
     Wait-K8ElasticsearchReady -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
+    Wait-K8LogStructurerReady -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
+    Wait-K8ZoneDetectorReady -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
 
     # 4b. Full image inventory (c2-dnp3-image-inventory.md SS4), before trigger:
     # per-service image reference/ID from `compose images`, THEN `docker image

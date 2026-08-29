@@ -491,21 +491,51 @@ Assert-K8Test 'Wait-K8ElasticsearchReady exists, has a finite timeout, and actua
     if ($body -notmatch 'elasticsearch-readiness\.json') { throw 'gate does not retain its result' }
 }
 
-Assert-K8Test 'The Elasticsearch application-readiness gate runs once, shared, before interface resolution and the sender trigger' {
-    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
-    $gateCalls = @([regex]::Matches($body, 'Wait-K8ElasticsearchReady\s+-RunId'))
-    if ($gateCalls.Count -ne 1) { throw "expected exactly one shared call site in Invoke-K8ShakedownRangeAB (used by both Range A and Range B); found $($gateCalls.Count)" }
-    $gateIndex = $gateCalls[0].Index
-    $interfaceIndex = $body.IndexOf('Resolve-K8GatewayInterface -RunId')
-    $senderIndex = $body.IndexOf("(Join-Path `$ScriptsDir 'study01_sender.py')")
-    if ($interfaceIndex -lt 0 -or $senderIndex -lt 0) { throw 'could not locate gateway-resolution or sender call sites to order against' }
-    if (-not ($gateIndex -lt $interfaceIndex -and $gateIndex -lt $senderIndex)) {
-        throw "Elasticsearch readiness gate (index $gateIndex) must precede both interface resolution ($interfaceIndex) and the sender trigger ($senderIndex)"
+foreach ($gateFunc in @('Wait-K8ElasticsearchReady', 'Wait-K8LogStructurerReady', 'Wait-K8ZoneDetectorReady')) {
+    Assert-K8Test "$gateFunc runs exactly once, shared (not Range-specific), before interface resolution and the sender trigger" {
+        $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+        $gateCalls = @([regex]::Matches($body, "$gateFunc\s+-RunId"))
+        if ($gateCalls.Count -ne 1) { throw "expected exactly one shared call site in Invoke-K8ShakedownRangeAB (used by both Range A and Range B); found $($gateCalls.Count)" }
+        $gateIndex = $gateCalls[0].Index
+        $interfaceIndex = $body.IndexOf('Resolve-K8GatewayInterface -RunId')
+        $senderIndex = $body.IndexOf("(Join-Path `$ScriptsDir 'study01_sender.py')")
+        if ($interfaceIndex -lt 0 -or $senderIndex -lt 0) { throw 'could not locate gateway-resolution or sender call sites to order against' }
+        if (-not ($gateIndex -lt $interfaceIndex -and $gateIndex -lt $senderIndex)) {
+            throw "$gateFunc (index $gateIndex) must precede both interface resolution ($interfaceIndex) and the sender trigger ($senderIndex)"
+        }
+        # Guard against reintroducing a Range-specific branch around the call --
+        # this must be unconditional, identical for 'a' and 'b'.
+        $surrounding = $body.Substring([Math]::Max(0, $gateIndex - 200), 200)
+        if ($surrounding -match "Range\s+-eq\s+'[ab]'") { throw "$gateFunc call site appears to be inside a Range-specific branch; it must be unconditional/shared" }
     }
-    # Guard against reintroducing a Range-specific branch around the call --
-    # this must be unconditional, identical for 'a' and 'b'.
-    $surrounding = $body.Substring([Math]::Max(0, $gateIndex - 200), 200)
-    if ($surrounding -match "Range\s+-eq\s+'[ab]'") { throw 'Elasticsearch readiness gate call site appears to be inside a Range-specific branch; it must be unconditional/shared' }
+}
+
+Assert-K8Test 'Elasticsearch readiness PASS requires a parsed cluster-health status, not HTTP 2xx alone' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Wait-K8ElasticsearchReady'
+    if ($body -notmatch "in @\('yellow',\s*'green'\)") { throw "gate no longer checks cluster status is yellow/green -- HTTP-200-only PASS condition may have been reintroduced" }
+    if ($body -notmatch 'ConvertFrom-Json') { throw 'gate no longer parses the response body as JSON' }
+}
+
+Assert-K8Test 'log_structurer/zone_detector readiness gates check /proc-based live processes, not ps/pgrep (not guaranteed installed on these images)' {
+    foreach ($name in @('Wait-K8LogStructurerReady', 'Wait-K8ZoneDetectorReady')) {
+        $body = Get-K8FunctionBodyText -Path $CommonPath -Name $name
+        if ($body -notmatch '/proc/\[0-9\]\*/cmdline') { throw "$name does not probe /proc/*/cmdline" }
+        # Check only the actual executed probe command (the $probe = '...'
+        # assignment), not the whole function body -- the docstring itself
+        # legitimately says "ps/pgrep" in prose explaining why they're
+        # avoided, which would false-positive a whole-body text search.
+        $probeLine = [regex]::Match($body, "\`$probe\s*=\s*'([^']*)'")
+        if (-not $probeLine.Success) { throw "${name}: could not find its \`$probe command assignment to check" }
+        if ($probeLine.Groups[1].Value -match '\bpgrep\b|\bps\b') { throw "${name}'s actual probe command invokes ps/pgrep, which these images do not install" }
+    }
+    $structurerBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Wait-K8LogStructurerReady'
+    foreach ($needle in @("'tshark'", "'dnp3'", "'bulk_loader\.py'")) {
+        if ($structurerBody -notmatch [regex]::Escape($needle)) { throw "Wait-K8LogStructurerReady missing expected match target: $needle" }
+    }
+    $detectorBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Wait-K8ZoneDetectorReady'
+    foreach ($needle in @("'python3'", "'signal-1-zone-violation'")) {
+        if ($detectorBody -notmatch [regex]::Escape($needle)) { throw "Wait-K8ZoneDetectorReady missing expected match target: $needle" }
+    }
 }
 
 Assert-K8Test 'Scientific Elasticsearch requests (Collector/Rule/R-OBS-05/mapping) contain no retry/loop construct' {
@@ -537,6 +567,73 @@ Assert-K8Test 'Range B runtime-contract record uses structured service-state che
     if ($body -match '\$psText\s+-(not)?match') { throw 'runtime-contract-record still decides readiness by text/substring-matching `compose ps` display output' }
     if ($body -notmatch 'Test-K8ComposeServiceReadiness') { throw 'runtime-contract-record does not use the structured readiness check' }
     if ($body -match "docker exec .*curl.*9200") { throw 'runtime-contract-record still runs its own ad hoc Elasticsearch curl check -- this must be removed now that Wait-K8ElasticsearchReady is shared and already ran before this function is called (duplicated/inconsistent Range A vs B readiness logic is exactly the defect class this audit fixed)' }
+}
+
+# --- 9. Behavioral: log_structurer / zone_detector / Elasticsearch gates -----
+#
+# Everything above this point is structural (AST/text). This section
+# actually INVOKES the real Wait-K8LogStructurerReady / Wait-K8ZoneDetectorReady
+# / Wait-K8ElasticsearchReady functions against a scripted `docker` mock
+# (tests/mock-docker/docker.cmd -> docker.ps1), so "not ready -> STOP before
+# trigger" and "ready -> PASS" are proven by running the real code, not by
+# asserting that the right words appear in it.
+
+$mockDockerDir = Join-Path $ShakedownDir 'tests\mock-docker'
+if (-not (Test-Path (Join-Path $mockDockerDir 'docker.cmd'))) { throw "docker mock not found at $mockDockerDir" }
+
+$originalPath = $env:PATH
+$originalMockState = $env:K8_MOCK_DOCKER_STATE
+try {
+    $env:PATH = "$mockDockerDir;$env:PATH"
+    Import-Module $CommonPath -Force
+
+    $behaviorEvidenceDir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-behavior-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path (Join-Path $behaviorEvidenceDir 'environment') | Out-Null
+
+    function Invoke-K8MockedGate {
+        param([string] $MockState, [string] $FunctionName)
+        $env:K8_MOCK_DOCKER_STATE = $MockState
+        & $FunctionName -RunId 'x' -ComposePath 'y.yml' -RunEvidence $behaviorEvidenceDir -TimeoutSeconds 4 -PollSeconds 1
+    }
+
+    $cases = @(
+        @{ Name = 'log_structurer: apt-get still installing -> trigger-before-STOP'; State = 'structurer-installing'; Func = 'Wait-K8LogStructurerReady'; ExpectPass = $false }
+        @{ Name = 'log_structurer: tshark|bulk_loader pipeline live -> PASS';        State = 'structurer-ready';       Func = 'Wait-K8LogStructurerReady'; ExpectPass = $true }
+        @{ Name = 'log_structurer: only tshark live, no bulk_loader yet -> STOP (both required, not either)'; State = 'structurer-tshark-only'; Func = 'Wait-K8LogStructurerReady'; ExpectPass = $false }
+        @{ Name = 'zone_detector: pip install still running -> trigger-before-STOP'; State = 'detector-installing'; Func = 'Wait-K8ZoneDetectorReady'; ExpectPass = $false }
+        @{ Name = 'zone_detector: signal-1-zone-violation plugin live -> PASS';      State = 'detector-ready';       Func = 'Wait-K8ZoneDetectorReady'; ExpectPass = $true }
+        @{ Name = 'elasticsearch: transport failure (curl exit 7) -> STOP';          State = 'es-down';              Func = 'Wait-K8ElasticsearchReady'; ExpectPass = $false }
+        @{ Name = 'elasticsearch: cluster status red -> STOP (not just HTTP 2xx)';   State = 'es-red';               Func = 'Wait-K8ElasticsearchReady'; ExpectPass = $false }
+        @{ Name = 'elasticsearch: HTTP 200 with no status field -> STOP (proves body is actually parsed)'; State = 'es-http-200-no-body-status'; Func = 'Wait-K8ElasticsearchReady'; ExpectPass = $false }
+        @{ Name = 'elasticsearch: cluster status yellow -> PASS';                    State = 'es-ready-yellow';      Func = 'Wait-K8ElasticsearchReady'; ExpectPass = $true }
+        @{ Name = 'elasticsearch: cluster status green -> PASS';                     State = 'es-ready-green';       Func = 'Wait-K8ElasticsearchReady'; ExpectPass = $true }
+    )
+    foreach ($case in $cases) {
+        Assert-K8Test $case.Name {
+            $passed = $false
+            try { Invoke-K8MockedGate -MockState $case.State -FunctionName $case.Func; $passed = $true }
+            catch { $passed = $false }
+            if ($passed -ne $case.ExpectPass) {
+                throw "expected $(if ($case.ExpectPass) {'PASS'} else {'STOP'}) but got $(if ($passed) {'PASS'} else {'STOP'})"
+            }
+        }
+    }
+
+    Assert-K8Test 'All three application-readiness gates retain their result artifact under environment/' {
+        foreach ($file in @('log-structurer-readiness.json', 'zone-detector-readiness.json', 'elasticsearch-readiness.json')) {
+            if (-not (Test-Path (Join-Path $behaviorEvidenceDir "environment\$file"))) { throw "$file was not retained" }
+        }
+        $esResult = Get-Content (Join-Path $behaviorEvidenceDir 'environment\elasticsearch-readiness.json') -Raw | ConvertFrom-Json
+        if ($esResult.result -ne 'PASS' -or $esResult.attempts[-1].cluster_status -ne 'green') {
+            throw 'retained Elasticsearch readiness artifact does not reflect the last (green) run -- body/status was not actually recorded'
+        }
+    }
+
+    Remove-Item $behaviorEvidenceDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+finally {
+    $env:PATH = $originalPath
+    $env:K8_MOCK_DOCKER_STATE = $originalMockState
 }
 
 # --- 7. Study01/ untouched on this branch -------------------------------------
