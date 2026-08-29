@@ -1231,20 +1231,263 @@ function Invoke-K8TsharkFieldDecode {
     return ,$rows
 }
 
-function Write-K8UnrelatedPcapRows {
+function Get-K8Robs05LivenessSpec {
+    <#
+        Acquisition parameters for the R-OBS-05 auxiliary liveness capture.
+        EVERY value here is a fixed constant of this module: the operator
+        supplies nothing, and there is no parameter, environment variable,
+        or config file that can vary any of them per run. That mirrors the
+        PURPOSE c2-dnp3-capture-procedure.md SS4 states for the two frozen
+        stages ("the operator supplies only the run ID, evidence root,
+        stage, and Compose file ... rather than from anything typed by
+        hand").
+
+        Namespace/interface are the frozen values from
+        k6-r-obs-05-collector-query-contract.md SS4, which names the artifact
+        this capture produces: "the separate R-OBS-05 `tap_observer:eth0`
+        liveness pcap".
+
+        THERE IS DELIBERATELY NO BPF FILTER. This is the single most
+        important property of this spec and it is asserted, not incidental:
+        a capture-time filter would be a selector, and no frozen constant
+        defines one for this capture (the historical one is unrecoverable
+        and must never be guessed). Capturing with no filter means the frame
+        set that can become evidence is a pure function of frozen inputs
+        only -- the frozen SS4 capture point, the frozen SS3 selector applied
+        AFTER capture, and the frozen SS2/SS4 window -- with no non-frozen
+        parameter able to influence it. Any filter, including the frozen
+        target-scoped CAPTURE_FILTER, would reintroduce exactly the
+        structural exclusion that made this gate unsatisfiable (the frozen
+        filter requires host 10.1.20.11, which the unrelated flow
+        10.1.10.10<->10.1.40.10 does not contain).
+
+        This capture is NEITHER Ground Truth NOR Sensor. It produces
+        liveness/control evidence only, per the frozen contract SS1 ("This
+        query produces liveness evidence only. Its hits may never satisfy
+        the target-event Sensor/Collector stages, rule correlation, or
+        target complete-selector query."). The frozen Ground Truth and
+        Sensor stages, apparatus.py's CAPTURE_FILTER, and study01_capture.py
+        are all untouched and continue to own those two stages exclusively.
+    #>
+    param([Parameter(Mandatory)][string] $RunId)
+    $C = Get-K8ShakedownConstants
+    return [pscustomobject]@{
+        HelperName       = "$RunId-r-obs-05-liveness-capture"
+        HelperImage      = "$($C.TcpdumpImage)@$($C.TcpdumpDigest)"
+        NamespaceService = 'tap_observer'
+        Interface        = 'eth0'
+        ContainerPcap    = '/data/r-obs-05-liveness.pcap'
+        Artifact         = 'contract-output\r-obs-05-liveness.pcap'
+        Decode           = 'contract-output\r-obs-05-liveness-decode.txt'
+        Lifecycle        = 'contract-output\r-obs-05-capture-lifecycle.json'
+        Rows             = 'contract-output\r-obs-05-pcap-rows.json'
+    }
+}
+
+function Invoke-K8Robs05LifecycleStep {
+    <# Runs one lifecycle command and returns the same shape the frozen
+       capture_lifecycle.py retains per step: exact argv, exit code, output,
+       and BOTH the start and completion UTC instants (they prove different
+       things -- see c2-dnp3-capture-procedure.md SS5.1). #>
+    param([Parameter(Mandatory)][string] $Step, [Parameter(Mandatory)][string[]] $Argv)
+    $started = (Get-Date).ToUniversalTime().ToString('o')
+    $capture = Invoke-K8SeparatedNativeCapture -FilePath $Argv[0] -ArgumentList @($Argv[1..($Argv.Count - 1)])
+    $completed = (Get-Date).ToUniversalTime().ToString('o')
+    return [ordered]@{
+        step = $Step; argv = $Argv; exit_code = $capture.ExitCode
+        stdout = ($capture.Stdout | Out-String).Trim(); stderr = $capture.Stderr.Trim()
+        started_utc = $started; completed_utc = $completed
+    }
+}
+
+function Start-K8Robs05LivenessCapture {
+    <#
+        Starts the auxiliary R-OBS-05 liveness capture and confirms it is
+        listening. Range B only. Any failure is a reproduction-APPARATUS
+        failure and STOPs the run (fresh run ID per
+        c2-dnp3-capture-procedure.md SS6); it is never mapped onto an
+        R-OBS-05 / Runtime Contract / classification value -- this function
+        cannot and must not decide a scientific verdict.
+    #>
     param(
         [Parameter(Mandatory)][string] $RunId,
         [Parameter(Mandatory)][string] $ComposePath,
         [Parameter(Mandatory)][string] $RunEvidence
     )
-    $pcap = Join-Path $RunEvidence 'sensor-input\mirror-capture\c2-mirror-sensor.pcap'
+    $spec = Get-K8Robs05LivenessSpec -RunId $RunId
+    $contractDir = Join-Path $RunEvidence 'contract-output'
+    New-Item -ItemType Directory -Force -Path $contractDir | Out-Null
+    $lifecyclePath = Join-Path $RunEvidence $spec.Lifecycle
+
+    $nsCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '-q', $spec.NamespaceService)
+    $namespaceContainer = ($nsCapture.Stdout | Out-String).Trim()
+    if ($nsCapture.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($namespaceContainer)) {
+        throw "R-OBS-05 liveness capture STOP (apparatus failure): namespace container for '$($spec.NamespaceService)' was not resolved (exit $($nsCapture.ExitCode)). stderr: $($nsCapture.Stderr.Trim())"
+    }
+
+    $record = [ordered]@{
+        schema_version = 1; run_id = $RunId
+        execution_run_root = (Resolve-Path $RunEvidence).Path
+        role = 'r-obs-05-auxiliary-liveness'
+        not_ground_truth = $true; not_sensor = $true
+        helper_name = $spec.HelperName; helper_image = $spec.HelperImage
+        helper_container_id = $null
+        namespace_service = $spec.NamespaceService; namespace_container_id = $namespaceContainer
+        interface = $spec.Interface
+        capture_time_bpf_filter = $null
+        capture_time_bpf_filter_note = 'No capture-time BPF filter by design: the frozen k6-r-obs-05 SS3 selector is the sole arbiter, applied after capture. See Get-K8Robs05LivenessSpec.'
+        container_pcap = $spec.ContainerPcap; artifact = $spec.Artifact
+        pcap_sha256 = $null; steps = @()
+    }
+
+    # Exactly the frozen helper argv shape (capture_lifecycle.py
+    # expected_argv), MINUS the trailing filter argument.
+    $startStep = Invoke-K8Robs05LifecycleStep -Step 'start' -Argv @(
+        'docker', 'run', '-d', '--name', $spec.HelperName,
+        '--network', "container:$namespaceContainer", '--cap-add', 'NET_RAW', $spec.HelperImage,
+        '-i', $spec.Interface, '-nn', '-s', '0', '-w', $spec.ContainerPcap
+    )
+    $record.steps += $startStep
+    if ($startStep.exit_code -ne 0) {
+        $record | ConvertTo-Json -Depth 6 | Set-Content -Path $lifecyclePath -Encoding utf8NoBOM
+        throw "R-OBS-05 liveness capture STOP (apparatus failure): helper did not start (exit $($startStep.exit_code)). stderr: $($startStep.stderr)"
+    }
+    $record.helper_container_id = $startStep.stdout.Trim()
+
+    $listenStep = Invoke-K8Robs05LifecycleStep -Step 'listening-check' -Argv @('docker', 'logs', $spec.HelperName)
+    $record.steps += $listenStep
+    $record | ConvertTo-Json -Depth 6 | Set-Content -Path $lifecyclePath -Encoding utf8NoBOM
+    if ($listenStep.exit_code -ne 0 -or "$($listenStep.stdout)`n$($listenStep.stderr)" -notmatch 'listening on') {
+        throw "R-OBS-05 liveness capture STOP (apparatus failure): helper never reported 'listening on' (exit $($listenStep.exit_code)). stdout: $($listenStep.stdout) stderr: $($listenStep.stderr)"
+    }
+    Write-K8ShakedownLog -Message "R-OBS-05 auxiliary liveness capture listening on $($spec.NamespaceService):$($spec.Interface) (no capture-time BPF filter by design)."
+}
+
+function Complete-K8Robs05LivenessCapture {
+    <#
+        Window-end liveness check, stop, export, hash, remove -- the same
+        six-step discipline the frozen stages retain, and the same
+        window-coverage reasoning (SS5.1): the listening check must have
+        COMPLETED at or before T0-5s, and the window-end liveness check must
+        be timestamped at or after T0+15s and report `true`, before the
+        helper may be stopped.
+
+        Note on evidentiary standing: the frozen contract SS4 decides window
+        validity from the FRAME and DOCUMENT timestamps at correlation time,
+        not from this record. These checks are additional apparatus
+        provenance. They can only cause a STOP, never a PASS -- the gate is
+        positive-evidence (SS4 needs at least one correlating pair), so an
+        under-covering capture can only fail to find evidence, never
+        manufacture it.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string] $RunEvidence
+    )
+    $spec = Get-K8Robs05LivenessSpec -RunId $RunId
+    $lifecyclePath = Join-Path $RunEvidence $spec.Lifecycle
+    if (-not (Test-Path $lifecyclePath)) { throw "R-OBS-05 liveness capture STOP (apparatus failure): lifecycle record missing at $lifecyclePath; the capture was never started." }
+    $record = Get-Content $lifecyclePath -Raw | ConvertFrom-Json
+
+    $t0Path = Join-Path $RunEvidence 'metadata-t0.txt'
+    if (-not (Test-Path $t0Path)) { throw "R-OBS-05 liveness capture STOP (apparatus failure): T0 record not found at $t0Path." }
+    $t0 = [datetimeoffset]::Parse((Get-Content $t0Path -Raw).Trim())
+    $windowStart = $t0.AddSeconds(-5); $windowEnd = $t0.AddSeconds(15)
+
+    $steps = [System.Collections.Generic.List[object]]::new()
+    foreach ($s in @($record.steps)) { $steps.Add($s) }
+
+    $listening = @($steps | Where-Object { $_.step -eq 'listening-check' })
+    if ($listening.Count -ne 1) { throw 'R-OBS-05 liveness capture STOP (apparatus failure): listening-check step missing from the lifecycle record.' }
+    if (([datetimeoffset]::Parse($listening[0].completed_utc)) -gt $windowStart) {
+        throw "R-OBS-05 liveness capture STOP (apparatus failure): listening was confirmed at $($listening[0].completed_utc), after the frozen window start $($windowStart.ToString('o')); the capture cannot be shown to cover [T0-5s, T0+15s]."
+    }
+
+    $liveStep = Invoke-K8Robs05LifecycleStep -Step 'window-end-liveness-check' -Argv @('docker', 'inspect', '--format', '{{.State.Running}}', $spec.HelperName)
+    $steps.Add($liveStep)
+    if (([datetimeoffset]::Parse($liveStep.started_utc)) -lt $windowEnd) {
+        throw "R-OBS-05 liveness capture STOP (apparatus failure): window-end liveness check ran at $($liveStep.started_utc), before the frozen window end $($windowEnd.ToString('o'))."
+    }
+    if ($liveStep.exit_code -ne 0 -or $liveStep.stdout.Trim() -ne 'true') {
+        throw "R-OBS-05 liveness capture STOP (apparatus failure): helper was not running at the window end (exit $($liveStep.exit_code), reported '$($liveStep.stdout.Trim())'); the capture did not cover the window."
+    }
+
+    $stopStep = Invoke-K8Robs05LifecycleStep -Step 'stop' -Argv @('docker', 'stop', $spec.HelperName)
+    $steps.Add($stopStep)
+    $artifactPath = Join-Path $RunEvidence $spec.Artifact
+    $exportStep = Invoke-K8Robs05LifecycleStep -Step 'export' -Argv @('docker', 'cp', "$($spec.HelperName):$($spec.ContainerPcap)", $artifactPath)
+    $steps.Add($exportStep)
+    $removeStep = Invoke-K8Robs05LifecycleStep -Step 'remove' -Argv @('docker', 'container', 'rm', $spec.HelperName)
+    $steps.Add($removeStep)
+
+    $record.steps = $steps.ToArray()
+    if ($stopStep.exit_code -ne 0 -or $exportStep.exit_code -ne 0) {
+        $record | ConvertTo-Json -Depth 6 | Set-Content -Path $lifecyclePath -Encoding utf8NoBOM
+        throw "R-OBS-05 liveness capture STOP (apparatus failure): stop (exit $($stopStep.exit_code)) / export (exit $($exportStep.exit_code)) failed. export stderr: $($exportStep.stderr)"
+    }
+    if (-not (Test-Path $artifactPath)) {
+        $record | ConvertTo-Json -Depth 6 | Set-Content -Path $lifecyclePath -Encoding utf8NoBOM
+        throw "R-OBS-05 liveness capture STOP (apparatus failure): exported pcap not found at $artifactPath."
+    }
+    $record.pcap_sha256 = (Get-FileHash -Path $artifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $record | ConvertTo-Json -Depth 6 | Set-Content -Path $lifecyclePath -Encoding utf8NoBOM
+    Write-K8ShakedownLog -Message "R-OBS-05 auxiliary liveness capture exported: $($spec.Artifact) (sha256 $($record.pcap_sha256))."
+}
+
+function Write-K8Robs05ContractReference {
+    <# Frozen contract SS5: "a contract SHA-256/reference identifying this
+       exact file at the K6 start commit." Retained, never interpreted. #>
+    param([Parameter(Mandatory)][string] $RunEvidence, [Parameter(Mandatory)][string] $Study01Root)
+    $contractFile = Join-Path $Study01Root 'studies\study-01-negative-result\protocol\k6-r-obs-05-collector-query-contract.md'
+    if (-not (Test-Path $contractFile)) { throw "R-OBS-05 contract file not found for the frozen SS5 contract reference: $contractFile" }
+    $sha = (Get-FileHash -Path $contractFile -Algorithm SHA256).Hash.ToLowerInvariant()
+    $path = Join-Path $RunEvidence 'contract-output\r-obs-05-contract-reference.txt'
+    "protocol/k6-r-obs-05-collector-query-contract.md`nsha256=$sha`n" | Set-Content -Path $path -Encoding utf8NoBOM
+    return $path
+}
+
+function Write-K8UnrelatedPcapRows {
+    <#
+        ROOT CAUSE this closes (real VM STOPs k8shakedown-rangeb-
+        20260829-111026 / -115720, both closed and not rescued): this
+        function previously decoded `sensor-input/mirror-capture/
+        c2-mirror-sensor.pcap`. The frozen contract SS4 requires correlation
+        against "the separate R-OBS-05 `tap_observer:eth0` liveness pcap",
+        and the frozen CAPTURE_FILTER ("host 10.1.20.11 and host 10.1.10.10
+        and tcp port 20000", enforced by capture_lifecycle.py) means the
+        Sensor pcap can NEVER contain the unrelated flow
+        (10.1.10.10<->10.1.40.10 has no 10.1.20.11). Reading the Sensor
+        pcap was therefore both a frozen-contract non-conformance and a
+        structurally unsatisfiable gate. Now reads the auxiliary liveness
+        pcap this module captures for exactly this purpose.
+
+        The SS3 display filter below is unchanged.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string] $ComposePath,
+        [Parameter(Mandatory)][string] $RunEvidence
+    )
+    $spec = Get-K8Robs05LivenessSpec -RunId $RunId
+    $pcap = Join-Path $RunEvidence $spec.Artifact
+    if (-not (Test-Path $pcap)) {
+        throw "R-OBS-05 STOP (apparatus failure): the auxiliary liveness pcap is missing at $pcap. The frozen contract SS4 correlates against this pcap; the Sensor pcap is never an acceptable substitute (its frozen BPF filter structurally excludes the unrelated flow)."
+    }
     $container = (docker compose -p $RunId -f $ComposePath ps -q log_structurer | Out-String).Trim()
     if (-not $container) { throw 'log_structurer container could not be resolved for frozen pcap decode' }
     $display = '(ip.src == 10.1.10.10 && ip.dst == 10.1.40.10 && tcp.dstport == 20000 && (dnp3.al.func == 1 || dnp3.al.func == 5) && dnp3.src == 1 && dnp3.dst == 20) || (ip.src == 10.1.40.10 && ip.dst == 10.1.10.10 && tcp.srcport == 20000 && dnp3.al.func == 129 && dnp3.src == 20 && dnp3.dst == 1)'
     $rows = Invoke-K8TsharkFieldDecode -Container $container -LocalPcapPath $pcap -DisplayFilter $display -RemoteNameHint "$RunId-r-obs-05"
     $path = Join-Path $RunEvidence 'contract-output\r-obs-05-pcap-rows.json'
     ConvertTo-Json -InputObject @($rows) -Depth 4 | Set-Content -Path $path -Encoding utf8NoBOM
-    if ($rows.Count -eq 0) { throw 'Range B R-OBS-05 gate failed: sensor pcap contains no unrelated-flow frame' }
+    # Frozen SS5 also requires the decoded unrelated-flow rows to be retained;
+    # keep a human-readable form beside the machine-readable one, both
+    # derived from the SAME decode of the SAME liveness pcap.
+    $decodeLines = @("source_pcap=$($spec.Artifact)", "display_filter=$display", "decoded_row_count=$($rows.Count)")
+    foreach ($r in $rows) { $decodeLines += (($r.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' ') }
+    $decodeLines -join "`n" | Set-Content -Path (Join-Path $RunEvidence $spec.Decode) -Encoding utf8NoBOM
+    if ($rows.Count -eq 0) {
+        throw "Range B R-OBS-05 gate failed: the auxiliary liveness pcap ($($spec.Artifact)) contains no frame matching the frozen k6-r-obs-05 SS3 unrelated-flow selector. The capture itself succeeded (see contract-output/r-obs-05-capture-lifecycle.json); this is an observed absence of the unrelated control flow, not a capture defect."
+    }
     return $path
 }
 
@@ -1458,6 +1701,7 @@ function Invoke-K8AutomatedQueries {
         Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'mapping-gate', '--mapping', $mappingPath, '--output', $mappingDecision) -Description 'R-OBS-05 exact mapping field/type gate'
         $response = Join-Path $RunEvidence 'contract-output\r-obs-05-response.json'
         Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method POST -Endpoint 'ot-logs-dnp3-*/_search' -Body (Get-Content (Join-Path $envDir 'r-obs-05-query.json') -Raw) -OutputPath $response
+        Write-K8Robs05ContractReference -RunEvidence $RunEvidence -Study01Root (Join-Path (Get-K8ShakedownState).repo_root 'Study01') | Out-Null
         $frames = Write-K8UnrelatedPcapRows -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
         Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'r-obs-05', '--response', $response, '--frames', $frames, '--window-start', $WindowStart, '--window-end', $WindowEnd, '--output', (Join-Path $RunEvidence 'contract-output\r-obs-05-correlation.json')) -Description 'R-OBS-05 exact integer-nanosecond pcap/document correlation'
     }
@@ -1849,12 +2093,28 @@ function Test-K8ScoringInputArtifactCompleteness {
             'contract-output\qdisc-pre-fault.txt'
             'contract-output\qdisc-post-fault.txt'
             'contract-output\unrelated-mirror-filters.txt'
+            # Derived from the frozen k6-r-obs-05-collector-query-contract.md
+            # SS4/SS5 required-artifact list -- NOT from expected/range-b/
+            # hashes.sha256 (a historical run's own integrity manifest, whose
+            # artifact bytes are unrecoverable and which is not a target for a
+            # fresh run to reproduce).
+            #   SS5: mapping response + mapping-gate decision
             'contract-output\r-obs-05-mapping-response.json'
             'contract-output\r-obs-05-mapping-gate.json'
-            'contract-output\r-obs-05-response.json'
-            'contract-output\r-obs-05-pcap-rows.json'
-            'contract-output\r-obs-05-correlation.json'
+            #   SS5: instantiated request JSON + full response JSON
             'environment\r-obs-05-query.json'
+            'contract-output\r-obs-05-response.json'
+            #   SS4: the separate tap_observer:eth0 liveness pcap correlation
+            #        is performed against, plus its acquisition provenance
+            'contract-output\r-obs-05-liveness.pcap'
+            'contract-output\r-obs-05-capture-lifecycle.json'
+            #   SS5: decoded unrelated-flow pcap rows (machine + human form)
+            'contract-output\r-obs-05-pcap-rows.json'
+            'contract-output\r-obs-05-liveness-decode.txt'
+            #   SS5: correlation record
+            'contract-output\r-obs-05-correlation.json'
+            #   SS5: contract SHA-256/reference identifying the exact file
+            'contract-output\r-obs-05-contract-reference.txt'
         )
     }
     $missing = @($required | Where-Object { -not (Test-Path (Join-Path $RunEvidence $_)) })
@@ -2000,6 +2260,17 @@ function Invoke-K8ShakedownRangeAB {
             '--run-id', $RunId, '--run-evidence', $RunEvidence, '--stage', $stage
         ) -Description "capture helper start: $stage"
     }
+    # 7-aux. Range B only: the auxiliary R-OBS-05 liveness capture the frozen
+    # contract SS4 requires. Started here so it covers the same
+    # [T0-5s, T0+15s] window as the two frozen stages, and entirely AFTER the
+    # Range B fault (step 6) so it witnesses post-fault mirror liveness --
+    # which is exactly what R-OBS-05 is a control for. Passive capture only:
+    # it injects no traffic and alters no routing, qdisc, filter, or service,
+    # so the frozen Range B experimental condition is untouched. Range A's
+    # runtime behavior is unchanged (this block never runs for Range A).
+    if ($Range -eq 'b') {
+        Start-K8Robs05LivenessCapture -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
+    }
 
     # 7a. Frozen window-start requirement: both stages' listening-check must
     # have COMPLETED at least 5s before T0 (which the sender is about to
@@ -2041,6 +2312,13 @@ function Invoke-K8ShakedownRangeAB {
             (Join-Path $ScriptsDir 'study01_capture.py'), 'stop-export',
             '--run-id', $RunId, '--run-evidence', $RunEvidence, '--stage', $stage
         ) -Description "capture stop/export: $stage"
+    }
+    # 9-aux. Range B only: window-end liveness check, stop, export, hash and
+    # remove the auxiliary R-OBS-05 helper. Runs after Wait-K8CaptureWindowEnd
+    # so its liveness check is genuinely at/after T0+15s, and before teardown
+    # so no helper survives the range (c2-dnp3-capture-procedure.md SS5).
+    if ($Range -eq 'b') {
+        Complete-K8Robs05LivenessCapture -RunId $RunId -RunEvidence $RunEvidence
     }
 
     # 9a. Frozen capture-lifecycle check, reusing the same validator functions

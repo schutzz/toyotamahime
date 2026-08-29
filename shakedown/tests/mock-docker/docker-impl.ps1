@@ -131,6 +131,47 @@ if ($joined -match '\bcompose\b.*\bps\b.*--all.*--format.*json') {
     }
 }
 
+if ($joined -match '^run\b.*r-obs-05-liveness-capture') {
+    # docker run -d ... tcpdump -i eth0 -nn -s 0 -w /data/r-obs-05-liveness.pcap
+    # (NO trailing BPF filter -- see Get-K8Robs05LivenessSpec).
+    switch ($env:K8_MOCK_DOCKER_STATE) {
+        'robs05-helper-start-fails' { [Console]::Error.WriteLine('docker: Error response from daemon: no such image'); exit 125 }
+        default { Write-Output 'aux0000000000000000000000000000000000000000000000000000000000000'; exit 0 }
+    }
+}
+
+if ($joined -match '^logs\b.*r-obs-05-liveness-capture') {
+    switch ($env:K8_MOCK_DOCKER_STATE) {
+        'robs05-never-listens' { [Console]::Error.WriteLine('tcpdump: eth0: You do not have permission to capture'); exit 0 }
+        default { [Console]::Error.WriteLine('tcpdump: listening on eth0, link-type EN10MB (Ethernet), snapshot length 262144 bytes'); exit 0 }
+    }
+}
+
+if ($joined -match '^inspect\b.*State.Running.*r-obs-05-liveness-capture') {
+    switch ($env:K8_MOCK_DOCKER_STATE) {
+        'robs05-helper-died' { Write-Output 'false'; exit 0 }
+        default { Write-Output 'true'; exit 0 }
+    }
+}
+
+if ($joined -match '^stop\b.*r-obs-05-liveness-capture' -or $joined -match '^container\s+rm\b.*r-obs-05-liveness-capture') {
+    exit 0
+}
+
+if ($joined -match '^cp\b.*r-obs-05-liveness-capture:') {
+    # docker cp <helper>:/data/r-obs-05-liveness.pcap <host artifact path>
+    switch ($env:K8_MOCK_DOCKER_STATE) {
+        'robs05-export-fails' { [Console]::Error.WriteLine('Error: No such container:path'); exit 1 }
+        default {
+            $dest = ($args[-1])
+            $parent = Split-Path $dest -Parent
+            if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+            'MOCK-LIVENESS-PCAP' | Set-Content -Path $dest -Encoding utf8NoBOM -NoNewline
+            exit 0
+        }
+    }
+}
+
 if ($joined -match '^cp\b') {
     # docker cp <local> <container>:<remote> -- pcap-into-log_structurer copy.
     exit 0
