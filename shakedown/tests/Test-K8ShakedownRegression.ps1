@@ -1226,6 +1226,279 @@ try {
 }
 finally { $env:PATH = $rootWarnOriginalPath }
 
+# --- 13. Environment readiness false-negative + network preflight -----------
+#
+# Real VM false negative, root-caused (k8shakedown-rangea-20260829-071142,
+# commit e1d98a4): `docker compose up -d --build` exited 0, then
+# Wait-K8ComposeReady timed out after 120s even though an operator's manual
+# recheck immediately after the failure showed all 21 expected services
+# running (State=running) with both declared healthchecks healthy. The
+# actual defect was NOT in JSON parsing at all: Get-K8ExpectedServices
+# already force-returns a real array via `return ,$services` (correct for 1
+# service or many), but BOTH of its callers additionally wrapped the call in
+# `@(...)` -- double-wrapping the result into a 1-element array whose SOLE
+# element was the real N-service array. Test-K8ComposeServiceReadiness then
+# iterated exactly one pseudo-"expected service" (the array object itself,
+# not a service-name string), which could never match any real `compose ps`
+# row, making every expected service "Missing" and Ready permanently false
+# regardless of actual Docker state. The SAME self-inflicted double-wrap
+# (`return ,@(...)` combining the comma AND `@()` in one statement, rather
+# than `,$X.ToArray()`) was found and fixed in this round's own new
+# ConvertFrom-K8ComposePsJson/ConvertFrom-K8ConcatenatedJson before it ever
+# shipped, while writing these very regression tests -- see the structural
+# checks below, which exist specifically so this exact bug class cannot
+# silently return.
+#
+# Secondary, independent fix in this section: `ps --all --format json`
+# parsing was rebuilt on a depth-aware concatenated-JSON scanner
+# (ConvertFrom-K8ConcatenatedJson) instead of "try whole-string parse, catch,
+# naive `-split \`n` per line" -- format-agnostic across compact NDJSON, a
+# pretty-printed multi-line array, or any mix, and fail-closed (never
+# silently skipped) on a stray non-JSON line. Readiness diagnostics were
+# also restructured: environment/readiness.json now holds expected/actual
+# counts, Missing/NotRunning/NotHealthy, and a parse diagnostic distinct
+# from a genuine not-ready state, and a timeout prints a short console
+# summary of exactly what blocked PASS instead of only an abstract message.
+#
+# Third, independent UX fix in this section: a network pool-conflict
+# preflight (Test-K8ShakedownNetworkPreflight), reading THIS run's actually-
+# declared subnet(s) from `docker compose config` and every leftover
+# Shakedown network's actual subnet from `docker network inspect` (never a
+# hardcoded CIDR), runs before `docker compose up` and STOPs with the exact
+# conflicting network name if a leftover, abandoned run's fixed subnet would
+# collide -- never auto-removing or pruning any network.
+
+Assert-K8Test 'REGRESSION (root cause): Get-K8ExpectedServices callers do not double-wrap its already-array-safe return value in @()' {
+    foreach ($fn in @('Wait-K8ComposeReady', 'Write-K8ImageInventory')) {
+        $body = Get-K8FunctionBodyText -Path $CommonPath -Name $fn
+        if ($body -match '@\(Get-K8ExpectedServices') { throw "$fn wraps Get-K8ExpectedServices in @() again -- this is the exact double-wrap that made the real VM run's 21/21/healthy environment report Missing forever" }
+        if ($body -notmatch 'Get-K8ExpectedServices\s+-RunId') { throw "$fn no longer calls Get-K8ExpectedServices at all" }
+    }
+}
+
+Assert-K8Test 'REGRESSION (self-inflicted double-wrap, caught before shipping): no comma-returning helper in this module wraps its own ToArray()/array in @() at the return statement' {
+    $body = Get-Content $CommonPath -Raw
+    if ($body -match 'return\s+,@\(') { throw 'found `return ,@(...)` -- combining the comma operator with @() double-wraps into an array-of-array; use `,$X` or `,$X.ToArray()` alone' }
+}
+
+Assert-K8Test 'REGRESSION: no caller anywhere in this module wraps ConvertFrom-K8ComposePsJson, ConvertFrom-K8ConcatenatedJson, Get-K8ComposeDeclaredSubnets, or Get-K8LeftoverShakedownNetworks in @() (all four already force-return real arrays)' {
+    $body = Get-Content $CommonPath -Raw
+    foreach ($fn in @('ConvertFrom-K8ComposePsJson', 'ConvertFrom-K8ConcatenatedJson', 'Get-K8ComposeDeclaredSubnets', 'Get-K8LeftoverShakedownNetworks')) {
+        if ($body -match [regex]::Escape("@($fn")) { throw "found a caller wrapping $fn in @() -- double-wrap risk" }
+    }
+}
+
+Assert-K8Test 'ConvertFrom-K8ConcatenatedJson: compact NDJSON, a pretty multi-line array, and a single object all split correctly' {
+    # NOT wrapped in @() at any of these call sites -- the function already
+    # force-returns a real array via `,$values.ToArray()` (see its own
+    # return statement and the double-wrap regression tests above); wrapping
+    # it again here would reintroduce the exact bug class this whole section
+    # regression-tests, inside the regression test itself.
+    Import-Module $CommonPath -Force
+    $ndjson = (1..5 | ForEach-Object { "{`"Service`":`"svc$_`"}" }) -join "`n"
+    if ((ConvertFrom-K8ConcatenatedJson -Raw $ndjson).Count -ne 5) { throw '5-row compact NDJSON did not split into 5 values' }
+    $pretty = "[`n  { `"a`": 1 },`n  { `"b`": 2 }`n]"
+    if ((ConvertFrom-K8ConcatenatedJson -Raw $pretty).Count -ne 1) { throw 'a single pretty-printed multi-line array must split into exactly ONE top-level value (the whole array), not be confused by its internal newlines' }
+    if ((ConvertFrom-K8ConcatenatedJson -Raw '{"a":1}').Count -ne 1) { throw 'a single compact object must split into exactly one value' }
+    if ((ConvertFrom-K8ConcatenatedJson -Raw '').Count -ne 0) { throw 'empty input must split into zero values, not throw or return a null element' }
+}
+
+Assert-K8Test 'ConvertFrom-K8ConcatenatedJson: braces/brackets inside a JSON string value never confuse the depth tracker' {
+    # NOT wrapped in @() -- see the comment on the test above.
+    Import-Module $CommonPath -Force
+    $chunks = ConvertFrom-K8ConcatenatedJson -Raw '{"Labels":"foo={bar}, baz=[1,2]","Service":"svc1"}'
+    if ($chunks.Count -ne 1) { throw "expected exactly 1 top-level value, got $($chunks.Count) -- a brace/bracket inside a string literal was mistaken for real JSON structure" }
+    $parsed = $chunks[0] | ConvertFrom-Json
+    if ($parsed.Service -ne 'svc1') { throw 'string-embedded-brace fixture did not round-trip correctly' }
+}
+
+Assert-K8Test 'ConvertFrom-K8ConcatenatedJson: fail-closed (not silently skipped) on a stray non-JSON line and on unbalanced JSON' {
+    Import-Module $CommonPath -Force
+    $stopped1 = $false
+    try { ConvertFrom-K8ConcatenatedJson -Raw "some banner line`n{`"Service`":`"a`"}" } catch { $stopped1 = $true }
+    if (-not $stopped1) { throw 'a stray non-JSON top-level line did not STOP -- it must never be silently skipped or silently accepted' }
+    $stopped2 = $false
+    try { ConvertFrom-K8ConcatenatedJson -Raw '{"Service":"a"' } catch { $stopped2 = $true }
+    if (-not $stopped2) { throw 'unbalanced/truncated JSON did not STOP' }
+}
+
+Assert-K8Test 'REGRESSION 1/8: Compose v5 NDJSON, 21 rows, all running, 2 healthy -> PASS (pure parse+gate fixture)' {
+    Import-Module $CommonPath -Force
+    $rows = 1..21 | ForEach-Object {
+        if ($_ -le 2) { "{`"Service`":`"svc$_`",`"State`":`"running`",`"Health`":`"healthy`"}" }
+        else { "{`"Service`":`"svc$_`",`"State`":`"running`"}" }
+    }
+    $expected = 1..21 | ForEach-Object { "svc$_" }
+    $services = ConvertFrom-K8ComposePsJson -Raw ($rows -join "`n")
+    if ($services.Count -ne 21) { throw "expected 21 parsed rows, got $($services.Count)" }
+    $gate = Test-K8ComposeServiceReadiness -Expected $expected -Services $services
+    if (-not $gate.Ready) { throw "21/21 running with 2 declared-healthy healthchecks did not PASS: $($gate | ConvertTo-Json -Compress)" }
+}
+
+Assert-K8Test 'REGRESSION 2/8: one service missing from the parsed rows -> FAIL' {
+    Import-Module $CommonPath -Force
+    $services = ConvertFrom-K8ComposePsJson -Raw '{"Service":"a","State":"running"}'
+    $gate = Test-K8ComposeServiceReadiness -Expected @('a', 'b') -Services $services
+    if ($gate.Ready) { throw 'a missing expected service incorrectly PASSed' }
+    if (@($gate.Missing) -notcontains 'b') { throw 'Missing does not name the actually-missing service' }
+}
+
+Assert-K8Test 'REGRESSION 3/8: one service State=exited -> FAIL' {
+    Import-Module $CommonPath -Force
+    $services = ConvertFrom-K8ComposePsJson -Raw "{`"Service`":`"a`",`"State`":`"running`"}`n{`"Service`":`"b`",`"State`":`"exited`"}"
+    $gate = Test-K8ComposeServiceReadiness -Expected @('a', 'b') -Services $services
+    if ($gate.Ready) { throw 'an exited service incorrectly PASSed' }
+    if (@($gate.NotRunning) -notcontains 'b') { throw 'NotRunning does not name the exited service' }
+}
+
+Assert-K8Test 'REGRESSION 4/8: a declared healthcheck reporting unhealthy -> FAIL' {
+    Import-Module $CommonPath -Force
+    $services = ConvertFrom-K8ComposePsJson -Raw "{`"Service`":`"a`",`"State`":`"running`",`"Health`":`"unhealthy`"}"
+    $gate = Test-K8ComposeServiceReadiness -Expected @('a') -Services $services
+    if ($gate.Ready) { throw 'an unhealthy declared healthcheck incorrectly PASSed' }
+    if (@($gate.NotHealthy) -notcontains 'a') { throw 'NotHealthy does not name the unhealthy service' }
+}
+
+Assert-K8Test 'REGRESSION 5/8: Health property absent entirely, or present but empty, with State=running -> PASS' {
+    Import-Module $CommonPath -Force
+    # svcNoHealthKey omits Health entirely (real shape for a service with no
+    # configured healthcheck); svcEmptyHealth declares the key as "".
+    $rows = '{"Service":"svcNoHealthKey","State":"running"}' + "`n" + '{"Service":"svcEmptyHealth","State":"running","Health":""}'
+    $services = ConvertFrom-K8ComposePsJson -Raw $rows
+    $gate = Test-K8ComposeServiceReadiness -Expected @('svcNoHealthKey', 'svcEmptyHealth') -Services $services
+    if (-not $gate.Ready) { throw "a service with no healthcheck must PASS on State alone, whether Health is absent or empty: $($gate | ConvertTo-Json -Compress)" }
+}
+
+Assert-K8Test 'REGRESSION 6/8: exactly one row (a single JSON object, not an array) does not break the collection shape' {
+    Import-Module $CommonPath -Force
+    $services = ConvertFrom-K8ComposePsJson -Raw '{"Service":"only","State":"running"}'
+    if ($services.Count -ne 1) { throw "a single-object (non-array) compose ps output must parse to a 1-element collection, got Count=$($services.Count)" }
+    $gate = Test-K8ComposeServiceReadiness -Expected @('only') -Services $services
+    if (-not $gate.Ready) { throw 'a single genuinely-running expected service did not PASS' }
+    # Also exercise the single-element JSON ARRAY shape specifically --
+    # ConvertFrom-Json unwraps a 1-element JSON array to a bare object, which
+    # ConvertFrom-K8ComposePsJson must handle explicitly (see its docstring).
+    $servicesFromArray = ConvertFrom-K8ComposePsJson -Raw '[{"Service":"only","State":"running"}]'
+    if ($servicesFromArray.Count -ne 1) { throw "a single-element JSON ARRAY must also parse to a 1-element collection, got Count=$($servicesFromArray.Count)" }
+}
+
+$readinessMockDir = Join-Path $ShakedownDir 'tests\mock-docker'
+$readinessOriginalPath = $env:PATH
+try {
+    $env:PATH = "$readinessMockDir;$env:PATH"
+    Import-Module $CommonPath -Force
+
+    Assert-K8Test 'REGRESSION: exact real-VM reproduction -- 21 expected services, all running, 2 declared healthchecks healthy -> PASS' {
+        $env:K8_MOCK_DOCKER_STATE = 'readiness-21-services-pass'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-readiness-21-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir 'environment') | Out-Null
+        try {
+            Wait-K8ComposeReady -RunId 'k8shakedown-rangea-20260829-071142' -ComposePath 'y.yml' -RunEvidence $dir -TimeoutSeconds 5 -PollSeconds 1
+            $record = Get-Content (Join-Path $dir 'environment\readiness.json') -Raw | ConvertFrom-Json
+            if ($record.decision -ne 'PASS' -or $record.expected_count -ne 21 -or $record.actual_present_count -ne 21) { throw "readiness record does not reflect a clean 21/21 PASS: $($record | ConvertTo-Json -Compress)" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION 7/8: stdout has valid JSON rows, stderr has a Compose warning -> stdout-only parse, PASS' {
+        $env:K8_MOCK_DOCKER_STATE = 'readiness-e2e-ready-with-stderr-warning'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-readiness-stderr-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir 'environment') | Out-Null
+        try {
+            Wait-K8ComposeReady -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -TimeoutSeconds 5 -PollSeconds 1
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION: one missing service -> FAIL-STATE, readiness.json names it, console diagnostic does not throw' {
+        $env:K8_MOCK_DOCKER_STATE = 'readiness-e2e-not-ready-missing-forever'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-readiness-missing-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir 'environment') | Out-Null
+        try {
+            $stopped = $false
+            try { Wait-K8ComposeReady -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -TimeoutSeconds 2 -PollSeconds 1 } catch { $stopped = $true }
+            if (-not $stopped) { throw 'a persistently missing service did not STOP' }
+            $record = Get-Content (Join-Path $dir 'environment\readiness.json') -Raw | ConvertFrom-Json
+            if ($record.decision -ne 'FAIL-STATE') { throw "expected decision FAIL-STATE, got $($record.decision)" }
+            if (@($record.missing) -notcontains 'svcC') { throw "readiness.json does not name the missing service: $($record | ConvertTo-Json -Compress)" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION 8/8: malformed JSON persists -> FAIL-PARSE, distinct from FAIL-STATE, with the parse diagnostic retained' {
+        $env:K8_MOCK_DOCKER_STATE = 'readiness-e2e-malformed-json-forever'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-readiness-malformed-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Force -Path (Join-Path $dir 'environment') | Out-Null
+        try {
+            $stopped = $false
+            try { Wait-K8ComposeReady -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -TimeoutSeconds 2 -PollSeconds 1 } catch { $stopped = $true }
+            if (-not $stopped) { throw 'persistently malformed JSON did not STOP' }
+            $record = Get-Content (Join-Path $dir 'environment\readiness.json') -Raw | ConvertFrom-Json
+            if ($record.decision -ne 'FAIL-PARSE') { throw "expected decision FAIL-PARSE, got $($record.decision)" }
+            if ([string]::IsNullOrWhiteSpace([string]$record.parse_diagnostic)) { throw 'parse_diagnostic was not retained on a parse failure' }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'Network preflight: a leftover Shakedown network holding an overlapping fixed subnet STOPs, naming the network and both subnets' {
+        $env:K8_MOCK_DOCKER_STATE = 'preflight-conflict'
+        $stopped = $false; $msg = ''
+        try { Test-K8ShakedownNetworkPreflight -RunId 'k8shakedown-rangea-20260829-999999' -ComposePath 'y.yml' } catch { $stopped = $true; $msg = $_.Exception.Message }
+        if (-not $stopped) { throw 'an overlapping leftover network did not STOP' }
+        if ($msg -notmatch 'k8shakedown-rangea-20260801-001_default' -or $msg -notmatch '10\.1\.20\.0/24' -or $msg -notmatch '10\.1\.0\.0/16') { throw "STOP message does not name the conflicting network and both subnets: $msg" }
+    }
+
+    Assert-K8Test 'Network preflight: a leftover network with a non-overlapping subnet PASSes; no declared subnet PASSes without even checking' {
+        $env:K8_MOCK_DOCKER_STATE = 'preflight-clear'
+        Test-K8ShakedownNetworkPreflight -RunId 'k8shakedown-rangea-20260829-999999' -ComposePath 'y.yml'
+        $env:K8_MOCK_DOCKER_STATE = 'preflight-no-subnet-declared'
+        Test-K8ShakedownNetworkPreflight -RunId 'k8shakedown-rangea-20260829-999999' -ComposePath 'y.yml'
+    }
+}
+finally { $env:PATH = $readinessOriginalPath }
+
+Assert-K8Test 'ConvertTo-K8CidrRange / Test-K8CidrOverlap: standard containment, adjacency, and /0 edge cases' {
+    Import-Module $CommonPath -Force
+    if (-not (Test-K8CidrOverlap -CidrA '10.1.0.0/16' -CidrB '10.1.20.0/24')) { throw 'a /24 inside a /16 must overlap' }
+    if (Test-K8CidrOverlap -CidrA '10.1.0.0/24' -CidrB '10.2.0.0/24') { throw 'disjoint /24s in different /16s must not overlap' }
+    if (Test-K8CidrOverlap -CidrA '10.1.20.0/25' -CidrB '10.1.20.128/25') { throw 'two adjacent, non-overlapping halves of the same /24 must not overlap' }
+    if (-not (Test-K8CidrOverlap -CidrA '0.0.0.0/0' -CidrB '10.1.20.0/24')) { throw '/0 must overlap everything' }
+    $stopped = $false
+    try { ConvertTo-K8CidrRange -Cidr 'not-a-cidr' } catch { $stopped = $true }
+    if (-not $stopped) { throw 'a non-CIDR string did not STOP' }
+}
+
+Assert-K8Test 'Test-K8ShakedownNetworkPreflight never calls network rm/prune, and runs before docker compose up in Invoke-K8ShakedownRangeAB' {
+    $preflightBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Test-K8ShakedownNetworkPreflight'
+    $helperBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Get-K8LeftoverShakedownNetworks'
+    foreach ($body in @($preflightBody, $helperBody)) {
+        # Scope to an actual ArgumentList invocation shape ('network', 'rm'
+        # /'prune' as separate array elements), not this function's own
+        # advisory throw text recommending the OPERATOR run `docker network
+        # rm <name>` by hand -- that prose legitimately contains the words.
+        if ($body -match "'network',\s*'rm'" -or $body -match "'network',\s*'prune'") {
+            throw 'the network preflight (or its helper) appears to actually INVOKE network rm/prune -- it must only detect and report, per the explicit no-auto-removal requirement'
+        }
+    }
+    $rangeAbBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+    $preflightCallIndex = $rangeAbBody.IndexOf('Test-K8ShakedownNetworkPreflight -RunId')
+    $upCallIndex = $rangeAbBody.IndexOf("'up', '-d', '--build'")
+    if ($preflightCallIndex -lt 0) { throw 'Test-K8ShakedownNetworkPreflight is not called from Invoke-K8ShakedownRangeAB' }
+    if ($upCallIndex -lt 0) { throw 'could not locate the docker compose up call site' }
+    if ($preflightCallIndex -gt $upCallIndex) { throw 'the network preflight runs AFTER docker compose up -- it must run BEFORE, or it cannot prevent the pool-overlap failure it exists to catch' }
+}
+
+Assert-K8Test 'Wait-K8ComposeReady readiness gate is not weakened: still requires every expected service present, running, and (if healthchecked) healthy' {
+    Import-Module $CommonPath -Force
+    $expected = @('a', 'b')
+    $healthy = @([pscustomobject]@{Service='a';State='running';Health='healthy'}, [pscustomobject]@{Service='b';State='running'})
+    if (-not (Test-K8ComposeServiceReadiness -Expected $expected -Services $healthy).Ready) { throw 'a genuinely healthy/running complete set must still PASS' }
+    $oneUnhealthy = @([pscustomobject]@{Service='a';State='running';Health='unhealthy'}, [pscustomobject]@{Service='b';State='running'})
+    if ((Test-K8ComposeServiceReadiness -Expected $expected -Services $oneUnhealthy).Ready) { throw 'an unhealthy declared healthcheck must still FAIL -- the readiness condition itself must not be weakened' }
+    $oneExited = @([pscustomobject]@{Service='a';State='exited';Health=''}, [pscustomobject]@{Service='b';State='running'})
+    if ((Test-K8ComposeServiceReadiness -Expected $expected -Services $oneExited).Ready) { throw 'an exited service must still FAIL' }
+}
+
 # --- 7. Study01/ untouched on this branch -------------------------------------
 
 Assert-K8Test 'Study01/ is byte-for-byte unchanged versus origin/main' {

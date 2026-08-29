@@ -33,6 +33,104 @@ if ($joined -match '\bcompose\b.*\bps\b.*-q') {
     exit 0
 }
 
+if ($joined -match '\bcompose\b.*\bconfig\b.*--services') {
+    # docker compose -p <id> -f <file> config --services -- the expected
+    # service set Wait-K8ComposeReady/Write-K8ImageInventory compare against.
+    switch ($env:K8_MOCK_DOCKER_STATE) {
+        { $_ -in @('readiness-e2e-ready-with-stderr-warning', 'readiness-e2e-not-ready-missing-forever', 'readiness-e2e-malformed-json-forever') } {
+            Write-Output 'svcA'; Write-Output 'svcB'; Write-Output 'svcC'; exit 0
+        }
+        # Faithful reproduction of the real VM false negative
+        # (k8shakedown-rangea-20260829-071142): 21 real services, all
+        # running, exactly the 2 declared healthchecks healthy.
+        'readiness-21-services-pass' { 1..21 | ForEach-Object { Write-Output "svc$_" }; exit 0 }
+        default { Write-Output 'svc1'; exit 0 }
+    }
+}
+
+if ($joined -match '\bcompose\b.*\bconfig\b.*--format.*json') {
+    # docker compose -p <id> -f <file> config --format json -- the fully
+    # resolved compose document (a single JSON object, never NDJSON),
+    # queried by the network pool-conflict preflight for THIS run's own
+    # declared subnet(s). Never a hardcoded assumption about the subnet.
+    switch ($env:K8_MOCK_DOCKER_STATE) {
+        { $_ -in @('preflight-conflict', 'preflight-clear') } {
+            Write-Output '{"name":"k8shakedown-rangea-20260829-999999","networks":{"ot_net":{"name":"ot_net","driver":"bridge","ipam":{"config":[{"subnet":"10.1.0.0/16"}]}}}}'
+            exit 0
+        }
+        'preflight-no-subnet-declared' {
+            Write-Output '{"name":"k8shakedown-rangea-20260829-999999","networks":{"ot_net":{"name":"ot_net","driver":"bridge"}}}'
+            exit 0
+        }
+        default { Write-Output '{"name":"mock","networks":{}}'; exit 0 }
+    }
+}
+
+if ($joined -match '\bnetwork\b.*\bls\b') {
+    # docker network ls --format json -- candidate leftover Shakedown
+    # networks for the pool-conflict preflight.
+    switch ($env:K8_MOCK_DOCKER_STATE) {
+        'preflight-conflict' { Write-Output '{"Name":"k8shakedown-rangea-20260801-001_default","ID":"abc123","Driver":"bridge","Scope":"local"}'; exit 0 }
+        'preflight-clear'    { Write-Output '{"Name":"k8shakedown-rangea-20260801-001_default","ID":"abc123","Driver":"bridge","Scope":"local"}'; exit 0 }
+        default { exit 0 }
+    }
+}
+
+if ($joined -match '\bnetwork\b.*\binspect\b') {
+    # docker network inspect <name> --format json -- always a JSON array,
+    # even for one network; used to read the leftover network's ACTUAL
+    # subnet, never assumed from its name.
+    switch ($env:K8_MOCK_DOCKER_STATE) {
+        'preflight-conflict' { Write-Output '[{"Name":"k8shakedown-rangea-20260801-001_default","IPAM":{"Config":[{"Subnet":"10.1.20.0/24"}]}}]'; exit 0 }
+        'preflight-clear'    { Write-Output '[{"Name":"k8shakedown-rangea-20260801-001_default","IPAM":{"Config":[{"Subnet":"10.9.0.0/16"}]}}]'; exit 0 }
+        default { Write-Output '[{"Name":"unknown","IPAM":{"Config":[]}}]'; exit 0 }
+    }
+}
+
+if ($joined -match '\bcompose\b.*\bps\b.*--all.*--format.*json') {
+    # docker compose -p <id> -f <file> ps --all --format json -- the
+    # readiness poll. Root-cause reproduction states for the real VM false
+    # negative (k8shakedown-rangea-20260829-071142): a stray Compose stderr
+    # warning must never contaminate the parse (already fixed by stream
+    # separation), and the ONLY thing that should ever block PASS is a
+    # genuine missing/not-running/unhealthy service or truly malformed JSON
+    # -- never a parser artifact.
+    switch ($env:K8_MOCK_DOCKER_STATE) {
+        'readiness-e2e-ready-with-stderr-warning' {
+            [Console]::Error.WriteLine('time="2026-08-29T07:11:42Z" level=warning msg="the attribute `version` is obsolete"')
+            Write-Output '{"Service":"svcA","State":"running","Health":""}'
+            Write-Output '{"Service":"svcB","State":"running","Health":""}'
+            Write-Output '{"Service":"svcC","State":"running","Health":""}'
+            exit 0
+        }
+        'readiness-e2e-not-ready-missing-forever' {
+            # svcC never shows up -- a genuine, persistent missing service.
+            Write-Output '{"Service":"svcA","State":"running","Health":""}'
+            Write-Output '{"Service":"svcB","State":"running","Health":""}'
+            exit 0
+        }
+        'readiness-e2e-malformed-json-forever' {
+            # Truncated/unbalanced JSON, persistently -- must fail-closed
+            # with a parse diagnostic, never silently retried into a false
+            # "not ready" with no trace of why.
+            Write-Output '{"Service":"svcA","State":"running"'
+            exit 0
+        }
+        'readiness-21-services-pass' {
+            # 21 compact NDJSON rows, all State=running; only svc1/svc2
+            # declare a healthcheck and both report Health=healthy; the rest
+            # omit Health entirely (real Compose behavior for a service with
+            # no configured healthcheck) -- must still PASS on State alone.
+            for ($n = 1; $n -le 21; $n++) {
+                if ($n -le 2) { Write-Output "{`"Service`":`"svc$n`",`"State`":`"running`",`"Health`":`"healthy`"}" }
+                else { Write-Output "{`"Service`":`"svc$n`",`"State`":`"running`"}" }
+            }
+            exit 0
+        }
+        default { Write-Output '{"Service":"svc1","State":"running","Health":""}'; exit 0 }
+    }
+}
+
 if ($joined -match '^cp\b') {
     # docker cp <local> <container>:<remote> -- pcap-into-log_structurer copy.
     exit 0

@@ -430,14 +430,129 @@ function Get-K8ExpectedServices {
     return ,$services
 }
 
-function ConvertFrom-K8ComposePsJson {
-    <# `compose ps --format json` emits either one JSON array or
-       newline-delimited JSON objects depending on Compose version. #>
-    param([string] $Raw)
-    try { return @($Raw | ConvertFrom-Json) }
-    catch {
-        return @($Raw -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
+function ConvertFrom-K8ConcatenatedJson {
+    <#
+        Splits $Raw into one or more top-level JSON values (each a balanced
+        `{...}` object or `[...]` array), tracking bracket depth and string
+        literal/escape state -- NOT naive newline-splitting.
+
+        Root cause this exists to fix (real VM run k8shakedown-rangea-
+        20260829-071142, independent review): the prior ConvertFrom-K8ComposePsJson
+        tried `$Raw | ConvertFrom-Json` once, and on ANY failure fell back to
+        `$Raw -split "`n" | ForEach-Object { ConvertFrom-Json }` with no
+        further diagnostic -- a strategy that assumes Compose's `ps --all
+        --format json` is always either one compact single-line array, or
+        compact one-object-per-line NDJSON, and gives up with a bare WARN
+        (no persisted reason) on anything else, including a single stray
+        non-JSON line accidentally sharing stdout with otherwise-valid rows.
+        A real VM run's environment reported 21/21 services running with the
+        two declared healthchecks healthy (confirmed by an operator's manual
+        recheck immediately after the failure) yet Wait-K8ComposeReady still
+        exhausted its full 120s timeout -- meaning readiness was blocked by
+        this module's OWN parsing, not by Docker Compose's real state, and
+        the retained evidence at the time gave no way to tell which of
+        "parse failed" vs "genuinely not ready" had actually happened.
+
+        This scanner is deliberately format-agnostic: it does not care
+        whether the N rows are compact-NDJSON, or the whole document is one
+        pretty-printed multi-line array, or any mix of the two, because it
+        never splits on newlines at all -- only on where a top-level
+        value's own brackets balance back to zero. A brace/bracket
+        character INSIDE a JSON string (e.g. a container's Labels or Mounts
+        field containing literal `{`/`[`) is correctly ignored because
+        string state is tracked with escape-awareness. Any top-level
+        non-whitespace byte that is not the start of `{` or `[` (a stray
+        banner/warning line landing on stdout instead of stderr, for
+        example) is a hard, fail-closed parse error with an exact offset and
+        surrounding snippet -- real docker/compose/network JSON output never
+        contains a bare top-level scalar, so this can never silently skip
+        real data, and it can never silently accept corrupt data either.
+
+        Returns the array of still-unparsed top-level substrings; callers
+        parse each with ConvertFrom-Json and flatten arrays themselves (see
+        ConvertFrom-K8ComposePsJson below) -- kept separate from JSON
+        parsing itself so this scanner can be unit-tested purely as a
+        string-splitting algorithm.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string] $Raw)
+    $values = New-Object System.Collections.Generic.List[string]
+    $depth = 0
+    $inString = $false
+    $escape = $false
+    $start = -1
+    for ($i = 0; $i -lt $Raw.Length; $i++) {
+        $ch = $Raw[$i]
+        if ($inString) {
+            if ($escape) { $escape = $false }
+            elseif ($ch -eq '\') { $escape = $true }
+            elseif ($ch -eq '"') { $inString = $false }
+            continue
+        }
+        if ($ch -eq '"') { $inString = $true; continue }
+        if ($ch -eq '{' -or $ch -eq '[') {
+            if ($depth -eq 0) { $start = $i }
+            $depth++
+            continue
+        }
+        if ($ch -eq '}' -or $ch -eq ']') {
+            $depth--
+            if ($depth -lt 0) {
+                $lo = [Math]::Max(0, $i - 40); $len = [Math]::Min(80, $Raw.Length - $lo)
+                throw ('unbalanced JSON at offset {0} (unexpected closing bracket): ...{1}...' -f $i, $Raw.Substring($lo, $len))
+            }
+            if ($depth -eq 0) {
+                $values.Add($Raw.Substring($start, $i - $start + 1))
+                $start = -1
+            }
+            continue
+        }
+        if ($depth -eq 0 -and -not [char]::IsWhiteSpace($ch)) {
+            $lo = [Math]::Max(0, $i - 20); $len = [Math]::Min(60, $Raw.Length - $lo)
+            throw ('unexpected non-JSON content at top level, offset {0}: ...{1}...' -f $i, $Raw.Substring($lo, $len))
+        }
     }
+    if ($inString) { throw 'unterminated string literal in JSON output' }
+    if ($depth -ne 0) { throw "unbalanced JSON: $depth unclosed bracket(s) at end of input" }
+    # A single comma, NOT `,@(...)`: `@()` around an already-real array does
+    # not change it, but the leading comma then wraps THAT into a further
+    # 1-element array-of-array -- the exact double-wrap defect class this
+    # whole round is about, self-inflicted here if both were combined. See
+    # ConvertFrom-K8ComposePsJson's return statement for the same fix and
+    # Get-K8ExpectedServices' callers for the caller-side half of this bug.
+    return ,$values.ToArray()
+}
+
+function ConvertFrom-K8ComposePsJson {
+    <#
+        `compose ps --format json` / `compose images --format json` / `network
+        ls --format json` etc. emit either one JSON array or newline-
+        delimited JSON objects depending on Docker/Compose version -- and,
+        per ConvertFrom-K8ConcatenatedJson's docstring, possibly other
+        line-layout variants this module must not assume away. Delegates the
+        splitting to that depth-aware scanner (fail-closed on anything not a
+        clean top-level array/object), then flattens: a single top-level
+        array is expanded to its elements; each top-level object is one row.
+        This is also where the well-known ConvertFrom-Json single-element-
+        array-unwrap quirk (a JSON array with exactly one element
+        deserializes to a bare object, not a 1-element array) is handled
+        explicitly via the `-is [array]` check below, rather than papered
+        over with an `@()` wrap that would be correct for that one quirk but
+        wrong for the many-rows-NDJSON case.
+    #>
+    param([string] $Raw)
+    if ([string]::IsNullOrWhiteSpace($Raw)) { throw 'empty output: no JSON value to parse' }
+    $chunks = ConvertFrom-K8ConcatenatedJson -Raw $Raw
+    if ($chunks.Count -eq 0) { throw 'no JSON value found in output' }
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($chunk in $chunks) {
+        $parsed = $chunk | ConvertFrom-Json
+        if ($parsed -is [array]) { foreach ($item in $parsed) { $rows.Add($item) } }
+        else { $rows.Add($parsed) }
+    }
+    # Single comma only (see ConvertFrom-K8ConcatenatedJson above) -- and
+    # every CALLER of this function must NOT wrap it in @() either, for the
+    # same reason: this already force-returns a real array for 1 row or N.
+    return ,$rows.ToArray()
 }
 
 function Get-K8ObjectPropertyValue {
@@ -1595,6 +1710,14 @@ function Invoke-K8ShakedownRangeAB {
     "generated compose SHA-256 (within-run integrity record only, per c2-dnp3-range-derivation.md SS2.2): $composeHash" |
         Set-Content -Path (Join-Path $envDir 'generated-compose-hash.txt') -Encoding utf8NoBOM
 
+    # 3a. Network pool-conflict preflight -- BEFORE `compose up`, never
+    # after. A leftover network from an older, abandoned k8shakedown-range*
+    # run holding this run's same fixed subnet would otherwise only surface
+    # as `docker compose up`'s own opaque "invalid pool request: Pool
+    # overlaps with other one on this address space" failure. Read-only:
+    # never removes/prunes a network itself.
+    Test-K8ShakedownNetworkPreflight -RunId $RunId -ComposePath $ComposePath
+
     # 4. Provision. Compose build output is intentionally kept outside the
     # scientific evidence tree as a per-run Shakedown runtime/debug log.
     $buildLog = Join-Path $state.shakedown_root "runtime-logs\$RunId\docker-compose-up-build.log"
@@ -1814,12 +1937,265 @@ See environment/, ground-truth/, sensor-input/, contract-output/ for the machine
     return $RunEvidence
 }
 
+function ConvertTo-K8CidrRange {
+    <# Returns @(networkAddress, broadcastAddress) as UInt32 for an IPv4
+       CIDR string, for range-overlap comparison. Masking is done entirely
+       in UInt64 before narrowing to UInt32, because `[uint32](0xFFFFFFFF
+       -shl n)` overflows UInt32 directly for any n between 1 and 31 (the
+       shift itself is computed in a wider type first). #>
+    param([Parameter(Mandatory)][string] $Cidr)
+    $parts = $Cidr -split '/'
+    if ($parts.Count -ne 2) { throw "not a CIDR (expected address/prefix): '$Cidr'" }
+    $ip = [System.Net.IPAddress]::Parse($parts[0].Trim())
+    if ($ip.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { throw "not an IPv4 CIDR: '$Cidr'" }
+    $prefix = [int]$parts[1]
+    if ($prefix -lt 0 -or $prefix -gt 32) { throw "invalid IPv4 prefix length in '$Cidr'" }
+    $bytes = $ip.GetAddressBytes()
+    if ([BitConverter]::IsLittleEndian) { [array]::Reverse($bytes) }
+    $ipUInt = [BitConverter]::ToUInt32($bytes, 0)
+    $fullMask = [uint64]4294967295
+    $maskU64 = if ($prefix -eq 0) { [uint64]0 } else { ($fullMask -shl (32 - $prefix)) -band $fullMask }
+    $mask = [uint32]$maskU64
+    $network = $ipUInt -band $mask
+    $broadcast = [uint32]($network -bor ($fullMask -band (-bnot [uint64]$mask)))
+    return @($network, $broadcast)
+}
+
+function Test-K8CidrOverlap {
+    param([Parameter(Mandatory)][string] $CidrA, [Parameter(Mandatory)][string] $CidrB)
+    $ra = ConvertTo-K8CidrRange -Cidr $CidrA
+    $rb = ConvertTo-K8CidrRange -Cidr $CidrB
+    return ($ra[0] -le $rb[1]) -and ($rb[0] -le $ra[1])
+}
+
+function Get-K8ComposeDeclaredSubnets {
+    <#
+        Resolves the IPv4 subnet(s) THIS run's compose file declares via
+        `docker compose config --format json` (the fully-resolved compose
+        document -- name/services/networks/volumes as one JSON object,
+        never NDJSON, since it is a single document, not a per-item list),
+        never a hardcoded/assumed CIDR. Only networks with an explicit
+        `ipam.config[].subnet` are returned; a network with no declared
+        subnet (Docker assigns one from its default pool) is not a FIXED
+        CIDR and cannot deterministically collide the way the reported UX
+        defect requires, so it is intentionally excluded here.
+    #>
+    param([Parameter(Mandatory)][string] $RunId, [Parameter(Mandatory)][string] $ComposePath)
+    $capture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'config', '--format', 'json')
+    if ($capture.ExitCode -ne 0) {
+        throw "'docker compose config --format json' failed (exit $($capture.ExitCode)); cannot resolve this run's declared network subnets for the pool-conflict preflight. stderr: $($capture.Stderr.Trim())"
+    }
+    $config = ($capture.Stdout | Out-String) | ConvertFrom-Json
+    $subnets = New-Object System.Collections.Generic.List[string]
+    $networks = Get-K8ObjectPropertyValue -Object $config -Name 'networks'
+    if ($networks) {
+        foreach ($netProp in $networks.PSObject.Properties) {
+            $ipam = Get-K8ObjectPropertyValue -Object $netProp.Value -Name 'ipam'
+            $ipamConfig = if ($ipam) { Get-K8ObjectPropertyValue -Object $ipam -Name 'config' } else { $null }
+            # `@($null)` is a 1-element array CONTAINING null, not an empty
+            # array -- must skip explicitly, not just iterate blindly, or a
+            # network with no ipam/config at all throws on the null $entry.
+            if ($null -ne $ipamConfig) {
+                foreach ($entry in @($ipamConfig)) {
+                    if ($null -eq $entry) { continue }
+                    $subnet = Get-K8ObjectPropertyValue -Object $entry -Name 'subnet'
+                    if (-not [string]::IsNullOrWhiteSpace([string]$subnet)) { $subnets.Add([string]$subnet) }
+                }
+            }
+        }
+    }
+    return ,$subnets.ToArray()
+}
+
+function Get-K8LeftoverShakedownNetworks {
+    <#
+        Enumerates EXISTING docker networks that look like a leftover
+        network from a PRIOR (not this) Shakedown run -- name matching
+        `k8shakedown-range[abc]-<digits>...`, excluding $RunId's own -- and
+        returns each with whatever IPv4 subnet(s) it actually has, via
+        `docker network inspect`. Read-only: never removes, prunes, or
+        otherwise mutates any network. That decision is the operator's, by
+        design (see Test-K8ShakedownNetworkPreflight's docstring).
+    #>
+    param([Parameter(Mandatory)][string] $RunId)
+    $lsCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('network', 'ls', '--format', 'json')
+    if ($lsCapture.ExitCode -ne 0) {
+        throw "'docker network ls --format json' failed (exit $($lsCapture.ExitCode)); cannot check for leftover Shakedown networks. stderr: $($lsCapture.Stderr.Trim())"
+    }
+    $raw = ($lsCapture.Stdout | Out-String)
+    $networks = if ([string]::IsNullOrWhiteSpace($raw)) { @() } else { ConvertFrom-K8ComposePsJson -Raw $raw }
+    $candidates = @($networks | Where-Object {
+        $name = [string](Get-K8ObjectPropertyValue -Object $_ -Name 'Name')
+        $name -match '^k8shakedown-range[abc]-\d' -and $name -ne $RunId -and -not $name.StartsWith("$RunId-") -and -not $name.StartsWith("${RunId}_")
+    })
+    $result = New-Object System.Collections.Generic.List[object]
+    foreach ($net in $candidates) {
+        $name = [string](Get-K8ObjectPropertyValue -Object $net -Name 'Name')
+        $inspectCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('network', 'inspect', $name, '--format', 'json')
+        if ($inspectCapture.ExitCode -ne 0) { continue }  # network may have been removed between ls and inspect; not this preflight's concern
+        $inspectRaw = ($inspectCapture.Stdout | Out-String)
+        if ([string]::IsNullOrWhiteSpace($inspectRaw)) { continue }
+        $inspected = ConvertFrom-K8ComposePsJson -Raw $inspectRaw
+        foreach ($detail in $inspected) {
+            $ipam = Get-K8ObjectPropertyValue -Object $detail -Name 'IPAM'
+            $ipamConfig = if ($ipam) { Get-K8ObjectPropertyValue -Object $ipam -Name 'Config' } else { $null }
+            $subnets = New-Object System.Collections.Generic.List[string]
+            # See the matching guard in Get-K8ComposeDeclaredSubnets: `@($null)`
+            # is a 1-element array containing null, not an empty array.
+            if ($null -ne $ipamConfig) {
+                foreach ($entry in @($ipamConfig)) {
+                    if ($null -eq $entry) { continue }
+                    $subnet = Get-K8ObjectPropertyValue -Object $entry -Name 'Subnet'
+                    if (-not [string]::IsNullOrWhiteSpace([string]$subnet)) { $subnets.Add([string]$subnet) }
+                }
+            }
+            if ($subnets.Count -gt 0) {
+                $result.Add([pscustomobject]@{ Name = $name; Subnets = $subnets.ToArray() })
+            }
+        }
+    }
+    return ,$result.ToArray()
+}
+
+function Test-K8ShakedownNetworkPreflight {
+    <#
+        UX defect this exists to fix (real VM finding, reported alongside
+        the readiness false-negative): a leftover docker network from an
+        OLDER k8shakedown-rangea-* project, still holding a fixed subnet, is
+        never torn down by an abandoned/non-rescued run -- a fresh
+        `docker compose up` for a NEW run then fails with "invalid pool
+        request: Pool overlaps with other one on this address space" during
+        provisioning, with no earlier, clearer signal of why.
+
+        Runs BEFORE `docker compose up` (never after -- the whole point is
+        to fail before provisioning attempts anything). Compares THIS run's
+        actually-declared subnet(s) (read from `compose config`, never
+        hardcoded) against every discoverable leftover Shakedown network's
+        actual subnet(s) (read from `docker network inspect`, never
+        assumed). On overlap, STOPs with the exact conflicting network name
+        and both subnets so the operator can decide what to do.
+
+        Deliberately does NOT remove, prune, or otherwise touch any
+        network -- `docker network prune`/`rm` are explicitly out of scope
+        here. An old network may still be attached to a container the
+        operator wants to inspect, or may belong to a run under active
+        investigation; only the operator can safely judge that, never this
+        preflight.
+    #>
+    param([Parameter(Mandatory)][string] $RunId, [Parameter(Mandatory)][string] $ComposePath)
+    # NOT wrapped in @() -- both helpers already force-return a real array
+    # via `,$X.ToArray()`; see their own return statements and the
+    # Get-K8ExpectedServices comment earlier in this module for why
+    # wrapping the call site AGAIN would double-wrap into an array-of-array.
+    $ourSubnets = Get-K8ComposeDeclaredSubnets -RunId $RunId -ComposePath $ComposePath
+    if ($ourSubnets.Count -eq 0) {
+        Write-K8ShakedownLog -Message 'Network preflight: this run declares no fixed-subnet networks; nothing to check for pool conflicts.'
+        return
+    }
+    $leftovers = Get-K8LeftoverShakedownNetworks -RunId $RunId
+    $conflicts = New-Object System.Collections.Generic.List[string]
+    foreach ($leftover in $leftovers) {
+        foreach ($theirSubnet in $leftover.Subnets) {
+            foreach ($ourSubnet in $ourSubnets) {
+                if (Test-K8CidrOverlap -CidrA $ourSubnet -CidrB $theirSubnet) {
+                    $conflicts.Add("network '$($leftover.Name)' holds subnet $theirSubnet, which overlaps this run's $ourSubnet")
+                }
+            }
+        }
+    }
+    if ($conflicts.Count -gt 0) {
+        $detail = $conflicts.ToArray() -join '; '
+        throw "Network preflight STOP: a leftover Shakedown network's fixed subnet overlaps this run's intended network(s): $detail. This run will not proceed automatically -- Shakedown does not remove or prune docker networks. Inspect and, if it is safe to do so, remove the conflicting network yourself (docker network rm <name>), then retry with a fresh run ID."
+    }
+    Write-K8ShakedownLog -Message "Network preflight PASS: this run's subnet(s) ($($ourSubnets -join ', ')) do not overlap any of the $($leftovers.Count) leftover Shakedown network(s) found."
+}
+
+function New-K8ComposeReadinessRecord {
+    <#
+        Builds the structured readiness record Wait-K8ComposeReady retains,
+        and writes it to $Path. Root cause this exists to fix: a real VM run
+        (k8shakedown-rangea-20260829-071142) timed out after 120s with only
+        an abstract "missing/not running/unhealthy or output could not be
+        parsed" message, and environment/readiness.json held nothing but the
+        LAST raw `compose ps` text dump -- an operator had to manually
+        recompute expected/actual/missing counts by hand to discover the
+        real 21/21/all-running/declared-healthchecks-healthy state had
+        already been reached, meaning readiness itself, not Docker, was the
+        false negative. This record makes that distinction mechanically
+        explicit and persisted, every poll, not just reconstructible after
+        the fact from a raw dump.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string[]] $Expected,
+        [string] $Decision,
+        [string] $RawPsOutput,
+        [string] $ParseDiagnostic,
+        $Gate,
+        [int] $Attempts = 0
+    )
+    $actualCount = 0
+    $missing = @(); $notRunning = @(); $notHealthy = @()
+    if ($Gate) {
+        $missing = @($Gate.Missing); $notRunning = @($Gate.NotRunning); $notHealthy = @($Gate.NotHealthy)
+        $actualCount = $Expected.Count - $missing.Count
+    }
+    $record = [ordered]@{
+        decision              = $Decision
+        expected_count        = $Expected.Count
+        expected_services     = @($Expected)
+        actual_present_count  = $actualCount
+        missing               = $missing
+        not_running           = $notRunning
+        not_healthy           = $notHealthy
+        parse_diagnostic      = $(if ($ParseDiagnostic) { $ParseDiagnostic } else { $null })
+        poll_attempts         = $Attempts
+        raw_ps_output         = $RawPsOutput
+    }
+    $record | ConvertTo-Json -Depth 6 | Set-Content -Path $Path -Encoding utf8NoBOM
+    return $record
+}
+
+function Write-K8ComposeReadinessTimeoutDiagnostic {
+    <# Prints the 5-10 line console summary a timeout must show: not just
+       "timed out", but exactly what evaluation blocked PASS the last time
+       it was actually checked. #>
+    param([Parameter(Mandatory)][int] $TimeoutSeconds, [Parameter(Mandatory)] $Record)
+    Write-Host ''
+    Write-Host "Environment readiness timed out after ${TimeoutSeconds}s. Last poll result:" -ForegroundColor Yellow
+    Write-Host "  Expected services : $($Record.expected_count)"
+    if ($Record.parse_diagnostic) {
+        Write-Host "  Actual services   : could not be determined (parse failed)"
+        Write-Host "  Parse diagnostic  : $($Record.parse_diagnostic)"
+    }
+    else {
+        Write-Host "  Actual present    : $($Record.actual_present_count)"
+        Write-Host "  Missing           : $(if ($Record.missing.Count) { $Record.missing -join ', ' } else { '(none)' })"
+        Write-Host "  Not running       : $(if ($Record.not_running.Count) { $Record.not_running -join ', ' } else { '(none)' })"
+        Write-Host "  Not healthy       : $(if ($Record.not_healthy.Count) { $Record.not_healthy -join ', ' } else { '(none)' })"
+    }
+    Write-Host "  Poll attempts     : $($Record.poll_attempts)"
+    Write-Host "  Full record       : environment/readiness.json"
+    Write-Host ''
+}
+
 function Wait-K8ComposeReady {
     <#
         Polls `docker compose ps --format json` until every defined service
         reports a running state, or throws on timeout. README SS5.1 step 4
         requires readiness before capture context resolution; this makes that
         an explicit, fail-closed gate instead of an assumption.
+
+        Never weakens the readiness condition itself: every expected service
+        must be present, State 'running', and -- for a service that DOES
+        declare a Docker healthcheck -- Health 'healthy' (see
+        Test-K8ComposeServiceReadiness, unchanged). What changed (see
+        New-K8ComposeReadinessRecord's docstring for the root cause) is that
+        a parse failure is now tracked SEPARATELY from a genuine
+        missing/not-running/unhealthy result across the whole polling loop,
+        surfaced in both the persisted record and an explicit console
+        diagnostic on timeout, rather than being indistinguishable WARN-and-
+        retry noise with no persisted trace of which one actually happened.
     #>
     param(
         [Parameter(Mandatory)][string] $RunId,
@@ -1829,29 +2205,61 @@ function Wait-K8ComposeReady {
         [int] $PollSeconds = 3
     )
     $envDir = Join-Path $RunEvidence 'environment'
-    $expected = @(Get-K8ExpectedServices -RunId $RunId -ComposePath $ComposePath)
+    # NOT wrapped in @() here: Get-K8ExpectedServices already force-returns a
+    # real array via `return ,$services` (correct for 1 element AND for many).
+    # Wrapping ITS call site in @() as well double-wraps the result into a
+    # 1-element array whose sole element is the real array -- Test-K8Compose
+    # ServiceReadiness would then iterate exactly one pseudo-"expected
+    # service" (the array object itself, not a service name string), which
+    # can never match any real row, making Missing non-empty and Ready
+    # false FOREVER regardless of actual Docker state. Root cause of the
+    # real VM false negative (k8shakedown-rangea-20260829-071142): 21/21
+    # services were genuinely running and healthy the whole time; this
+    # double-wrap is what made Test-K8ComposeServiceReadiness never see them.
+    $expected = Get-K8ExpectedServices -RunId $RunId -ComposePath $ComposePath
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $lastRaw = ''
+    $lastGate = $null
+    $lastParseDiagnostic = $null
+    $attempts = 0
     while ((Get-Date) -lt $deadline) {
+        $attempts++
         # STDOUT/STDERR captured separately: a Compose warning on stderr
         # must not be merged into the JSON this parses.
         $psCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '--all', '--format', 'json')
         $lastRaw = ($psCapture.Stdout | Out-String)
-        try {
-            $services = @(ConvertFrom-K8ComposePsJson -Raw $lastRaw)
-            $gate = Test-K8ComposeServiceReadiness -Expected $expected -Services $services
-            if ($gate.Ready) {
-                $lastRaw | Set-Content -Path (Join-Path $envDir 'readiness.json') -Encoding utf8NoBOM
-                Write-K8ShakedownLog -Message "Environment readiness PASS: all $($expected.Count) expected service(s) present/running and all reported healthchecks healthy."
-                return
-            }
+        if ($psCapture.ExitCode -ne 0) {
+            $lastParseDiagnostic = "'docker compose ps' failed (exit $($psCapture.ExitCode)): $($psCapture.Stderr.Trim())"
+            $lastGate = $null
+            Write-K8ShakedownLog -Level WARN -Message "readiness poll: $lastParseDiagnostic"
         }
-        catch {
-            Write-K8ShakedownLog -Level WARN -Message "readiness poll: could not parse 'compose ps --format json' output, retrying: $($_.Exception.Message)"
+        else {
+            try {
+                # NOT wrapped in @() -- ConvertFrom-K8ComposePsJson already
+                # force-returns a real array; see its own return statement.
+                $services = ConvertFrom-K8ComposePsJson -Raw $lastRaw
+                $gate = Test-K8ComposeServiceReadiness -Expected $expected -Services $services
+                $lastGate = $gate
+                $lastParseDiagnostic = $null
+                if ($gate.Ready) {
+                    New-K8ComposeReadinessRecord -Path (Join-Path $envDir 'readiness.json') -Expected $expected `
+                        -Decision 'PASS' -RawPsOutput $lastRaw -Gate $gate -Attempts $attempts | Out-Null
+                    Write-K8ShakedownLog -Message "Environment readiness PASS: all $($expected.Count) expected service(s) present/running and all reported healthchecks healthy (after $attempts poll(s))."
+                    return
+                }
+            }
+            catch {
+                $lastParseDiagnostic = $_.Exception.Message
+                $lastGate = $null
+                Write-K8ShakedownLog -Level WARN -Message "readiness poll: could not parse 'compose ps --format json' output, retrying: $lastParseDiagnostic"
+            }
         }
         Start-Sleep -Seconds $PollSeconds
     }
-    $lastRaw | Set-Content -Path (Join-Path $envDir 'readiness.json') -Encoding utf8NoBOM
+    $record = New-K8ComposeReadinessRecord -Path (Join-Path $envDir 'readiness.json') -Expected $expected `
+        -Decision $(if ($lastParseDiagnostic) { 'FAIL-PARSE' } else { 'FAIL-STATE' }) `
+        -RawPsOutput $lastRaw -ParseDiagnostic $lastParseDiagnostic -Gate $lastGate -Attempts $attempts
+    Write-K8ComposeReadinessTimeoutDiagnostic -TimeoutSeconds $TimeoutSeconds -Record $record
     throw "Environment readiness timed out after ${TimeoutSeconds}s; an expected service was missing/not running/unhealthy or output could not be parsed. See environment/readiness.json."
 }
 
@@ -1868,7 +2276,18 @@ function Write-K8ImageInventory {
         [Parameter(Mandatory)][string] $RunEvidence
     )
     $envDir = Join-Path $RunEvidence 'environment'
-    $expected = @(Get-K8ExpectedServices -RunId $RunId -ComposePath $ComposePath)
+    # NOT wrapped in @() here: Get-K8ExpectedServices already force-returns a
+    # real array via `return ,$services` (correct for 1 element AND for many).
+    # Wrapping ITS call site in @() as well double-wraps the result into a
+    # 1-element array whose sole element is the real array -- Test-K8Compose
+    # ServiceReadiness would then iterate exactly one pseudo-"expected
+    # service" (the array object itself, not a service name string), which
+    # can never match any real row, making Missing non-empty and Ready
+    # false FOREVER regardless of actual Docker state. Root cause of the
+    # real VM false negative (k8shakedown-rangea-20260829-071142): 21/21
+    # services were genuinely running and healthy the whole time; this
+    # double-wrap is what made Test-K8ComposeServiceReadiness never see them.
+    $expected = Get-K8ExpectedServices -RunId $RunId -ComposePath $ComposePath
     # STDOUT/STDERR captured separately throughout: a stray Compose/Docker
     # stderr line merged into either JSON capture below would corrupt the
     # mandatory image inventory (a completeness-gate-required artifact).
@@ -1878,7 +2297,9 @@ function Write-K8ImageInventory {
     $psJson | Set-Content -Path (Join-Path $envDir 'compose-images.json') -Encoding utf8NoBOM
     (docker compose -p $RunId -f $ComposePath ps 2>&1) | Set-Content -Path (Join-Path $envDir 'compose-ps.txt') -Encoding utf8NoBOM
 
-    try { $images = @(ConvertFrom-K8ComposePsJson -Raw ($psJson | Out-String)) }
+    # NOT wrapped in @() -- ConvertFrom-K8ComposePsJson already force-returns
+    # a real array; see its own return statement.
+    try { $images = ConvertFrom-K8ComposePsJson -Raw ($psJson | Out-String) }
     catch { throw "could not parse mandatory compose image inventory JSON: $($_.Exception.Message)" }
     $resolvedRows = Resolve-K8ComposeImageRows -RunId $RunId -ExpectedServices $expected -ImageRows $images
     $inventory = @()
@@ -1940,7 +2361,9 @@ function Write-K8RuntimeContractRecord {
     # merged into the JSON this parses for the Range B service-state gate.
     $psJsonCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '--all', '--format', 'json')
     if ($psJsonCapture.ExitCode -ne 0) { throw "docker compose ps --format json failed while building the runtime contract record (exit $($psJsonCapture.ExitCode)). stderr: $($psJsonCapture.Stderr.Trim())" }
-    $services = @(ConvertFrom-K8ComposePsJson -Raw ($psJsonCapture.Stdout | Out-String))
+    # NOT wrapped in @() -- ConvertFrom-K8ComposePsJson already force-returns
+    # a real array; see its own return statement.
+    $services = ConvertFrom-K8ComposePsJson -Raw ($psJsonCapture.Stdout | Out-String)
     $lines = @()
     $lines += "# Runtime contract observational record -- $RunId"
     $lines += ''
