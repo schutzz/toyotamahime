@@ -649,7 +649,7 @@ function Invoke-K8ShakedownRangeAB {
     # 10. Instantiate the fixed queries from retained T0. The exact requests,
     # raw responses and mechanical correlations are executed below without
     # retries, selector changes, field substitution, or result-driven widening.
-    $t0Path = Join-Path $RunEvidence 'ground-truth\metadata-t0.txt'
+    $t0Path = Join-Path $RunEvidence 'metadata-t0.txt'
     if (-not (Test-Path $t0Path)) {
         throw "T0 record not found at $t0Path after stop-export; cannot window the Collector/Rule queries. This is a STOP condition -- do not proceed to teardown without it."
     }

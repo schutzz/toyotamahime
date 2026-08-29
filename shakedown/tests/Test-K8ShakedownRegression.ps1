@@ -158,6 +158,16 @@ Assert-K8Test 'Range A/B keeps the fresh evidence tree empty until frozen prefli
     }
 }
 
+Assert-K8Test 'Range A/B reads T0 from the run root, matching frozen T0_ARTIFACT placement' {
+    $common = Get-Content (Join-Path $ToolsDir 'K8ShakedownCommon.psm1') -Raw
+    if ($common -notmatch "Join-Path\s+\`$RunEvidence\s+'metadata-t0\.txt'") {
+        throw 'runner does not read <run-evidence>/metadata-t0.txt'
+    }
+    if ($common -match "ground-truth[\\/]metadata-t0\.txt") {
+        throw 'runner still references the invalid ground-truth/metadata-t0.txt path'
+    }
+}
+
 # --- 4. Runner argument coverage against the real scripts' own argparse ------
 #
 # Per-invocation, not whole-module: a whole-file substring search cannot tell
