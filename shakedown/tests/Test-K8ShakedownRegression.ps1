@@ -617,6 +617,13 @@ try {
         # plugin-process-alive is necessary but not sufficient either.
         @{ Name = 'zone_detector: plugin alive but its OWN container cannot reach Elasticsearch -> STOP'; State = 'detector-connectivity-fail'; Func = 'Wait-K8ZoneDetectorReady'; ExpectPass = $false }
         @{ Name = 'zone_detector: plugin alive AND connectivity confirmed from inside the container -> PASS'; State = 'detector-connectivity-ok'; Func = 'Wait-K8ZoneDetectorReady'; ExpectPass = $true }
+        # Round 4: _cluster/health 2xx is not proof the plugin's OWN real
+        # dependency (POST ot-logs-dnp3-*/_search) works -- poll_once()
+        # catches every RequestException on that call and returns 0.
+        @{ Name = 'zone_detector: cluster health 200 but its own ot-logs-dnp3-*/_search returns 400 -> STOP'; State = 'detector-search-400'; Func = 'Wait-K8ZoneDetectorReady'; ExpectPass = $false }
+        @{ Name = 'zone_detector: its own source-index search transport failure -> STOP'; State = 'detector-search-transport-error'; Func = 'Wait-K8ZoneDetectorReady'; ExpectPass = $false }
+        @{ Name = 'zone_detector: its own source-index search returns invalid JSON -> STOP'; State = 'detector-search-invalid-json'; Func = 'Wait-K8ZoneDetectorReady'; ExpectPass = $false }
+        @{ Name = 'zone_detector: its own source-index search 2xx + valid JSON -> PASS'; State = 'detector-search-ok'; Func = 'Wait-K8ZoneDetectorReady'; ExpectPass = $true }
     )
     foreach ($case in $cases) {
         Assert-K8Test $case.Name {
@@ -640,6 +647,16 @@ try {
         if ($body -match '"gte"|"lte"|WINDOW_START|WINDOW_END') {
             throw 'canary query appears to use a T0 time window -- T0 does not exist yet at this point in the pipeline, and this must stay a wall-clock/insertion-order check, not a scientific-window one'
         }
+    }
+
+    Assert-K8Test 'zone_detector source-index search uses the pinned plugin''s own literal query, executed from inside zone_detector, requires valid JSON' {
+        $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Wait-K8ZoneDetectorReady'
+        foreach ($needle in @('ot-logs-dnp3-\*/_search', '"_doc": "desc"', 'wildcard', 'frame_frame_protocols', '\*dnp3\*')) {
+            if ($body -notmatch $needle) { throw "search check does not use zone_violation.py's own literal query shape (missing: $needle)" }
+        }
+        if ($body -notmatch 'json\.loads\(raw\)') { throw 'search check does not actually parse the response body as JSON before accepting it' }
+        if ($body -notmatch "docker exec \`$container python3 -c \`$searchScript") { throw 'search check is not executed via docker exec against $container (zone_detector itself)' }
+        if ($body -notmatch '\$pluginLive -and \$connectivityOk -and \$searchOk') { throw 'PASS condition no longer requires plugin-alive AND connectivity AND search all three' }
     }
 
     Assert-K8Test 'zone_detector connectivity check runs FROM INSIDE the zone_detector container, not from Elasticsearch or the host' {

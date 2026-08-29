@@ -759,6 +759,24 @@ function Wait-K8ZoneDetectorReady {
         installed (only what `plugin.requires` declares is pip-installed;
         curl is not a Python package).
 
+        Round 4 (BLOCKER, independent review): a bare `_cluster/health` 2xx
+        proves TCP/HTTP reachability but not that the plugin's ACTUAL
+        dependency -- `POST <ES_URL>/ot-logs-dnp3-*/_search` -- succeeds.
+        poll_once() catches every requests.exceptions.RequestException on
+        that search (a 400 from a query/mapping incompatibility included)
+        and returns 0, so "process alive + generic ES reachable + this one
+        specific search permanently failing" was a real, undetected PASS
+        condition. This gate now also issues, FROM WITHIN the zone_detector
+        container, the plugin's own literal query --
+        `{"size": 50, "sort": [{"_doc": "desc"}], "query": {"wildcard":
+        {"layers.frame.frame_frame_protocols": "*dnp3*"}}}` -- copied
+        verbatim from scenarios/legacy-power-grid-signals/zone_violation.py
+        poll_once() at the pinned commit, not reconstructed or
+        approximated, against ot-logs-dnp3-* (already known to hold at
+        least one document at this point in the pipeline, since
+        Wait-K8LogStructurerReady's operational canary already required
+        that). PASS requires HTTP 2xx AND a body that parses as JSON.
+
         Best-effort, non-blocking: the container's recent stderr is also
         checked for zone_violation's own "search failed"/"bulk write
         failed" lines and recorded (not gated on) -- a transient old error
@@ -794,28 +812,40 @@ function Wait-K8ZoneDetectorReady {
         $connExit = $LASTEXITCODE
         $connectivityOk = ($connExit -eq 0 -and $connOut -match '^2[0-9][0-9]$')
 
+        # The plugin's own literal search, from inside its own container,
+        # against its own real dependency (not just a generic health check).
+        $searchOk = $false
+        $searchResult = $null
+        if ($connectivityOk) {
+            $searchScript = "import sys,json,urllib.request,urllib.error`nbody=b'{`"size`": 50, `"sort`": [{`"_doc`": `"desc`"}], `"query`": {`"wildcard`": {`"layers.frame.frame_frame_protocols`": `"*dnp3*`"}}}'`ntry:`n req=urllib.request.Request('$esUrl/ot-logs-dnp3-*/_search',data=body,headers={'Content-Type':'application/json'},method='POST')`n r=urllib.request.urlopen(req,timeout=5)`n raw=r.read()`n json.loads(raw)`n sys.stdout.write(str(r.status))`nexcept urllib.error.HTTPError as e:`n sys.stdout.write('HTTPERROR:'+str(e.code))`n sys.exit(1)`nexcept Exception as e:`n sys.stdout.write('ERROR:'+str(e))`n sys.exit(1)`n"
+            $searchResult = (docker exec $container python3 -c $searchScript 2>&1 | Out-String).Trim()
+            $searchExit = $LASTEXITCODE
+            $searchOk = ($searchExit -eq 0 -and $searchResult -match '^2[0-9][0-9]$')
+        }
+
         $recentLog = (docker logs --tail 20 $container 2>&1 | Out-String)
         $recentLogHasError = [bool]($recentLog -match 'search failed|bulk write failed')
 
         $attempts += [ordered]@{
             attempt_utc=$attemptStart; signal1_plugin_process_found=$pluginLive
             es_url_used=$esUrl; zone_detector_to_es_connectivity_ok=$connectivityOk; zone_detector_to_es_result=$connOut
+            zone_detector_source_index_search_ok=$searchOk; zone_detector_source_index_search_result=$searchResult
             # Recorded for review, not gated on: a transient old error from
             # before Elasticsearch itself became ready must not by itself
             # fail a run that is otherwise functionally ready now.
             recent_log_tail_error_seen_best_effort_non_blocking=$recentLogHasError
         }
-        if ($pluginLive -and $connectivityOk) {
+        if ($pluginLive -and $connectivityOk -and $searchOk) {
             [ordered]@{ gate='zone-detector-functional-readiness'; result='PASS'; container=$container; attempts=$attempts } |
                 ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $envDir 'zone-detector-readiness.json') -Encoding utf8NoBOM
-            Write-K8ShakedownLog -Message "zone_detector functional readiness PASS after $($attempts.Count) attempt(s): plugin process live AND HTTP $connOut from inside the container to $esUrl."
+            Write-K8ShakedownLog -Message "zone_detector functional readiness PASS after $($attempts.Count) attempt(s): plugin process live, HTTP $connOut to $esUrl, AND its own ot-logs-dnp3-*/_search query returned HTTP $searchResult with a parseable body."
             return
         }
         Start-Sleep -Seconds $PollSeconds
     }
     [ordered]@{ gate='zone-detector-functional-readiness'; result='TIMEOUT'; container=$container; attempts=$attempts } |
         ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $envDir 'zone-detector-readiness.json') -Encoding utf8NoBOM
-    throw "zone_detector did not reach functional readiness within ${TimeoutSeconds}s (plugin-process-alive and/or its own container-to-Elasticsearch connectivity never both held -- see environment/zone-detector-readiness.json for which). Not proceeding to capture/trigger -- a Rule query against a detector that cannot reach Elasticsearch would return zero hits indistinguishable from a genuine 'No alert' result."
+    throw "zone_detector did not reach functional readiness within ${TimeoutSeconds}s (plugin-process-alive, its own container-to-Elasticsearch connectivity, and/or its own literal ot-logs-dnp3-*/_search query never all three held -- see environment/zone-detector-readiness.json for which). Not proceeding to capture/trigger -- a Rule query against a detector whose own search is failing (query/mapping incompatibility, a 400, etc.) would return zero hits indistinguishable from a genuine 'No alert' result."
 }
 
 function Complete-K8ElasticsearchResponse {

@@ -55,9 +55,19 @@ if ($joined -match '\bexec\b') {
         Write-Output 'http://elasticsearch:9200'
         exit 0
     }
+    if ($joined -match '\bpython3\b' -and $joined -match 'ot-logs-dnp3.*_search|_search.*wildcard') {
+        # zone_detector's own literal search, from inside its own container.
+        switch ($env:K8_MOCK_DOCKER_STATE) {
+            { $_ -in @('detector-search-ok', 'detector-connectivity-ok', 'detector-ready', 'detector-log-has-error') } { Write-Output '200'; exit 0 }
+            'detector-search-400'             { Write-Output 'HTTPERROR:400'; exit 1 }
+            'detector-search-transport-error' { Write-Output 'ERROR:Connection refused'; exit 1 }
+            'detector-search-invalid-json'    { Write-Output 'ERROR:Expecting value: line 1 column 1 (char 0)'; exit 1 }
+            default { Write-Output 'ERROR:Connection refused'; exit 1 }
+        }
+    }
     if ($joined -match '\bpython3\b' -and $joined -match 'urllib') {
         switch ($env:K8_MOCK_DOCKER_STATE) {
-            { $_ -in @('detector-connectivity-ok', 'detector-ready', 'detector-log-has-error') } { Write-Output '200'; exit 0 }
+            { $_ -in @('detector-connectivity-ok', 'detector-ready', 'detector-log-has-error', 'detector-search-400', 'detector-search-transport-error', 'detector-search-invalid-json', 'detector-search-ok') } { Write-Output '200'; exit 0 }
             'detector-connectivity-fail' { Write-Output 'ERROR:Connection refused'; exit 1 }
             default { Write-Output 'ERROR:Connection refused'; exit 1 }
         }
@@ -72,7 +82,7 @@ if ($joined -match '\bexec\b') {
         }
         'structurer-tshark-only' { Write-Output 'tshark -i eth0 -T ek -Y dnp3 -l '; exit 0 }
         'detector-installing'   { Write-Output 'pip install --quiet requests'; exit 0 }
-        { $_ -in @('detector-ready', 'detector-connectivity-ok', 'detector-connectivity-fail', 'detector-log-has-error') } {
+        { $_ -in @('detector-ready', 'detector-connectivity-ok', 'detector-connectivity-fail', 'detector-log-has-error', 'detector-search-ok', 'detector-search-400', 'detector-search-transport-error', 'detector-search-invalid-json') } {
             Write-Output 'python3 /app/plugins/signal-1-zone-violation.py'
             exit 0
         }
