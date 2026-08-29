@@ -488,6 +488,41 @@ function Get-K8FunctionBodyText {
     return $function.Extent.Text
 }
 
+function Get-K8CommentStrippedSource {
+    <#
+        Returns the file's source with every comment token blanked out
+        (spaces, newlines preserved so line numbers and line structure are
+        unchanged).
+
+        This exists because "search the source for a banned pattern" checks
+        have repeatedly false-positived on this repo's OWN docstrings, which
+        legitimately quote the very pattern they describe fixing -- including
+        inside block comments, whose continuation lines do not start with a
+        hash and so survive naive line filtering. Using the real tokenizer is
+        the only reliable way to ask "does the CODE do this?".
+    #>
+    param([Parameter(Mandatory)][string] $Path)
+    $tokens = $null; $errors = $null
+    $null = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
+    $sb = [System.Text.StringBuilder]::new((Get-Content $Path -Raw))
+    foreach ($t in ($tokens | Where-Object { $_.Kind -eq [System.Management.Automation.Language.TokenKind]::Comment })) {
+        for ($i = $t.Extent.StartOffset; $i -lt $t.Extent.EndOffset -and $i -lt $sb.Length; $i++) {
+            if ($sb[$i] -ne "`n" -and $sb[$i] -ne "`r") { $sb[$i] = ' ' }
+        }
+    }
+    return $sb.ToString()
+}
+
+function Get-K8CommentStrippedFunctionBody {
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $Name)
+    $tokens = $null; $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
+    $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $Name }, $true)
+    if (-not $fn) { throw "function '$Name' not found in $Path" }
+    $stripped = Get-K8CommentStrippedSource -Path $Path
+    return $stripped.Substring($fn.Extent.StartOffset, $fn.Extent.EndOffset - $fn.Extent.StartOffset)
+}
+
 function Test-K8HasLoopConstruct {
     param([Parameter(Mandatory)][string] $FunctionBodyText)
     # Parse just this function body as its own script and look for real loop
@@ -2463,7 +2498,8 @@ Assert-K8Test 'Completeness gate: the Range B R-OBS-05 required set is derived f
             'metadata-t0.txt', 'metadata.md', 'deviations.md'
         )
         $rangeBExtra = @(
-            'contract-output\qdisc-pre-fault.txt', 'contract-output\qdisc-post-fault.txt', 'contract-output\unrelated-mirror-filters.txt',
+            'contract-output\qdisc-pre-fault.txt', 'contract-output\fault-injection-command.txt',
+            'contract-output\qdisc-post-fault.txt', 'contract-output\unrelated-mirror-filters.txt',
             'contract-output\r-obs-05-mapping-response.json', 'contract-output\r-obs-05-mapping-gate.json',
             'environment\r-obs-05-query.json', 'contract-output\r-obs-05-response.json',
             'contract-output\r-obs-05-liveness.pcap', 'contract-output\r-obs-05-capture-lifecycle.json',
@@ -2513,6 +2549,209 @@ Assert-K8Test 'Frozen apparatus is untouched: CAPTURE_FILTER, its enforcement, a
     if ($apparatus -match 'r-obs-05' -or $apparatus -match 'liveness') { throw 'the auxiliary capture must NOT have been added to the frozen apparatus as a third scientific stage' }
     $lifecycle = Get-Content (Join-Path $Study01 'studies\study-01-negative-result\scripts\study01\capture_lifecycle.py') -Raw
     if ($lifecycle -notmatch [regex]::Escape('raise CaptureLifecycleError("capture filter is not the frozen filter")')) { throw 'the frozen filter enforcement was weakened' }
+}
+
+# --- 26. Range B fault-boundary evidence retention --------------------------
+#
+# Real VM STOP k8shakedown-rangeb-20260829-134837 (closed, not rescued):
+# "Scoring-input artifact completeness gate failed / missing:
+# contract-output\qdisc-post-fault.txt". The producer existed and its path
+# matched the consumer exactly. Root cause: `$post = docker exec ... 2>&1`
+# followed by `$post | Set-Content <path>` -- Set-Content creates NO FILE
+# when nothing is piped to it, and a SUCCESSFUL fault leaves
+# `tc filter show ... parent ffff:` with nothing to list. The more correctly
+# the frozen fault worked, the more certainly the artifact vanished. The
+# empty listing IS the frozen c2-dnp3-step4-range-b-fault-pilot.md SS4 check-2
+# success condition, so the tooling was discarding exactly the positive
+# evidence. Exit codes were also discarded and stderr merged into stdout, so
+# "empty because no filter remains" was indistinguishable from "empty
+# because tc failed".
+#
+# Classification: Shakedown tooling defect (evidence retention) + evidence
+# completeness defect. Not a scientific/runtime defect (the fault worked)
+# and not a frozen transcription gap (c2-dnp3-range-derivation.md SS3
+# already requires "Preserve pre/post command output ... in contract-output/").
+
+Assert-K8Test 'MEASURED: Set-Content creates no file for $null / empty-array input, but always does via -join or ConvertTo-Json (the exact cause and the exact fix)' {
+    $d = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-sc-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path $d | Out-Null
+    try {
+        $nothing = & cmd.exe /c "exit 0"
+        $nothing | Set-Content -Path (Join-Path $d 'a.txt') -Encoding utf8NoBOM
+        if (Test-Path (Join-Path $d 'a.txt')) { throw 'PowerShell behavior changed: a null pipeline now creates a file -- the fix rationale needs revisiting' }
+        @() | Set-Content -Path (Join-Path $d 'b.txt') -Encoding utf8NoBOM
+        if (Test-Path (Join-Path $d 'b.txt')) { throw 'PowerShell behavior changed: an empty array now creates a file' }
+        (@() -join "`n") | Set-Content -Path (Join-Path $d 'c.txt') -Encoding utf8NoBOM
+        if (-not (Test-Path (Join-Path $d 'c.txt'))) { throw '-join no longer guarantees file creation -- the fix would not hold' }
+    }
+    finally { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'REGRESSION: fault observation artifact is ALWAYS created -- pre/post, empty and non-empty stdout, with argv/exit/stdout_empty/timestamp retained' {
+    Import-Module $CommonPath -Force
+    foreach ($case in @(
+        @{ Name = 'pre: empty stdout + exit 0';    Argv = @('cmd.exe', '/c', 'exit 0');            Empty = $true;  Exit = 0; File = 'qdisc-pre-fault.txt' }
+        @{ Name = 'pre: nonempty stdout';          Argv = @('cmd.exe', '/c', 'echo qdisc ingress'); Empty = $false; Exit = 0; File = 'qdisc-pre-fault.txt' }
+        @{ Name = 'post: empty stdout + exit 0';   Argv = @('cmd.exe', '/c', 'exit 0');            Empty = $true;  Exit = 0; File = 'qdisc-post-fault.txt' }
+        @{ Name = 'post: nonempty stdout';         Argv = @('cmd.exe', '/c', 'echo filter parent ffff:'); Empty = $false; Exit = 0; File = 'qdisc-post-fault.txt' }
+    )) {
+        $d = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-fobs-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        try {
+            $obs = @(Invoke-K8FaultObservationCommand -Label $case.Name -Argv $case.Argv)
+            if ($obs[0].StdoutEmpty -ne $case.Empty) { throw "$($case.Name): stdout_empty was $($obs[0].StdoutEmpty), expected $($case.Empty)" }
+            if ($obs[0].ExitCode -ne $case.Exit) { throw "$($case.Name): exit was $($obs[0].ExitCode), expected $($case.Exit)" }
+            $path = Join-Path $d $case.File
+            Write-K8FaultObservationArtifact -Observations $obs -Path $path -Title 'test'
+            if (-not (Test-Path $path)) { throw "$($case.Name): the artifact was NOT created -- this is the exact real-VM defect" }
+            $text = Get-Content $path -Raw
+            foreach ($field in @('argv=', 'exit_code=', 'timestamp_utc=', 'stdout_empty=', '--- stdout ---', '--- stderr ---')) {
+                if ($text -notmatch [regex]::Escape($field)) { throw "$($case.Name): retained record is missing '$field'" }
+            }
+            if ($text -notmatch "stdout_empty=$($case.Empty.ToString().ToLowerInvariant())") { throw "$($case.Name): stdout_empty was not retained correctly" }
+        }
+        finally { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Assert-K8Test 'REGRESSION: empty stdout with a NONZERO exit fails closed -- never read as a successful "no remaining filter"' {
+    Import-Module $CommonPath -Force
+    foreach ($stage in @('pre-fault observation', 'post-fault observation')) {
+        $obs = @(Invoke-K8FaultObservationCommand -Label $stage -Argv @('cmd.exe', '/c', 'exit 3'))
+        if (-not $obs[0].StdoutEmpty) { throw 'fixture did not produce the empty-stdout case' }
+        $stopped = $false; $msg = ''
+        try { Assert-K8FaultObservationsSucceeded -Observations $obs -Stage $stage } catch { $stopped = $true; $msg = $_.Exception.Message }
+        if (-not $stopped) { throw "$stage : an empty stdout with exit 3 did not STOP" }
+        if ($msg -notmatch 'never read as success') { throw "the failure does not state the empty-vs-failed distinction: $msg" }
+    }
+}
+
+Assert-K8Test 'REGRESSION: fault observations separate stdout from stderr (never merged via 2>&1)' {
+    Import-Module $CommonPath -Force
+    $obs = @(Invoke-K8FaultObservationCommand -Label 'sep' -Argv @('cmd.exe', '/c', 'echo OUT& echo ERRLINE 1>&2'))
+    if ($obs[0].Stdout -notmatch 'OUT') { throw 'stdout was not captured' }
+    if ($obs[0].Stdout -match 'ERRLINE') { throw 'stderr leaked into stdout -- streams are being merged' }
+    if ($obs[0].Stderr -notmatch 'ERRLINE') { throw 'stderr was not retained' }
+    if ($obs[0].StdoutEmpty) { throw 'stdout_empty must be false when stdout has content' }
+    # Tokenizer-stripped: this function's own docstring legitimately quotes
+    # the old `2>&1` shape while describing the defect it replaced.
+    $code = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Invoke-K8FaultObservationCommand'
+    if ($code -match '2>&1') { throw 'the fault observation command merges streams via 2>&1' }
+    if ($code -notmatch 'Invoke-K8SeparatedNativeCapture') { throw 'the fault observation command no longer uses the separated-capture helper' }
+}
+
+Assert-K8Test 'Range B fault block: pre, fault-command and post are all retained via the observation helpers, artifact written BEFORE the exit assertion' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+    foreach ($needle in @('qdisc-pre-fault.txt', 'fault-injection-command.txt', 'qdisc-post-fault.txt')) {
+        if ($body -notmatch [regex]::Escape($needle)) { throw "fault-boundary artifact not written: $needle" }
+    }
+    # The fault command's own argv/exit/stdout/stderr must now be retained.
+    if ($body -notmatch "Label 'fault: tc qdisc del ingress") { throw 'the fault command itself is not retained as an observation' }
+    # No bare `$pre`/`$post` piping survives.
+    if ($body -match '\$post \| Set-Content' -or $body -match '\$pre \| Set-Content') { throw 'a bare (possibly empty) command result is still piped to Set-Content -- the real-VM defect is back' }
+    # Write-then-assert ordering, per artifact.
+    foreach ($pair in @(@('qdisc-pre-fault.txt', 'pre-fault observation'), @('qdisc-post-fault.txt', 'post-fault observation'))) {
+        $writeIdx = $body.IndexOf($pair[0])
+        $assertIdx = $body.IndexOf("-Stage '$($pair[1])'")
+        if ($writeIdx -lt 0 -or $assertIdx -lt 0) { throw "could not locate write/assert pair for $($pair[0])" }
+        if ($writeIdx -gt $assertIdx) { throw "$($pair[0]) is written AFTER its exit assertion -- a failing command would leave no diagnostic" }
+    }
+    # The frozen fault scope is unchanged: still exactly one qdisc del ingress.
+    $dels = @([regex]::Matches($body, "'tc',\s*'qdisc',\s*'del'"))
+    if ($dels.Count -ne 1) { throw "expected exactly one 'tc qdisc del' (the sole permitted fault); found $($dels.Count)" }
+}
+
+Assert-K8Test 'HORIZONTAL AUDIT: no Set-Content call site in the module can silently skip file creation on empty pipeline input' {
+    # Tokenizer-stripped source: docstrings in this module quote the old
+    # `$post | Set-Content` shape while explaining the defect it replaced.
+    $lines = ((Get-K8CommentStrippedSource -Path $CommonPath) -split "`n") | Where-Object { $_ -match '\|\s*Set-Content' }
+    if ($lines.Count -lt 15) { throw "the Set-Content audit found only $($lines.Count) call sites; the scan is probably broken" }
+    # A call site is safe when the piped expression is guaranteed to yield at
+    # least one object: -join / ConvertTo-Json / Out-String always do, and
+    # these named variables are always [string] (possibly empty, which still
+    # creates a file -- measured above).
+    $safeStringVars = @('$RawBody', '$collectorIdsJson', '$ruleQuery', '$collectorQuery', '$r0query', '$deviationsBody', '$ruleQueryText')
+    foreach ($line in $lines) {
+        $t = $line.Trim()
+        # A double/single-quoted string literal (including one with $-inter-
+        # polation) is a single [string] object, so Set-Content always writes
+        # a file -- even when every interpolated value is empty.
+        $safe = ($t -match '-join') -or ($t -match 'ConvertTo-Json') -or ($t -match 'Out-String') -or ($t.StartsWith('"')) -or ($t.StartsWith("'"))
+        if (-not $safe) { foreach ($v in $safeStringVars) { if ($t -match [regex]::Escape("$v | Set-Content") -or $t -match [regex]::Escape("$v |Set-Content")) { $safe = $true } } }
+        if (-not $safe) { throw "unsafe Set-Content call site (empty pipeline input would create no file): $t" }
+    }
+}
+
+Assert-K8Test 'REGRESSION: Write-K8ImageInventory retains compose-images.json / compose-ps.txt even when the command emits nothing' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Write-K8ImageInventory'
+    # Single-quoted: these needles contain literal $-variable text that must
+    # NOT be interpolated by this test.
+    foreach ($needle in @('(@($psJson) -join', '(@($composePsCapture.Stdout) -join')) {
+        if ($body -notmatch [regex]::Escape($needle)) { throw "Write-K8ImageInventory still pipes a possibly-empty capture directly to Set-Content: missing $needle" }
+    }
+    if ($body -match 'docker compose -p \$RunId -f \$ComposePath ps 2>&1') { throw 'compose-ps.txt is still captured with merged streams and no empty-input guard' }
+    # And the generic guarantee the fix relies on, measured directly.
+    $d = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-ii-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Force -Path $d | Out-Null
+    try {
+        $emptyCapture = @()
+        (@($emptyCapture) -join "`n") | Set-Content -Path (Join-Path $d 'x.json') -Encoding utf8NoBOM
+        if (-not (Test-Path (Join-Path $d 'x.json'))) { throw 'the -join guard does not create a file for an empty capture' }
+    }
+    finally { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'Range A non-regression: no fault-boundary artifact is produced or required for Range A' {
+    Import-Module $CommonPath -Force
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+    foreach ($artifact in @('qdisc-pre-fault.txt', 'fault-injection-command.txt', 'qdisc-post-fault.txt')) {
+        $idx = $body.IndexOf($artifact)
+        $before = $body.Substring(0, $idx)
+        if ($before.LastIndexOf("if (`$Range -eq 'b')") -lt 0) { throw "$artifact is written outside a Range B branch -- Range A runtime behavior would change" }
+    }
+    # And the completeness gate must not require them for Range A.
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-rangea-nofault-" + [guid]::NewGuid())
+    try {
+        foreach ($rel in @(
+            'ground-truth\independent-capture\c2-original-path.pcap', 'ground-truth\independent-capture\capture-lifecycle.json',
+            'ground-truth\independent-capture\capture-context.json', 'ground-truth\independent-capture\decoded-verification.json',
+            'ground-truth\sender-record.txt', 'ground-truth\procedure-conformance.json',
+            'sensor-input\mirror-capture\c2-mirror-sensor.pcap', 'sensor-input\mirror-capture\capture-lifecycle.json',
+            'sensor-input\mirror-capture\capture-context.json', 'sensor-input\mirror-capture\decoded-verification.json',
+            'collector-output\collector-response.json', 'collector-output\collector-index-mapping.json',
+            'collector-output\collector-selector-mapping-gate.json', 'collector-output\accepted-collector-hit-ids.json',
+            'rule-output\rule-response.json', 'rule-output\rule-index-mapping.json',
+            'rule-output\rule-selector-mapping-gate.json', 'rule-output\collector-rule-correlation.json',
+            'contract-output\gateway-interface-resolution.txt', 'contract-output\runtime-contract-record.md',
+            'environment\image-inventory.json', 'environment\collector-query.json', 'environment\rule-query.json',
+            'metadata-t0.txt', 'metadata.md', 'deviations.md'
+        )) {
+            $full = Join-Path $dir $rel
+            New-Item -ItemType Directory -Force -Path (Split-Path $full -Parent) | Out-Null
+            'x' | Set-Content $full
+        }
+        Test-K8ScoringInputArtifactCompleteness -Range a -RunEvidence $dir
+    }
+    finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'Completeness gate: the fault-command artifact is required for Range B and every required artifact name has a producer in the module' {
+    Import-Module $CommonPath -Force
+    $source = Get-Content $CommonPath -Raw
+    $completeness = (Get-Command Test-K8ScoringInputArtifactCompleteness).ScriptBlock.Ast.Extent.Text
+    if ($completeness -notmatch [regex]::Escape('contract-output\fault-injection-command.txt')) { throw 'the retained fault command is not a required Range B artifact' }
+    # Producer/consumer path agreement: every required artifact whose leaf name
+    # this module is responsible for writing must appear outside the gate too.
+    # (capture-context/sender-record/procedure-conformance come from the frozen
+    # Python CLI, so they are legitimately absent from this module's text.)
+    $frozenPythonProduced = @('capture-context.json', 'sender-record.txt', 'procedure-conformance.json', 'capture-lifecycle.json', 'c2-original-path.pcap', 'c2-mirror-sensor.pcap', 'metadata-t0.txt')
+    $required = [regex]::Matches($completeness, "'((?:contract-output|collector-output|rule-output|environment)\\[^']+)'") | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+    $outside = $source.Replace($completeness, '')
+    foreach ($r in $required) {
+        $leaf = Split-Path $r -Leaf
+        if ($frozenPythonProduced -contains $leaf) { continue }
+        if ($outside -notmatch [regex]::Escape($leaf)) { throw "required artifact '$r' has no producer anywhere in the module" }
+    }
 }
 
 # --- 7. Study01/ untouched on this branch -------------------------------------

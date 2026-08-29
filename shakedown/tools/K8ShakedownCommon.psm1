@@ -1128,6 +1128,91 @@ function Invoke-K8ElasticsearchRequest {
         -RequestLabel "Elasticsearch $Method $Endpoint"
 }
 
+function Invoke-K8FaultObservationCommand {
+    <#
+        Runs one Range B fault-boundary observation command and returns a
+        complete record of it: exact argv, exit code, separated stdout and
+        stderr, an explicit stdout_empty flag, and a UTC instant.
+
+        ROOT CAUSE this exists to fix (real VM STOP
+        k8shakedown-rangeb-20260829-134837, closed and not rescued): the
+        previous implementation did `$post = docker exec ... 2>&1` and then
+        `$post | Set-Content <path>`. PowerShell's Set-Content creates NO
+        FILE when nothing is piped to it, and a successful fault leaves
+        `tc filter show ... parent ffff:` with nothing to list -- so $post
+        was $null and contract-output/qdisc-post-fault.txt was silently
+        never written. The more correctly the frozen fault worked, the more
+        certainly the artifact vanished. Confirmed by direct measurement:
+        `$null | Set-Content` and `@() | Set-Content` create no file, while
+        `-join`/ConvertTo-Json results always do.
+
+        It also discarded the exit code and merged stderr into stdout, so
+        "empty because no filter remains" (the frozen
+        c2-dnp3-step4-range-b-fault-pilot.md SS4 check 2 success condition)
+        was indistinguishable from "empty because tc failed".
+    #>
+    param([Parameter(Mandatory)][string[]] $Argv, [Parameter(Mandatory)][string] $Label)
+    $timestamp = (Get-Date).ToUniversalTime().ToString('o')
+    $capture = Invoke-K8SeparatedNativeCapture -FilePath $Argv[0] -ArgumentList @($Argv[1..($Argv.Count - 1)])
+    $stdout = ($capture.Stdout | Out-String)
+    return [pscustomobject]@{
+        Label = $Label; Argv = ($Argv -join ' '); ExitCode = $capture.ExitCode
+        Stdout = $stdout; Stderr = $capture.Stderr
+        StdoutEmpty = [string]::IsNullOrWhiteSpace($stdout); TimestampUtc = $timestamp
+    }
+}
+
+function Write-K8FaultObservationArtifact {
+    <#
+        Writes a fault-boundary observation artifact. ALWAYS creates the
+        file, including when every observation had empty stdout -- the
+        emptiness is itself a retained observation, never a missing
+        artifact.
+
+        The final `-join` is load-bearing, not cosmetic: a joined string is
+        a single pipeline item, so Set-Content always produces a file, which
+        a bare (possibly $null / empty-array) command result does not.
+    #>
+    param(
+        [Parameter(Mandatory)][object[]] $Observations,
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Title
+    )
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("# $Title")
+    $lines.Add('# Frozen basis: c2-dnp3-range-derivation.md SS3 -- "Preserve pre/post command output and the resolved interface in contract-output/".')
+    $lines.Add('# An EMPTY stdout is a retained observation, not a missing artifact. For the post-fault')
+    $lines.Add('# `tc filter show ... parent ffff:` it is exactly the frozen c2-dnp3-step4-range-b-fault-pilot.md')
+    $lines.Add('# SS4 check 2 result ("shows no remaining target-segment mirror filter"). exit_code is what')
+    $lines.Add('# distinguishes that from a command failure; this runner STOPs on any nonzero exit.')
+    $lines.Add('# This record retains observation only. It computes no Pass/Fail and no scored verdict.')
+    foreach ($o in $Observations) {
+        $lines.Add('')
+        $lines.Add("## $($o.Label)")
+        $lines.Add("argv=$($o.Argv)")
+        $lines.Add("exit_code=$($o.ExitCode)")
+        $lines.Add("timestamp_utc=$($o.TimestampUtc)")
+        $lines.Add("stdout_empty=$($o.StdoutEmpty.ToString().ToLowerInvariant())")
+        $lines.Add('--- stdout ---')
+        $lines.Add($o.Stdout.TrimEnd())
+        $lines.Add('--- stderr ---')
+        $lines.Add($o.Stderr.TrimEnd())
+    }
+    ($lines.ToArray() -join "`n") | Set-Content -Path $Path -Encoding utf8NoBOM
+}
+
+function Assert-K8FaultObservationsSucceeded {
+    <# Fail-close on a nonzero exit. An empty stdout must never be read as
+       success when the command that produced it actually failed. Callers
+       write the artifact BEFORE calling this, so the diagnostic survives. #>
+    param([Parameter(Mandatory)][object[]] $Observations, [Parameter(Mandatory)][string] $Stage)
+    foreach ($o in $Observations) {
+        if ($o.ExitCode -ne 0) {
+            throw "Range B $Stage STOP: '$($o.Argv)' exited $($o.ExitCode). An empty stdout is never read as success when the command itself failed. stderr: $($o.Stderr.Trim())"
+        }
+    }
+}
+
 function Assert-K8UnrelatedMirrorFilter {
     <#
         Interface enumeration uses `ip -o link show` and extracts each name
@@ -2090,7 +2175,10 @@ function Test-K8ScoringInputArtifactCompleteness {
     )
     if ($Range -eq 'b') {
         $required += @(
+            # c2-dnp3-range-derivation.md SS3: "Preserve pre/post command
+            # output and the resolved interface in contract-output/."
             'contract-output\qdisc-pre-fault.txt'
+            'contract-output\fault-injection-command.txt'
             'contract-output\qdisc-post-fault.txt'
             'contract-output\unrelated-mirror-filters.txt'
             # Derived from the frozen k6-r-obs-05-collector-query-contract.md
@@ -2168,7 +2256,7 @@ function Invoke-K8ShakedownRangeAB {
         '--shell-probe', $PSVersionTable.PSVersion.ToString(),
         '--path-probe', '/study/traffic/send_direct_operate.py', '/data/c2-original-path.pcap', '/data/c2-mirror-sensor.pcap'
     ) -Description 'execution preflight gate (Docker-free)' |
-        ForEach-Object { $_.Output | Set-Content -Path (Join-Path $envDir 'preflight.txt') -Encoding utf8NoBOM }
+        ForEach-Object { (@($_.Output) -join "`n") | Set-Content -Path (Join-Path $envDir 'preflight.txt') -Encoding utf8NoBOM }
 
     # The frozen preflight requires every runtime evidence directory to be
     # empty at invocation time. Retain the generated Compose hash only after
@@ -2228,14 +2316,40 @@ function Invoke-K8ShakedownRangeAB {
     if ($Range -eq 'b') {
         Write-K8ShakedownLog -Level STEP -Message '--- Range B fault: deleting ingress qdisc on the resolved gateway interface ---'
         $contractDir = Join-Path $RunEvidence 'contract-output'
-        $pre = @()
-        $pre += docker exec $gw.Router tc qdisc show dev $gw.Interface 2>&1
-        $pre += docker exec $gw.Router tc filter show dev $gw.Interface parent ffff: 2>&1
-        $pre | Set-Content -Path (Join-Path $contractDir 'qdisc-pre-fault.txt') -Encoding utf8NoBOM
-        Invoke-K8ShakedownCommand -FilePath 'docker' -ArgumentList @('exec', $gw.Router, 'tc', 'qdisc', 'del', 'dev', $gw.Interface, 'ingress') `
-            -Description 'Range B fault: delete ingress qdisc (the sole permitted fault)'
-        $post = docker exec $gw.Router tc filter show dev $gw.Interface parent ffff: 2>&1
-        $post | Set-Content -Path (Join-Path $contractDir 'qdisc-post-fault.txt') -Encoding utf8NoBOM
+        New-Item -ItemType Directory -Force -Path $contractDir | Out-Null
+
+        # Frozen c2-dnp3-range-derivation.md SS3 command order, each observation
+        # now retained with argv/exit/stdout/stderr/stdout_empty/timestamp.
+        # The artifact is written BEFORE the exit-code assertion so a failing
+        # command still leaves its own diagnostic behind.
+        $preObservations = @(
+            (Invoke-K8FaultObservationCommand -Label 'pre-fault: tc qdisc show' -Argv @('docker', 'exec', $gw.Router, 'tc', 'qdisc', 'show', 'dev', $gw.Interface))
+            (Invoke-K8FaultObservationCommand -Label 'pre-fault: tc filter show parent ffff:' -Argv @('docker', 'exec', $gw.Router, 'tc', 'filter', 'show', 'dev', $gw.Interface, 'parent', 'ffff:'))
+        )
+        Write-K8FaultObservationArtifact -Observations $preObservations -Path (Join-Path $contractDir 'qdisc-pre-fault.txt') -Title 'Range B pre-fault observation (target gateway interface)'
+        Assert-K8FaultObservationsSucceeded -Observations $preObservations -Stage 'pre-fault observation'
+
+        # The sole permitted fault. Its own argv/exit/stdout/stderr are now
+        # retained too (frozen SS3 "Preserve pre/post command output"); this
+        # adds no new scientific acceptance condition.
+        $faultObservations = @(
+            (Invoke-K8FaultObservationCommand -Label 'fault: tc qdisc del ingress (the sole permitted fault)' -Argv @('docker', 'exec', $gw.Router, 'tc', 'qdisc', 'del', 'dev', $gw.Interface, 'ingress'))
+        )
+        Write-K8FaultObservationArtifact -Observations $faultObservations -Path (Join-Path $contractDir 'fault-injection-command.txt') -Title 'Range B fault injection command'
+        Assert-K8FaultObservationsSucceeded -Observations $faultObservations -Stage 'fault injection'
+
+        # Post-fault. An empty stdout here is the frozen SS4 check-2 success
+        # shape ("no remaining target-segment mirror filter"), NOT a missing
+        # artifact -- the file is always written and records stdout_empty.
+        $postObservations = @(
+            (Invoke-K8FaultObservationCommand -Label 'post-fault: tc filter show parent ffff:' -Argv @('docker', 'exec', $gw.Router, 'tc', 'filter', 'show', 'dev', $gw.Interface, 'parent', 'ffff:'))
+        )
+        Write-K8FaultObservationArtifact -Observations $postObservations -Path (Join-Path $contractDir 'qdisc-post-fault.txt') -Title 'Range B post-fault observation (target gateway interface)'
+        Assert-K8FaultObservationsSucceeded -Observations $postObservations -Stage 'post-fault observation'
+        if ($postObservations[0].StdoutEmpty) {
+            Write-K8ShakedownLog -Message 'Range B post-fault: tc filter show returned exit 0 with no remaining filter on the target interface. Retained as an observation (stdout_empty=true); the scored Runtime Contract judgment remains the operator''s at scoring-input.'
+        }
+
         Assert-K8UnrelatedMirrorFilter -Gateway $gw -RunEvidence $RunEvidence
     }
 
@@ -2784,8 +2898,13 @@ function Write-K8ImageInventory {
     $imagesCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'images', '--format', 'json')
     if ($imagesCapture.ExitCode -ne 0) { throw "docker compose images failed (exit $($imagesCapture.ExitCode)); image inventory is mandatory. stderr: $($imagesCapture.Stderr.Trim())" }
     $psJson = $imagesCapture.Stdout
-    $psJson | Set-Content -Path (Join-Path $envDir 'compose-images.json') -Encoding utf8NoBOM
-    (docker compose -p $RunId -f $ComposePath ps 2>&1) | Set-Content -Path (Join-Path $envDir 'compose-ps.txt') -Encoding utf8NoBOM
+    # `-join` (not a bare pipeline): Set-Content creates NO FILE when nothing
+    # is piped to it, so an exit-0 command that happened to emit nothing would
+    # silently leave no artifact at all -- the same cause class as the Range B
+    # post-fault retention defect.
+    (@($psJson) -join "`n") | Set-Content -Path (Join-Path $envDir 'compose-images.json') -Encoding utf8NoBOM
+    $composePsCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps')
+    (@($composePsCapture.Stdout) -join "`n") | Set-Content -Path (Join-Path $envDir 'compose-ps.txt') -Encoding utf8NoBOM
 
     # NOT wrapped in @() -- ConvertFrom-K8ComposePsJson already force-returns
     # a real array; see its own return statement.
