@@ -536,6 +536,92 @@ function Wait-K8ElasticsearchReady {
     throw "Elasticsearch application-readiness gate timed out after ${TimeoutSeconds}s ($($attempts.Count) attempt(s); none returned HTTP 2xx with a parsed _cluster/health body whose status was yellow or green). Not proceeding to capture/trigger. See environment/elasticsearch-readiness.json. This is the pre-trigger gate for the curl-exit-7 class of failure; it is not retried here, and the fixed Collector/Rule/R-OBS-05 requests downstream are still never retried either."
 }
 
+function Get-K8Dnp3OperationalCanaryHits {
+    <#
+        PRE-TRIGGER READINESS CANARY -- not the scientific R-OBS-05 request.
+
+        Independent review round 3 found that "log_structurer's tshark and
+        bulk_loader.py processes are both alive" (round 2's fix) still does
+        not prove documents are actually landing in ot-logs-dnp3-*:
+        platform/generators/assets/bulk_loader.py's own flush() catches
+        every _bulk POST failure (HTTPError and bare Exception alike),
+        prints to stderr, and keeps running -- a process that is alive but
+        silently failing every flush looks identical, from a process-table
+        check alone, to one that is delivering correctly.
+
+        This queries ot-logs-dnp3-* for the cc_scada_master (10.1.10.10,
+        link source 1) <-> sub_c_rtu (10.1.40.10, link source 20) periodic
+        DNP3 Integrity Poll -- genuine, pre-existing normal-operations
+        traffic (an ~8s background interval; see
+        k6-r-obs-05-collector-query-contract.md SS1/SS3, whose own frozen
+        "unrelated flow" selector this reuses verbatim as VALUES only, for
+        an entirely different purpose). No fixed selector/index pattern/
+        query shape is invented here -- the field names and addresses are
+        copied from that already-frozen contract, not guessed.
+
+        This is deliberately NOT the scientific R-OBS-05 evidence request:
+          - No T0 window (T0 does not exist yet -- this runs before the
+            sender). Sorted `_doc desc` (insertion order) instead, exactly
+            as scenarios/legacy-power-grid-signals/zone_violation.py itself
+            does for the same "give me whatever is most recently indexed"
+            need.
+          - Result is NOT retained under contract-output/ and is not an
+            R-OBS-05 artifact. It exists only to prove the pipeline is
+            functionally delivering before the one scientific trigger.
+          - Never touches, and is asserted never to match, the target
+            attack selector (10.1.20.11 -> 10.1.10.10, fc=5, link
+            1024->1): every returned hit's source IP/function code is
+            checked against that tuple and this throws if it ever matches,
+            rather than silently trusting the query filter alone to keep
+            them disjoint.
+          - Executed once per poll attempt by the caller's own loop; it is
+            not itself retried past that caller's timeout, and it never
+            substitutes for or is confused with the fixed, exactly-once
+            Collector/Rule/R-OBS-05 requests in Invoke-K8ElasticsearchRequest.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string] $ComposePath
+    )
+    $container = (docker compose -p $RunId -f $ComposePath ps -q elasticsearch | Out-String).Trim()
+    if ([string]::IsNullOrWhiteSpace($container)) {
+        throw 'elasticsearch container could not be resolved for the operational-canary readiness check'
+    }
+    # Same cc_scada_master<->sub_c_rtu selector VALUES as
+    # k6-r-obs-05-collector-query-contract.md SS3, no time window, sorted by
+    # insertion order (matching zone_violation.py's own approach) rather
+    # than by a T0 this check runs before.
+    $query = '{"size":3,"track_total_hits":true,"sort":[{"_doc":"desc"}],"query":{"bool":{"minimum_should_match":1,"should":[{"bool":{"filter":[{"term":{"layers.ip.ip_ip_src.keyword":"10.1.10.10"}},{"term":{"layers.ip.ip_ip_dst.keyword":"10.1.40.10"}},{"term":{"layers.tcp.tcp_tcp_dstport.keyword":"20000"}},{"terms":{"layers.dnp3.dnp3_dnp3_al_func.keyword":["1","5"]}},{"term":{"layers.dnp3.dnp3_dnp3_src.keyword":"1"}},{"term":{"layers.dnp3.dnp3_dnp3_dst.keyword":"20"}}]}},{"bool":{"filter":[{"term":{"layers.ip.ip_ip_src.keyword":"10.1.40.10"}},{"term":{"layers.ip.ip_ip_dst.keyword":"10.1.10.10"}},{"term":{"layers.tcp.tcp_tcp_srcport.keyword":"20000"}},{"term":{"layers.dnp3.dnp3_dnp3_al_func.keyword":"129"}},{"term":{"layers.dnp3.dnp3_dnp3_src.keyword":"20"}},{"term":{"layers.dnp3.dnp3_dnp3_dst.keyword":"1"}}]}}]}}}'
+    $marker = 'K8_HTTP_STATUS'
+    $raw = (docker exec $container curl -sS --max-time 5 -X POST 'http://localhost:9200/ot-logs-dnp3-*/_search' -H 'Content-Type: application/json' --data-binary $query -w "`n${marker}:%{http_code}" 2>&1 | Out-String)
+    $curlExit = $LASTEXITCODE
+    if ($curlExit -ne 0 -or $raw -notmatch "(?s)^(.*)\r?\n${marker}:(\d+)\s*$") {
+        throw "operational-canary query transport failure (curl exit $curlExit): $raw"
+    }
+    $bodyText = $Matches[1]
+    $httpStatus = $Matches[2]
+    if ($httpStatus -notmatch '^2[0-9][0-9]$') {
+        throw "operational-canary query returned HTTP ${httpStatus}: $bodyText"
+    }
+    $parsed = $bodyText | ConvertFrom-Json
+    $hitsBlock = Get-K8ObjectPropertyValue -Object $parsed -Name 'hits'
+    $hits = @(Get-K8ObjectPropertyValue -Object $hitsBlock -Name 'hits')
+    $totalBlock = Get-K8ObjectPropertyValue -Object $hitsBlock -Name 'total'
+    $total = [int](Get-K8ObjectPropertyValue -Object $totalBlock -Name 'value')
+    foreach ($hit in $hits) {
+        $source = Get-K8ObjectPropertyValue -Object $hit -Name '_source'
+        $layers = Get-K8ObjectPropertyValue -Object $source -Name 'layers'
+        $ipLayer = Get-K8ObjectPropertyValue -Object $layers -Name 'ip'
+        $dnp3Layer = Get-K8ObjectPropertyValue -Object $layers -Name 'dnp3'
+        $srcIp = Get-K8ObjectPropertyValue -Object $ipLayer -Name 'ip_ip_src'
+        $func = Get-K8ObjectPropertyValue -Object $dnp3Layer -Name 'dnp3_dnp3_al_func'
+        if ($srcIp -eq '10.1.20.11' -and $func -eq '5') {
+            throw 'operational-canary query unexpectedly matched the TARGET scientific selector (src=10.1.20.11, fc=5) -- the canary selector must stay disjoint from the target attack flow by construction. STOP.'
+        }
+    }
+    return [pscustomobject]@{ TotalHits = $total; Hits = $hits; RawBody = $bodyText }
+}
+
 function Wait-K8LogStructurerReady {
     <#
         APPLICATION-level readiness gate for log_structurer's DNP3
@@ -572,6 +658,17 @@ function Wait-K8LogStructurerReady {
         their real /proc/PID/cmdline never contains the source's own
         double-quote characters -- confirmed by reading compose.py's command
         assembly, not assumed.
+
+        Process-alive is NECESSARY but not SUFFICIENT (independent review
+        round 3, BLOCKER): platform/generators/assets/bulk_loader.py's own
+        flush() catches every Elasticsearch _bulk POST failure (HTTPError
+        and any other Exception alike), prints it to stderr, and keeps
+        running -- so tshark+bulk_loader can both be alive while zero
+        documents are actually reaching ot-logs-dnp3-*. PASS therefore also
+        requires Get-K8Dnp3OperationalCanaryHits to find at least one
+        real, pre-existing, non-target-selector DNP3 document -- proof the
+        FULL observe -> structure -> index chain is functioning, not just
+        that its processes started.
     #>
     param(
         [Parameter(Mandatory)][string] $RunId,
@@ -593,18 +690,28 @@ function Wait-K8LogStructurerReady {
         $dump = @((docker exec $container sh -lc $probe 2>&1 | Out-String) -split "`n")
         $tsharkLive = [bool]($dump | Where-Object { $_ -match 'tshark' -and $_ -match 'dnp3' })
         $bulkLoaderLive = [bool]($dump | Where-Object { $_ -match 'bulk_loader\.py' -and $_ -match 'dnp3' })
-        $attempts += [ordered]@{ attempt_utc=$attemptStart; tshark_dnp3_process_found=$tsharkLive; bulk_loader_dnp3_process_found=$bulkLoaderLive }
-        if ($tsharkLive -and $bulkLoaderLive) {
-            [ordered]@{ gate='log-structurer-dnp3-pipeline-readiness'; result='PASS'; container=$container; attempts=$attempts } |
-                ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $envDir 'log-structurer-readiness.json') -Encoding utf8NoBOM
-            Write-K8ShakedownLog -Message "log_structurer DNP3 tshark|bulk_loader pipeline PASS after $($attempts.Count) attempt(s)."
+        $canaryHitCount = 0
+        $canaryError = $null
+        try {
+            $canary = Get-K8Dnp3OperationalCanaryHits -RunId $RunId -ComposePath $ComposePath
+            $canaryHitCount = $canary.TotalHits
+        }
+        catch { $canaryError = $_.Exception.Message }
+        $attempts += [ordered]@{
+            attempt_utc=$attemptStart; tshark_dnp3_process_found=$tsharkLive; bulk_loader_dnp3_process_found=$bulkLoaderLive
+            operational_canary_hit_count=$canaryHitCount; operational_canary_query_error=$canaryError
+        }
+        if ($tsharkLive -and $bulkLoaderLive -and $canaryHitCount -gt 0) {
+            [ordered]@{ gate='log-structurer-dnp3-functional-readiness'; result='PASS'; container=$container; attempts=$attempts } |
+                ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $envDir 'log-structurer-readiness.json') -Encoding utf8NoBOM
+            Write-K8ShakedownLog -Message "log_structurer functional readiness PASS after $($attempts.Count) attempt(s): pipeline processes live AND $canaryHitCount operational-canary document(s) observed in ot-logs-dnp3-*."
             return
         }
         Start-Sleep -Seconds $PollSeconds
     }
-    [ordered]@{ gate='log-structurer-dnp3-pipeline-readiness'; result='TIMEOUT'; container=$container; attempts=$attempts } |
-        ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $envDir 'log-structurer-readiness.json') -Encoding utf8NoBOM
-    throw "log_structurer's DNP3 tshark|bulk_loader pipeline did not start within ${TimeoutSeconds}s (its apt-get tshark/python3 install may still be running). Not proceeding to capture/trigger -- a Collector query against an unstarted structuring pipeline would return an empty/incomplete result that looks like a legitimate negative finding rather than a startup race. See environment/log-structurer-readiness.json."
+    [ordered]@{ gate='log-structurer-dnp3-functional-readiness'; result='TIMEOUT'; container=$container; attempts=$attempts } |
+        ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $envDir 'log-structurer-readiness.json') -Encoding utf8NoBOM
+    throw "log_structurer's DNP3 tshark|bulk_loader pipeline did not reach functional readiness within ${TimeoutSeconds}s (process-alive and/or the operational-canary document check in ot-logs-dnp3-* never both held -- see environment/log-structurer-readiness.json for which). Not proceeding to capture/trigger -- a Collector query against a non-functional structuring pipeline would return an empty/incomplete result that looks like a legitimate negative finding rather than a startup race."
 }
 
 function Wait-K8ZoneDetectorReady {
@@ -631,8 +738,32 @@ function Wait-K8ZoneDetectorReady {
         Mechanism: same /proc/*/cmdline approach as
         Wait-K8LogStructurerReady, for the same reason (this image's own
         startup script installs only what `requires` declares, not procps).
-        PASS requires a live process whose argv contains both 'python3' and
-        'signal-1-zone-violation'.
+
+        Process-alive is NECESSARY but not SUFFICIENT (independent review
+        round 3, BLOCKER):
+        scenarios/legacy-power-grid-signals/zone_violation.py's own
+        poll_once() wraps its Elasticsearch search in
+        `except requests.exceptions.RequestException: ... return 0` --
+        "sidecar must not crash" is the stated design intent, so a plugin
+        that cannot reach Elasticsearch at all keeps running forever,
+        indistinguishable by process state alone from one that is actually
+        polling successfully. PASS therefore also requires an HTTP
+        connectivity check issued FROM WITHIN the zone_detector container
+        itself (not from the elasticsearch container, not from the
+        Shakedown host) against that container's own resolved $ES_URL (read
+        from its actual environment, falling back to the script's own
+        documented default only if unset) -- proving the same network path
+        the real plugin process depends on, not a proxy for it. Uses
+        `python3 -c` with stdlib `urllib.request` only, not curl: this
+        image is python:3.11-slim with no guarantee curl was ever
+        installed (only what `plugin.requires` declares is pip-installed;
+        curl is not a Python package).
+
+        Best-effort, non-blocking: the container's recent stderr is also
+        checked for zone_violation's own "search failed"/"bulk write
+        failed" lines and recorded (not gated on) -- a transient old error
+        from before Elasticsearch itself became ready is expected and must
+        not by itself fail a run that is otherwise functionally ready now.
     #>
     param(
         [Parameter(Mandatory)][string] $RunId,
@@ -653,18 +784,38 @@ function Wait-K8ZoneDetectorReady {
         $attemptStart = (Get-Date).ToUniversalTime().ToString('o')
         $dump = @((docker exec $container sh -lc $probe 2>&1 | Out-String) -split "`n")
         $pluginLive = [bool]($dump | Where-Object { $_ -match 'python3' -and $_ -match 'signal-1-zone-violation' })
-        $attempts += [ordered]@{ attempt_utc=$attemptStart; signal1_plugin_process_found=$pluginLive }
-        if ($pluginLive) {
-            [ordered]@{ gate='zone-detector-signal1-plugin-readiness'; result='PASS'; container=$container; attempts=$attempts } |
-                ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $envDir 'zone-detector-readiness.json') -Encoding utf8NoBOM
-            Write-K8ShakedownLog -Message "zone_detector Signal1 plugin process PASS after $($attempts.Count) attempt(s)."
+
+        # Resolve the container's OWN configured ES_URL (zone_violation.py's
+        # own default if unset), then check connectivity from inside it.
+        $esUrlRaw = (docker exec $container sh -lc 'printf "%s" "${ES_URL:-http://elasticsearch:9200}"' 2>&1 | Out-String).Trim()
+        $esUrl = if ($esUrlRaw) { $esUrlRaw } else { 'http://elasticsearch:9200' }
+        $connectivityScript = "import sys,urllib.request`ntry:`n r=urllib.request.urlopen('$esUrl/_cluster/health',timeout=5)`n sys.stdout.write(str(r.status))`nexcept Exception as e:`n sys.stdout.write('ERROR:'+str(e))`n sys.exit(1)`n"
+        $connOut = (docker exec $container python3 -c $connectivityScript 2>&1 | Out-String).Trim()
+        $connExit = $LASTEXITCODE
+        $connectivityOk = ($connExit -eq 0 -and $connOut -match '^2[0-9][0-9]$')
+
+        $recentLog = (docker logs --tail 20 $container 2>&1 | Out-String)
+        $recentLogHasError = [bool]($recentLog -match 'search failed|bulk write failed')
+
+        $attempts += [ordered]@{
+            attempt_utc=$attemptStart; signal1_plugin_process_found=$pluginLive
+            es_url_used=$esUrl; zone_detector_to_es_connectivity_ok=$connectivityOk; zone_detector_to_es_result=$connOut
+            # Recorded for review, not gated on: a transient old error from
+            # before Elasticsearch itself became ready must not by itself
+            # fail a run that is otherwise functionally ready now.
+            recent_log_tail_error_seen_best_effort_non_blocking=$recentLogHasError
+        }
+        if ($pluginLive -and $connectivityOk) {
+            [ordered]@{ gate='zone-detector-functional-readiness'; result='PASS'; container=$container; attempts=$attempts } |
+                ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $envDir 'zone-detector-readiness.json') -Encoding utf8NoBOM
+            Write-K8ShakedownLog -Message "zone_detector functional readiness PASS after $($attempts.Count) attempt(s): plugin process live AND HTTP $connOut from inside the container to $esUrl."
             return
         }
         Start-Sleep -Seconds $PollSeconds
     }
-    [ordered]@{ gate='zone-detector-signal1-plugin-readiness'; result='TIMEOUT'; container=$container; attempts=$attempts } |
-        ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $envDir 'zone-detector-readiness.json') -Encoding utf8NoBOM
-    throw "zone_detector's signal-1-zone-violation plugin process did not start within ${TimeoutSeconds}s (its pip install may still be running). Not proceeding to capture/trigger -- a Rule query against an unstarted detector would return zero hits indistinguishable from a genuine 'No alert' result. See environment/zone-detector-readiness.json."
+    [ordered]@{ gate='zone-detector-functional-readiness'; result='TIMEOUT'; container=$container; attempts=$attempts } |
+        ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $envDir 'zone-detector-readiness.json') -Encoding utf8NoBOM
+    throw "zone_detector did not reach functional readiness within ${TimeoutSeconds}s (plugin-process-alive and/or its own container-to-Elasticsearch connectivity never both held -- see environment/zone-detector-readiness.json for which). Not proceeding to capture/trigger -- a Rule query against a detector that cannot reach Elasticsearch would return zero hits indistinguishable from a genuine 'No alert' result."
 }
 
 function Complete-K8ElasticsearchResponse {

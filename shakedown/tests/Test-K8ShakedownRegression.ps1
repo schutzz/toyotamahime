@@ -607,6 +607,16 @@ try {
         @{ Name = 'elasticsearch: HTTP 200 with no status field -> STOP (proves body is actually parsed)'; State = 'es-http-200-no-body-status'; Func = 'Wait-K8ElasticsearchReady'; ExpectPass = $false }
         @{ Name = 'elasticsearch: cluster status yellow -> PASS';                    State = 'es-ready-yellow';      Func = 'Wait-K8ElasticsearchReady'; ExpectPass = $true }
         @{ Name = 'elasticsearch: cluster status green -> PASS';                     State = 'es-ready-green';       Func = 'Wait-K8ElasticsearchReady'; ExpectPass = $true }
+        # Round 3: process-alive is necessary but not sufficient -- bulk_loader.py
+        # catches every _bulk POST failure and keeps running (functional readiness).
+        @{ Name = 'log_structurer: processes alive but operational canary ABSENT (bulk_loader silently failing) -> STOP'; State = 'canary-absent'; Func = 'Wait-K8LogStructurerReady'; ExpectPass = $false }
+        @{ Name = 'log_structurer: processes alive but canary query transport error -> STOP';   State = 'canary-transport-error';        Func = 'Wait-K8LogStructurerReady'; ExpectPass = $false }
+        @{ Name = 'log_structurer: processes alive AND operational canary PRESENT -> PASS';      State = 'canary-present';                Func = 'Wait-K8LogStructurerReady'; ExpectPass = $true }
+        @{ Name = 'log_structurer: canary query matching the TARGET selector -> STOP (safety net, never trusted as readiness)'; State = 'canary-matches-target-selector'; Func = 'Wait-K8LogStructurerReady'; ExpectPass = $false }
+        # zone_violation.py catches every RequestException and returns 0 --
+        # plugin-process-alive is necessary but not sufficient either.
+        @{ Name = 'zone_detector: plugin alive but its OWN container cannot reach Elasticsearch -> STOP'; State = 'detector-connectivity-fail'; Func = 'Wait-K8ZoneDetectorReady'; ExpectPass = $false }
+        @{ Name = 'zone_detector: plugin alive AND connectivity confirmed from inside the container -> PASS'; State = 'detector-connectivity-ok'; Func = 'Wait-K8ZoneDetectorReady'; ExpectPass = $true }
     )
     foreach ($case in $cases) {
         Assert-K8Test $case.Name {
@@ -617,6 +627,41 @@ try {
                 throw "expected $(if ($case.ExpectPass) {'PASS'} else {'STOP'}) but got $(if ($passed) {'PASS'} else {'STOP'})"
             }
         }
+    }
+
+    Assert-K8Test 'Operational canary selector is disjoint from the target scientific flow, and self-checked, not just filtered' {
+        $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Get-K8Dnp3OperationalCanaryHits'
+        foreach ($needle in @('10.1.10.10', '10.1.40.10')) {
+            if ($body -notmatch [regex]::Escape($needle)) { throw "canary query does not reference the documented cc_scada_master<->sub_c_rtu addresses ($needle missing)" }
+        }
+        if ($body -notmatch [regex]::Escape("'10.1.20.11'") -or $body -notmatch "throw 'operational-canary query unexpectedly matched the TARGET") {
+            throw 'canary does not self-check that a returned hit never matches the target selector (10.1.20.11, fc=5) -- must not rely on the query filter alone'
+        }
+        if ($body -match '"gte"|"lte"|WINDOW_START|WINDOW_END') {
+            throw 'canary query appears to use a T0 time window -- T0 does not exist yet at this point in the pipeline, and this must stay a wall-clock/insertion-order check, not a scientific-window one'
+        }
+    }
+
+    Assert-K8Test 'zone_detector connectivity check runs FROM INSIDE the zone_detector container, not from Elasticsearch or the host' {
+        $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Wait-K8ZoneDetectorReady'
+        if ($body -notmatch "docker exec \`$container python3 -c") { throw 'connectivity check is not executed via docker exec against $container (the zone_detector container)' }
+        if ($body -notmatch 'urllib\.request') { throw 'connectivity check does not use a real HTTP request from inside the container' }
+        if ($body -match "ps -q elasticsearch.*python3|elasticsearch.*docker exec.*urllib") { throw 'connectivity check appears to run against the elasticsearch container instead of zone_detector -- this must prove the path FROM zone_detector' }
+    }
+
+    Assert-K8Test 'Scientific Elasticsearch requests still have no retry/loop, and the new canary/connectivity checks are not confused with them' {
+        foreach ($name in @('Invoke-K8ElasticsearchRequest', 'Complete-K8ElasticsearchResponse')) {
+            $body = Get-K8FunctionBodyText -Path $CommonPath -Name $name
+            if (Test-K8HasLoopConstruct -FunctionBodyText $body) { throw "$name contains a loop construct -- must remain exactly-once" }
+            if ($body -match 'Get-K8Dnp3OperationalCanaryHits') { throw "$name must not call the pre-trigger canary helper -- they must stay entirely separate code paths" }
+        }
+        # The canary helper is a pure query-and-return function: it must
+        # perform no file I/O of its own at all (the docstring itself
+        # legitimately says "contract-output" in prose explaining what this
+        # is NOT, which would false-positive a whole-body text search for
+        # that word -- so check for the absence of any write call instead).
+        $canaryBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Get-K8Dnp3OperationalCanaryHits'
+        if ($canaryBody -match 'Set-Content|Out-File|Add-Content') { throw 'the pre-trigger canary helper performs file I/O of its own -- it must only query and return, never retain scientific-looking evidence itself' }
     }
 
     Assert-K8Test 'All three application-readiness gates retain their result artifact under environment/' {
