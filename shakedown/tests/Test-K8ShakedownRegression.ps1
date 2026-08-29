@@ -348,6 +348,45 @@ Assert-K8Test 'compose build output is redirected to a per-run runtime log with 
     if (-not $upCall.Success) { throw 'docker compose up --build is not routed through the quiet logged command' }
 }
 
+Assert-K8Test 'Elasticsearch request uses old-curl-compatible single request status/body separation' {
+    $tokens = $null; $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($CommonPath, [ref]$tokens, [ref]$errors)
+    $function = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-K8ElasticsearchRequest' }, $true)
+    if (-not $function) { throw 'Invoke-K8ElasticsearchRequest not found' }
+    $text = $function.Extent.Text
+    if ($text -match '--fail-with-body') { throw 'request helper still depends on --fail-with-body' }
+    foreach ($needle in @("'curl', '-sS', '-o'", "'-w', '%{http_code}'", 'Complete-K8ElasticsearchResponse')) {
+        if ($text -notlike "*$needle*") { throw "old-curl single-request marker missing: $needle" }
+    }
+    $callerCount = ([regex]::Matches($commonSource, 'Invoke-K8ElasticsearchRequest\s+-RunId')).Count
+    if ($callerCount -ne 4) { throw "expected Collector, Rule, mapping, and R-OBS-05 to share one helper; found $callerCount call sites" }
+}
+
+Assert-K8Test 'Elasticsearch response gate accepts only 2xx valid JSON and retains failure diagnostics' {
+    Import-Module $CommonPath -Force
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-http-" + [guid]::NewGuid())
+    New-Item -ItemType Directory $tmp | Out-Null
+    try {
+        $success = Join-Path $tmp 'success.json'
+        Complete-K8ElasticsearchResponse -CurlExitCode 0 -HttpStatus '200' -RawBody '{"ok":true}' -OutputPath $success -RequestLabel test
+        if (-not (Test-Path $success) -or (Get-Content $success -Raw | ConvertFrom-Json).ok -ne $true) { throw '2xx valid JSON did not PASS/save' }
+
+        $cases = @(
+            @{ Name='http500'; Exit=0; Status='500'; Body='{"error":"boom"}' },
+            @{ Name='transport'; Exit=7; Status=''; Body='' },
+            @{ Name='invalid'; Exit=0; Status='200'; Body='not-json' }
+        )
+        foreach ($case in $cases) {
+            $output = Join-Path $tmp "$($case.Name).json"
+            $stopped = $false
+            try { Complete-K8ElasticsearchResponse -CurlExitCode $case.Exit -HttpStatus $case.Status -RawBody $case.Body -TransportDiagnostic 'curl diagnostic' -OutputPath $output -RequestLabel test } catch { $stopped = $true }
+            if (-not $stopped) { throw "$($case.Name) incorrectly PASSed" }
+            if (Test-Path $output) { throw "$($case.Name) incorrectly saved a success response" }
+            if (-not (Test-Path "$output.error-body.txt")) { throw "$($case.Name) diagnostic body was not retained" }
+        }
+    } finally { Remove-Item $tmp -Recurse -Force }
+}
+
 Assert-K8Test 'pre-teardown validate/finalize precede compose down and cleanup is followed by final finalize/verify' {
     $pre = $commonSource.IndexOf("-Description 'pre-teardown finalize/hash'")
     $down = $commonSource.IndexOf("-Description 'destroy project + volumes")

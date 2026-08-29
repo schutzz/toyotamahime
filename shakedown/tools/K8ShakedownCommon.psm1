@@ -382,6 +382,34 @@ function Test-K8ComposeServiceReadiness {
     return [pscustomobject]@{ Ready=($missing.Count -eq 0 -and $notRunning.Count -eq 0 -and $notHealthy.Count -eq 0); Missing=$missing; NotRunning=$notRunning; NotHealthy=$notHealthy }
 }
 
+function Complete-K8ElasticsearchResponse {
+    <# Pure fail-closed response gate, split from Docker/curl so every outcome
+       is regression-testable without a live VM. #>
+    param(
+        [Parameter(Mandatory)][int] $CurlExitCode,
+        [string] $HttpStatus = '',
+        [string] $RawBody = '',
+        [string] $TransportDiagnostic = '',
+        [Parameter(Mandatory)][string] $OutputPath,
+        [Parameter(Mandatory)][string] $RequestLabel
+    )
+    $diagnosticPath = "$OutputPath.error-body.txt"
+    if ($CurlExitCode -ne 0) {
+        "transport_exit=$CurlExitCode`n$TransportDiagnostic`n$RawBody" | Set-Content -Path $diagnosticPath -Encoding utf8NoBOM
+        throw "$RequestLabel transport/curl failure (exit $CurlExitCode); fixed request was not retried. Diagnostic: $diagnosticPath"
+    }
+    if ($HttpStatus -notmatch '^2[0-9][0-9]$') {
+        $RawBody | Set-Content -Path $diagnosticPath -Encoding utf8NoBOM
+        throw "$RequestLabel returned HTTP $HttpStatus; expected 2xx. Fixed request was not retried. Response body: $diagnosticPath"
+    }
+    try { $null = $RawBody | ConvertFrom-Json }
+    catch {
+        $RawBody | Set-Content -Path $diagnosticPath -Encoding utf8NoBOM
+        throw "$RequestLabel returned invalid JSON with HTTP $HttpStatus. Diagnostic: $diagnosticPath"
+    }
+    $RawBody | Set-Content -Path $OutputPath -Encoding utf8NoBOM
+}
+
 function Invoke-K8ElasticsearchRequest {
     param(
         [Parameter(Mandatory)][string] $RunId,
@@ -393,13 +421,24 @@ function Invoke-K8ElasticsearchRequest {
     )
     $container = (docker compose -p $RunId -f $ComposePath ps -q elasticsearch | Out-String).Trim()
     if (-not $container) { throw 'Elasticsearch container could not be resolved' }
-    $args = @('exec', $container, 'curl', '--fail-with-body', '--silent', '--show-error', '-X', $Method,
+    if (Test-Path $OutputPath) { throw "refusing to overwrite existing Elasticsearch response: $OutputPath" }
+    $remoteBody = "/tmp/k8-es-$([guid]::NewGuid().ToString('N')).body"
+    # Old curl compatibility: one HTTP request writes the body separately and
+    # emits only the status. No newer curl failure-body flag, retry, or resend.
+    $args = @('exec', $container, 'curl', '-sS', '-o', $remoteBody, '-w', '%{http_code}', '-X', $Method,
         "http://localhost:9200/$Endpoint", '-H', 'Content-Type: application/json')
     if ($Body) { $args += @('--data-binary', $Body) }
-    $raw = (docker @args 2>&1 | Out-String)
-    if ($LASTEXITCODE -ne 0) { throw "Elasticsearch $Method $Endpoint failed; refusing to broaden or retry the fixed request: $raw" }
-    try { $null = $raw | ConvertFrom-Json } catch { throw "Elasticsearch $Endpoint returned invalid JSON: $($_.Exception.Message)" }
-    $raw | Set-Content -Path $OutputPath -Encoding utf8NoBOM
+    $statusOutput = @(docker @args 2>&1)
+    $curlExit = $LASTEXITCODE
+    $bodyOutput = @(docker exec $container cat $remoteBody 2>&1)
+    $bodyExit = $LASTEXITCODE
+    docker exec $container rm -f $remoteBody 2>&1 | Out-Null
+    $rawBody = if ($bodyExit -eq 0) { $bodyOutput | Out-String } else { '' }
+    $effectiveExit = if ($curlExit -ne 0) { $curlExit } elseif ($bodyExit -ne 0) { 98 } else { 0 }
+    Complete-K8ElasticsearchResponse -CurlExitCode $effectiveExit `
+        -HttpStatus $(if ($curlExit -eq 0) { ($statusOutput | Out-String).Trim() } else { '' }) `
+        -RawBody $rawBody -TransportDiagnostic ($statusOutput | Out-String) -OutputPath $OutputPath `
+        -RequestLabel "Elasticsearch $Method $Endpoint"
 }
 
 function Assert-K8UnrelatedMirrorFilter {
