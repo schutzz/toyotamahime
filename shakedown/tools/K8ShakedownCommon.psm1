@@ -1172,8 +1172,22 @@ function Invoke-K8TsharkFieldDecode {
         # user 'root' and group 'root'. This could be dangerous." (and
         # similar diagnostics) to stderr, which a merged `2>&1` capture
         # would hand to the TSV parser below as if it were a data row.
+        #
+        # `-E separator=/t`, NOT `separator=\t`: real VM run
+        # k8shakedown-rangea-20260829-081151 showed a row delimited by a
+        # literal backslash character instead of an actual tab byte -- `\t`
+        # is a C-style/PowerShell escape, not tshark's own CLI syntax.
+        # TShark's `-E separator=` documents exactly three forms: a single
+        # literal character, `/t` for tab, or `/s` for space (never a
+        # backslash escape) -- this module had been confusing PowerShell's
+        # own string-escape convention with tshark's CLI contract. `/t` is
+        # an instruction tshark itself expands into a real tab (0x09) byte
+        # in ITS OWN output; the fix is entirely on this command-line
+        # argument, so the `-split "`t"` below (an actual PowerShell tab
+        # character, unrelated to this CLI syntax) is correct exactly as it
+        # already was and needs no change once tshark is emitting real tabs.
         $capture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @(
-            'exec', $Container, 'tshark', '-r', $remote, '-Y', $DisplayFilter, '-T', 'fields', '-E', 'separator=\t',
+            'exec', $Container, 'tshark', '-r', $remote, '-Y', $DisplayFilter, '-T', 'fields', '-E', 'separator=/t',
             '-e', 'frame.number', '-e', 'frame.time_epoch', '-e', 'ip.src', '-e', 'ip.dst',
             '-e', 'tcp.srcport', '-e', 'tcp.dstport', '-e', 'dnp3.al.func', '-e', 'dnp3.src', '-e', 'dnp3.dst'
         )

@@ -183,6 +183,21 @@ if ($joined -match '\bexec\b') {
             'decode-hit'   { Write-Output "1`t1767225615.0`t10.1.20.11`t10.1.10.10`t54321`t20000`t5`t1024`t1"; exit 0 }
             'decode-empty' { exit 0 }
             'decode-transport-error' { exit 2 }
+            # Multiple hits, real TAB-separated (0x09) rows -- as tshark
+            # actually emits with the correct `-E separator=/t` argument
+            # (k8shakedown-rangea-20260829-081151: the module was previously
+            # passing `separator=\t`, a PowerShell/C-style escape that is
+            # NOT tshark's own CLI syntax, and produced a backslash-
+            # delimited row instead of a real tab-delimited one).
+            'decode-multi-hit' {
+                Write-Output "4`t1787991349.810780000`t10.1.20.11`t10.1.10.10`t58852`t20000`t5`t1024`t1"
+                Write-Output "7`t1787991350.221340000`t10.1.20.11`t10.1.10.10`t58852`t20000`t5`t1024`t1"
+                Write-Output "9`t1787991351.005120000`t10.1.20.11`t10.1.10.10`t58852`t20000`t5`t1024`t1"
+                exit 0
+            }
+            # A row with the WRONG column count (8 fields, one dropped) --
+            # must fail-closed, never silently accepted.
+            'decode-bad-column-count' { Write-Output "4`t1787991349.810780000`t10.1.20.11`t10.1.10.10`t58852`t20000`t5`t1024"; exit 0 }
             # Reproduces the real VM failure verbatim: tshark's own "Running
             # as user root..." warning on STDERR, alongside a genuinely
             # valid TSV row on STDOUT -- exit 0 either way, exactly as the

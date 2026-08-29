@@ -1499,6 +1499,183 @@ Assert-K8Test 'Wait-K8ComposeReady readiness gate is not weakened: still require
     if ((Test-K8ComposeServiceReadiness -Expected $expected -Services $oneExited).Ready) { throw 'an exited service must still FAIL' }
 }
 
+# --- 14. tshark `-E separator=` CLI-contract fix -----------------------------
+#
+# Real VM parser defect, root-caused (k8shakedown-rangea-20260829-081151):
+# Invoke-K8TsharkFieldDecode passed `-E separator=\t` to tshark. `\t` is a
+# PowerShell/C-style string escape, NOT tshark's own CLI syntax -- tshark's
+# `-E separator=` documents exactly three forms (a single literal character,
+# `/t` for tab, `/s` for space), never a backslash escape. The module had
+# confused PowerShell's own escape convention with the external tool's CLI
+# contract, and the real row delimiter tshark actually emitted was a literal
+# backslash character, not a tab -- "unexpected tshark row shape" even
+# though the 9 fields themselves were correct. Not a scientific finding; the
+# closed run is not rescued/resumed. Fixed on the CLI argument alone
+# (`separator=/t`); the PowerShell-side `-split "`t"` (an actual tab
+# character, tshark's own OWN documented `/t` expands to a real 0x09 byte in
+# its OUTPUT) was already correct and needed no change -- no "\" acceptance
+# fallback was added on the parser side, matching the explicit requirement.
+# Applies to Ground Truth, Sensor, and R-OBS-05 uniformly because all three
+# share this one function.
+
+Assert-K8Test 'REGRESSION: Invoke-K8TsharkFieldDecode uses tshark''s own separator=/t (not the PowerShell/C-style separator=\t escape)' {
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8TsharkFieldDecode'
+    if ($body -match "'separator=\\+t'") { throw 'Invoke-K8TsharkFieldDecode still passes separator=\t -- not tshark''s own CLI syntax; the real-VM row-shape defect may be back' }
+    if ($body -notmatch "'separator=/t'") { throw 'Invoke-K8TsharkFieldDecode no longer passes tshark''s documented separator=/t token' }
+}
+
+Assert-K8Test 'REGRESSION: no `separator=\t` (PowerShell/C-style escape, not tshark CLI syntax) remains as an actual argument literal anywhere in the module source' {
+    # Scoped to the quoted CLI-argument shape ('separator=\t'), not prose --
+    # this file's own explanatory comments quote the old buggy value inside
+    # backticks followed by a comma/colon/space (e.g. `separator=\t`:),
+    # never as a standalone single-quoted PowerShell string literal.
+    $moduleSource = Get-Content $CommonPath -Raw
+    if ($moduleSource -match "'separator=\\+t'") { throw 'a literal separator=\t CLI argument string was found in the module source' }
+}
+
+$tsharkSepMockDir = Join-Path $ShakedownDir 'tests\mock-docker'
+$tsharkSepOriginalPath = $env:PATH
+try {
+    $env:PATH = "$tsharkSepMockDir;$env:PATH"
+    Import-Module $CommonPath -Force
+
+    Assert-K8Test 'REGRESSION 1/7: a real TAB-separated (0x09) 9-column row parses as exactly 1 hit' {
+        $env:K8_MOCK_DOCKER_STATE = 'decode-hit'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-tsep-1hit-" + [guid]::NewGuid())
+        $gt = Join-Path $dir 'ground-truth\independent-capture'
+        New-Item -ItemType Directory -Force -Path $gt | Out-Null
+        'fake' | Set-Content (Join-Path $gt 'c2-original-path.pcap')
+        try {
+            $ws = ([datetimeoffset]::UtcNow).AddSeconds(-100).ToString('o'); $we = ([datetimeoffset]::UtcNow).AddSeconds(100).ToString('o')
+            Write-K8TargetCaptureDecode -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -Stage 'ground-truth' -WindowStartIso $ws -WindowEndIso $we
+            $result = Get-Content (Join-Path $gt 'decoded-verification.json') -Raw | ConvertFrom-Json
+            if ($result.decoded_hit_count -ne 1) { throw "expected 1 hit, got $($result.decoded_hit_count)" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION 2/7: multiple TAB-separated rows all parse -- exactly the real VM row values (58852/1024/etc.), 3 hits' {
+        $env:K8_MOCK_DOCKER_STATE = 'decode-multi-hit'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-tsep-multi-" + [guid]::NewGuid())
+        $gt = Join-Path $dir 'ground-truth\independent-capture'
+        New-Item -ItemType Directory -Force -Path $gt | Out-Null
+        'fake' | Set-Content (Join-Path $gt 'c2-original-path.pcap')
+        try {
+            $ws = ([datetimeoffset]::UtcNow).AddSeconds(-100).ToString('o'); $we = ([datetimeoffset]::UtcNow).AddSeconds(100).ToString('o')
+            Write-K8TargetCaptureDecode -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -Stage 'ground-truth' -WindowStartIso $ws -WindowEndIso $we
+            $result = Get-Content (Join-Path $gt 'decoded-verification.json') -Raw | ConvertFrom-Json
+            if ($result.decoded_hit_count -ne 3) { throw "expected 3 hits, got $($result.decoded_hit_count)" }
+            if ($result.rows.Count -ne 3) { throw "rows array had $($result.rows.Count) entries, expected 3" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION 3/7: zero hits still processed as observed, not thrown' {
+        $env:K8_MOCK_DOCKER_STATE = 'decode-empty'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-tsep-empty-" + [guid]::NewGuid())
+        $sensor = Join-Path $dir 'sensor-input\mirror-capture'
+        New-Item -ItemType Directory -Force -Path $sensor | Out-Null
+        'fake' | Set-Content (Join-Path $sensor 'c2-mirror-sensor.pcap')
+        try {
+            $ws = ([datetimeoffset]::UtcNow).AddSeconds(-100).ToString('o'); $we = ([datetimeoffset]::UtcNow).AddSeconds(100).ToString('o')
+            Write-K8TargetCaptureDecode -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -Stage 'sensor' -WindowStartIso $ws -WindowEndIso $we
+            $result = Get-Content (Join-Path $sensor 'decoded-verification.json') -Raw | ConvertFrom-Json
+            if ($result.decoded_hit_count -ne 0) { throw "expected 0 hits, got $($result.decoded_hit_count)" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION 4/7: a row with the wrong column count fails closed, never silently accepted' {
+        $env:K8_MOCK_DOCKER_STATE = 'decode-bad-column-count'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-tsep-badcol-" + [guid]::NewGuid())
+        $gt = Join-Path $dir 'ground-truth\independent-capture'
+        New-Item -ItemType Directory -Force -Path $gt | Out-Null
+        'fake' | Set-Content (Join-Path $gt 'c2-original-path.pcap')
+        try {
+            $ws = ([datetimeoffset]::UtcNow).AddSeconds(-100).ToString('o'); $we = ([datetimeoffset]::UtcNow).AddSeconds(100).ToString('o')
+            $stopped = $false
+            try { Write-K8TargetCaptureDecode -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -Stage 'ground-truth' -WindowStartIso $ws -WindowEndIso $we } catch { $stopped = $true }
+            if (-not $stopped) { throw 'a row with the wrong column count did not STOP' }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Assert-K8Test 'REGRESSION 5/7: a root-execution stderr warning still never lands in a data row (unchanged by this round''s CLI-argument-only fix)' {
+        $env:K8_MOCK_DOCKER_STATE = 'decode-hit-with-root-warning'
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-tsep-rootwarn-" + [guid]::NewGuid())
+        $gt = Join-Path $dir 'ground-truth\independent-capture'
+        New-Item -ItemType Directory -Force -Path $gt | Out-Null
+        'fake' | Set-Content (Join-Path $gt 'c2-original-path.pcap')
+        try {
+            $ws = ([datetimeoffset]::UtcNow).AddSeconds(-100).ToString('o'); $we = ([datetimeoffset]::UtcNow).AddSeconds(100).ToString('o')
+            Write-K8TargetCaptureDecode -RunId 'x' -ComposePath 'y.yml' -RunEvidence $dir -Stage 'ground-truth' -WindowStartIso $ws -WindowEndIso $we
+            $result = Get-Content (Join-Path $gt 'decoded-verification.json') -Raw | ConvertFrom-Json
+            if ($result.decoded_hit_count -ne 1) { throw "expected 1 hit despite the stderr root-warning, got $($result.decoded_hit_count)" }
+        }
+        finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+finally { $env:PATH = $tsharkSepOriginalPath }
+
+# --- 15. Cross-cutting audit: CLI-native escape/separator/format syntax -----
+#
+# Explicitly requested audit for the same defect CLASS: this module (or any
+# other Shakedown script) treating an external tool's OWN CLI option syntax
+# as if it were a PowerShell/C-style string escape, for docker, curl,
+# tshark, tc, ip, compose, and `python3 -c`. Each finding below is either
+# fixed, or confirmed correct with the reasoning recorded so it is not
+# re-litigated by a future round mistaking it for the same bug.
+#
+# Confirmed CORRECT (external tool's own documented escape, not a mix-up):
+# - curl `-w`/`--write-out`: uses a literal `\n` (two characters) in the
+#   format string, which is curl's OWN documented write-out escape,
+#   expanded by curl itself into a real newline byte when it writes -w's
+#   output -- not a raw control character smuggled through argv (fixed in
+#   an earlier round specifically to avoid that). PowerShell's own
+#   double-quoted-string escape character is the backtick, NOT backslash,
+#   so `"\n"` in this module's PowerShell source is passed to curl
+#   completely literally as the two characters backslash+n, which is
+#   exactly what curl's own syntax requires.
+# - `tr "\0" " "` and `printf "\n"` inside the /proc probe shell one-liner:
+#   both `\0` and `\n` are tr's and printf's OWN POSIX-documented escape
+#   sequences (interpreted by tr/printf themselves inside the container's
+#   /bin/sh, not by PowerShell or by the outer shell) -- the whole probe
+#   string is a single-quoted PowerShell string, so PowerShell performs no
+#   interpretation of it at all and passes it through byte-for-byte.
+# - `python3 -c` scripts (ConvertTo-K8PythonExecOneLiner, fixed in an
+#   earlier round): `\n` inside the exec('...') string argument is
+#   PYTHON's own string-literal escape, expanded by Python itself when the
+#   exec'd code runs, not a shell/CLI separator convention at all.
+# - `-split '\s+'` (parsing `ip`/`tc` text output locally): this is
+#   PowerShell's OWN `-split` regex syntax (a .NET regex whitespace class),
+#   entirely internal to this module's own parsing, not an external tool's
+#   CLI argument.
+#
+# Confirmed and FIXED this round: tshark `-E separator=\t` -> `separator=/t`
+# (section 14 above) -- the one real instance of this defect class found.
+
+Assert-K8Test 'Cross-cutting audit: curl -w write-out format strings use curl''s own literal \n escape, never a raw embedded newline byte' {
+    foreach ($fn in @('Wait-K8ElasticsearchReady', 'Get-K8Dnp3OperationalCanaryHits')) {
+        $body = Get-K8FunctionBodyText -Path $CommonPath -Name $fn
+        if ($body -notmatch '-w.*\\n\$\{?marker\}?:%\{http_code\}') { throw "$fn's curl -w format string is missing or no longer uses curl's own literal \n escape" }
+        # A RAW embedded newline byte in the PowerShell source (not the
+        # literal two-character \n) would reintroduce the cmd.exe-trampoline
+        # argument-corruption bug fixed in an earlier round.
+        $wLine = ($body -split "`n") | Where-Object { $_ -match "-w'" -or $_ -match "'-w'" }
+        foreach ($line in $wLine) { if ($line.Contains([char]10)) { throw "$fn's curl -w argument contains a raw embedded newline byte, not curl's own \n escape" } }
+    }
+}
+
+Assert-K8Test 'Cross-cutting audit: no other native-command argument in this module contains a bare backslash-letter sequence masquerading as that tool''s own separator/format syntax' {
+    # Deliberately scoped to an actual single-quoted PowerShell string
+    # literal shape ('separator=\X'), not a broad "\\[a-z]" prose scan --
+    # this file's own explanatory comments (this test's section header
+    # included) legitimately quote the old buggy value while describing the
+    # fix, and a naive scan would flag its own documentation.
+    $moduleSource = Get-Content $CommonPath -Raw
+    if ($moduleSource -match "'separator=\\+[a-zA-Z]'") { throw "found a quoted CLI 'separator=' argument literal using a backslash escape instead of the tool's own documented token (e.g. tshark's /t)" }
+}
+
 # --- 7. Study01/ untouched on this branch -------------------------------------
 
 Assert-K8Test 'Study01/ is byte-for-byte unchanged versus origin/main' {
