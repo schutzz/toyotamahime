@@ -151,9 +151,9 @@ Assert-K8Test 'Range A/B keeps the fresh evidence tree empty until frozen prefli
     if ($errors.Count) { throw "module parse failed: $($errors -join '; ')" }
     $function = $ast.Find({
         param($node)
-        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-K8ShakedownRangeAB'
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-K8ShakedownRangeABBody'
     }, $true)
-    if (-not $function) { throw 'Invoke-K8ShakedownRangeAB not found' }
+    if (-not $function) { throw 'Invoke-K8ShakedownRangeABBody not found' }
     $body = $function.Extent.Text
     $preflight = $body.IndexOf("-Description 'execution preflight gate (Docker-free)'")
     $hashWrite = $body.IndexOf("generated-compose-hash.txt")
@@ -552,9 +552,9 @@ Assert-K8Test 'Wait-K8ElasticsearchReady exists, has a finite timeout, and actua
 
 foreach ($gateFunc in @('Wait-K8ElasticsearchReady', 'Wait-K8LogStructurerReady', 'Wait-K8ZoneDetectorReady')) {
     Assert-K8Test "$gateFunc runs exactly once, shared (not Range-specific), before interface resolution and the sender trigger" {
-        $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+        $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeABBody'
         $gateCalls = @([regex]::Matches($body, "$gateFunc\s+-RunId"))
-        if ($gateCalls.Count -ne 1) { throw "expected exactly one shared call site in Invoke-K8ShakedownRangeAB (used by both Range A and Range B); found $($gateCalls.Count)" }
+        if ($gateCalls.Count -ne 1) { throw "expected exactly one shared call site in Invoke-K8ShakedownRangeABBody (used by both Range A and Range B); found $($gateCalls.Count)" }
         $gateIndex = $gateCalls[0].Index
         $interfaceIndex = $body.IndexOf('Resolve-K8GatewayInterface -RunId')
         $senderIndex = $body.IndexOf("(Join-Path `$ScriptsDir 'study01_sender.py')")
@@ -889,7 +889,7 @@ Assert-K8Test 'Wait-K8CaptureWindowStart does not wait once both stages already 
 }
 
 Assert-K8Test 'Wait-K8CaptureWindowStart/End and the early capture-lifecycle check are each called exactly once, unconditionally, in the right order' {
-    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeABBody'
     $startCalls = @([regex]::Matches($body, 'Wait-K8CaptureWindowStart\s+-RunEvidence'))
     $endCalls = @([regex]::Matches($body, 'Wait-K8CaptureWindowEnd\s+-RunEvidence'))
     $earlyCalls = @([regex]::Matches($body, 'Test-K8CaptureLifecycleEarly\s+-ScriptsDir'))
@@ -1051,12 +1051,12 @@ Assert-K8Test 'Ground Truth/Sensor decode uses the frozen freeze-decision-table.
 }
 
 Assert-K8Test 'Both ground-truth and sensor decode calls run before finalize-evidence, while log_structurer is still up (before Complete''s teardown)' {
-    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeABBody'
     $gtCall = $body.IndexOf("-Stage 'ground-truth' -WindowStartIso")
     $sensorCall = $body.IndexOf("-Stage 'sensor' -WindowStartIso")
-    if ($gtCall -lt 0 -or $sensorCall -lt 0) { throw 'could not find both decode call sites in Invoke-K8ShakedownRangeAB' }
-    $completeBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Complete-K8ShakedownRangeAB'
-    if ($completeBody -match 'Write-K8TargetCaptureDecode') { throw 'decode must run in Invoke-K8ShakedownRangeAB (range still up), not in Complete (after teardown)' }
+    if ($gtCall -lt 0 -or $sensorCall -lt 0) { throw 'could not find both decode call sites in Invoke-K8ShakedownRangeABBody' }
+    $completeBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Complete-K8ShakedownRangeABBody'
+    if ($completeBody -match 'Write-K8TargetCaptureDecode') { throw 'decode must run in Invoke-K8ShakedownRangeABBody (range still up), not in Complete (after teardown)' }
 }
 
 Assert-K8Test 'Collector and Rule index mappings are retained (README SS5.1 step 6: "with their responses and mappings"), for both Range A and B' {
@@ -1110,7 +1110,7 @@ Assert-K8Test 'Test-K8ScoringInputArtifactCompleteness: missing artifact STOPs b
 }
 
 Assert-K8Test 'The completeness gate runs before "runtime evidence PASS" is ever reported, for both Range A and B from one shared call site' {
-    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeABBody'
     $gateCalls = @([regex]::Matches($body, 'Test-K8ScoringInputArtifactCompleteness\s+-Range'))
     if ($gateCalls.Count -ne 1) { throw "expected exactly one shared call site; found $($gateCalls.Count)" }
     # Search for the actual Write-K8ShakedownLog call site specifically
@@ -1528,7 +1528,7 @@ Assert-K8Test 'ConvertTo-K8CidrRange / Test-K8CidrOverlap: standard containment,
     if (-not $stopped) { throw 'a non-CIDR string did not STOP' }
 }
 
-Assert-K8Test 'Test-K8ShakedownNetworkPreflight never calls network rm/prune, and runs before docker compose up in Invoke-K8ShakedownRangeAB' {
+Assert-K8Test 'Test-K8ShakedownNetworkPreflight never calls network rm/prune, and runs before docker compose up in Invoke-K8ShakedownRangeABBody' {
     $preflightBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Test-K8ShakedownNetworkPreflight'
     $helperBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Get-K8LeftoverShakedownNetworks'
     foreach ($body in @($preflightBody, $helperBody)) {
@@ -1540,7 +1540,7 @@ Assert-K8Test 'Test-K8ShakedownNetworkPreflight never calls network rm/prune, an
             throw 'the network preflight (or its helper) appears to actually INVOKE network rm/prune -- it must only detect and report, per the explicit no-auto-removal requirement'
         }
     }
-    $rangeAbBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+    $rangeAbBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeABBody'
     $preflightCallIndex = $rangeAbBody.IndexOf('Test-K8ShakedownNetworkPreflight -RunId')
     $upCallIndex = $rangeAbBody.IndexOf("'up', '-d', '--build'")
     if ($preflightCallIndex -lt 0) { throw 'Test-K8ShakedownNetworkPreflight is not called from Invoke-K8ShakedownRangeAB' }
@@ -2307,7 +2307,7 @@ Assert-K8Test 'ARTIFACT SEPARATION: the auxiliary liveness pcap is never read by
 }
 
 Assert-K8Test 'Range A runtime behavior is unchanged: the auxiliary capture is Range-B-only at BOTH its start and completion call sites' {
-    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeABBody'
     foreach ($call in @('Start-K8Robs05LivenessCapture', 'Complete-K8Robs05LivenessCapture')) {
         $idx = $body.IndexOf($call)
         if ($idx -lt 0) { throw "$call is not called from the runner" }
@@ -2641,7 +2641,7 @@ Assert-K8Test 'REGRESSION: fault observations separate stdout from stderr (never
 }
 
 Assert-K8Test 'Range B fault block: pre, fault-command and post are all retained via the observation helpers, artifact written BEFORE the exit assertion' {
-    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeABBody'
     foreach ($needle in @('qdisc-pre-fault.txt', 'fault-injection-command.txt', 'qdisc-post-fault.txt')) {
         if ($body -notmatch [regex]::Escape($needle)) { throw "fault-boundary artifact not written: $needle" }
     }
@@ -2703,7 +2703,7 @@ Assert-K8Test 'REGRESSION: Write-K8ImageInventory retains compose-images.json / 
 
 Assert-K8Test 'Range A non-regression: no fault-boundary artifact is produced or required for Range A' {
     Import-Module $CommonPath -Force
-    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+    $body = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeABBody'
     foreach ($artifact in @('qdisc-pre-fault.txt', 'fault-injection-command.txt', 'qdisc-post-fault.txt')) {
         $idx = $body.IndexOf($artifact)
         $before = $body.Substring(0, $idx)
@@ -2751,6 +2751,908 @@ Assert-K8Test 'Completeness gate: the fault-command artifact is required for Ran
         $leaf = Split-Path $r -Leaf
         if ($frozenPythonProduced -contains $leaf) { continue }
         if ($outside -notmatch [regex]::Escape($leaf)) { throw "required artifact '$r' has no producer anywhere in the module" }
+    }
+}
+
+# --- 27. Qualification sequence / run provenance / termination record -------
+#
+# All offline: a throwaway git repo plus a throwaway K8_SHAKEDOWN_ROOT. No
+# Docker, no VM, no Amenonuboco checkout.
+
+$RangeCPath = Join-Path $ToolsDir 'Run-K8ShakedownRangeC.ps1'
+
+function Invoke-K8SequenceSandbox {
+    # Deliberately -Action, not -Body: PowerShell resolves a scriptblock's free
+    # variables against the caller's scope chain, so a parameter named like one
+    # the caller's scriptblock also uses can rebind it mid-flight.
+    param([Parameter(Mandatory)][scriptblock] $Action)
+    $root = Join-Path ([System.IO.Path]::GetTempPath()) ('k8seq-' + [guid]::NewGuid().ToString('N'))
+    $repo = Join-Path ([System.IO.Path]::GetTempPath()) ('k8seqrepo-' + [guid]::NewGuid().ToString('N'))
+    $previous = $env:K8_SHAKEDOWN_ROOT
+    $env:K8_SHAKEDOWN_ROOT = $root
+    New-Item -ItemType Directory -Force -Path $repo | Out-Null
+    try {
+        git -C $repo init -q *> $null
+        git -C $repo config user.email 'k8@test.local' *> $null
+        git -C $repo config user.name 'k8 test' *> $null
+        git -C $repo config commit.gpgsign false *> $null
+        'seed' | Set-Content -Path (Join-Path $repo 'seed.txt')
+        git -C $repo add -A *> $null
+        git -C $repo commit -q -m seed *> $null
+        & $Action ([pscustomobject]@{
+            Root = $root
+            Repo = $repo
+            Head = (git -C $repo rev-parse HEAD).Trim()
+        })
+    }
+    finally {
+        if ($null -eq $previous) { Remove-Item Env:\K8_SHAKEDOWN_ROOT -ErrorAction SilentlyContinue }
+        else { $env:K8_SHAKEDOWN_ROOT = $previous }
+        Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item $repo -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Add-K8SandboxCommit {
+    param([Parameter(Mandatory)][string] $Repo, [string] $Text = 'next')
+    $Text | Set-Content -Path (Join-Path $Repo 'seed.txt')
+    git -C $Repo add -A *> $null
+    git -C $Repo commit -q -m $Text *> $null
+    return (git -C $Repo rev-parse HEAD).Trim()
+}
+
+function Assert-K8FailsClosed {
+    param(
+        [Parameter(Mandatory)][string] $What,
+        [Parameter(Mandatory)][scriptblock] $Attempt,
+        [string] $Because
+    )
+    try { & $Attempt | Out-Null }
+    catch {
+        if ($Because -and $_.Exception.Message -notmatch $Because) {
+            throw "$What failed closed, but for the wrong reason: $($_.Exception.Message)"
+        }
+        return
+    }
+    throw "$What was expected to fail closed; it succeeded"
+}
+
+Assert-K8Test 'Sequence creation: sequence_id and locked_head are separate facts, and locked_head is the exact HEAD' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $seq = New-K8QualificationSequence -RepoRoot $sb.Repo
+        if ($seq['locked_head'] -ne $sb.Head) { throw "locked_head $($seq['locked_head']) != git HEAD $($sb.Head)" }
+        if ($seq['sequence_id'] -eq $seq['locked_head']) { throw 'sequence_id equals locked_head' }
+        # Not merely different: the ID must not encode the HEAD at all, or the
+        # C-2b gate would be comparing a value against itself.
+        for ($n = 7; $n -le $sb.Head.Length; $n++) {
+            if ($seq['sequence_id'].Contains($sb.Head.Substring(0, $n))) { throw "sequence_id embeds a $n-char prefix of locked_head" }
+        }
+        # The optional -N suffix disambiguates two sequences opened inside the
+        # same one-second timestamp; it never reuses an existing record.
+        if ($seq['sequence_id'] -notmatch '^k8shakedown-seq-\d{8}-\d{6}(-\d+)?$') { throw "unexpected sequence_id shape: $($seq['sequence_id'])" }
+        if ($seq['sequence_id'] -like 'k8-repro-*') { throw 'sequence_id uses the formal attempt namespace' }
+        if ($seq['status'] -ne 'open') { throw "status = $($seq['status'])" }
+        if ($seq['next_range'] -ne 'a') { throw "next_range = $($seq['next_range'])" }
+        if ($null -ne $seq['active_run']) { throw 'a fresh sequence already has an active run' }
+        if (@($seq['completed_runs']).Count -ne 0 -or @($seq['terminated_runs']).Count -ne 0) { throw 'a fresh sequence already has run history' }
+        if ($seq['initial_tree_clean'] -ne $true) { throw 'initial_tree_clean was not recorded' }
+        $pointer = (Get-Content (Join-Path $sb.Root 'sequences\current.txt') -Raw).Trim()
+        if ($pointer -ne $seq['sequence_id']) { throw "current.txt ($pointer) does not name the new sequence" }
+    }
+}
+
+Assert-K8Test 'Sequence creation fails closed on a dirty tree and writes no record' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        'stray' | Set-Content -Path (Join-Path $sb.Repo 'untracked.txt')
+        Assert-K8FailsClosed -What 'New-K8QualificationSequence on a dirty tree' -Because 'not clean' -Attempt {
+            New-K8QualificationSequence -RepoRoot $sb.Repo
+        }
+        $seqDir = Join-Path $sb.Root 'sequences'
+        $written = @(if (Test-Path $seqDir) { Get-ChildItem $seqDir -Filter '*.json' -File -ErrorAction SilentlyContinue } else { @() })
+        if ($written.Count -ne 0) { throw "a refused creation still wrote $($written.Count) record(s)" }
+        if (Test-Path (Join-Path $seqDir 'current.txt')) { throw 'a refused creation still wrote current.txt' }
+    }
+}
+
+Assert-K8Test 'Run provenance exists immediately after run-ID allocation and agrees with the reservation' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $seq = New-K8QualificationSequence -RepoRoot $sb.Repo
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        $provPath = Get-K8RunProvenancePath -RunId $run.RunId
+        if (-not (Test-Path $provPath)) { throw 'run-provenance.json does not exist after Start-K8ShakedownRun' }
+        $prov = Get-Content $provPath -Raw | ConvertFrom-Json -AsHashtable
+        if ($prov['run_id'] -ne $run.RunId) { throw 'run_id mismatch' }
+        if ($prov['sequence_id'] -ne $seq['sequence_id']) { throw 'sequence_id mismatch' }
+        if ($prov['tooling_head'] -ne $sb.Head) { throw 'tooling_head mismatch' }
+        if ($prov['sequence_locked_head'] -ne $seq['locked_head']) { throw 'sequence_locked_head mismatch' }
+        if ($prov['tree_clean'] -ne $true) { throw 'tree_clean is not true' }
+        if ($prov['observation_point'] -ne 'run-initialization') { throw 'observation_point missing or wrong' }
+        # The reservation made the same observation durable one step earlier;
+        # if the two disagree, one of them is fiction.
+        $live = Get-K8QualificationSequence
+        if ($live['active_run']['tooling_head'] -ne $prov['tooling_head']) { throw 'reservation and provenance disagree on tooling_head' }
+        if ($live['active_run']['state'] -ne 'running') { throw "active_run.state = $($live['active_run']['state'])" }
+    }
+}
+
+Assert-K8Test 'Run start precedes every command in the Range A/B and Range C paths; the provenance mirror follows evidence_tree.create' {
+    $wrapper = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Invoke-K8ShakedownRangeAB'
+    if ($wrapper -notmatch 'Start-K8ShakedownRun') { throw 'Invoke-K8ShakedownRangeAB does not start a tracked run' }
+    if ($wrapper -match 'New-K8ShakedownRunId') { throw 'the Range A/B wrapper allocates a raw run ID instead of going through Start-K8ShakedownRun' }
+    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Invoke-K8ShakedownRangeABBody'
+    if ($body -match 'New-K8ShakedownRunId') { throw 'the Range A/B body allocates its own run ID' }
+    $gate = $body.IndexOf('Assert-K8SequenceBinding')
+    if ($gate -lt 0) { throw 'Invoke-K8ShakedownRangeABBody never calls the binding gate' }
+    foreach ($token in @('Invoke-K8ShakedownCommand', 'Invoke-K8ShakedownLoggedCommand', 'docker compose', 'Push-Location')) {
+        $first = $body.IndexOf($token)
+        if ($first -ge 0 -and $first -lt $gate) { throw "'$token' appears before the binding gate in Invoke-K8ShakedownRangeABBody" }
+    }
+    $create = $body.IndexOf('evidence_tree import create')
+    $mirror = $body.IndexOf('Copy-K8RunProvenanceIntoEvidence')
+    if ($create -lt 0) { throw 'the frozen evidence_tree.create call was not found' }
+    if ($mirror -lt 0) { throw 'the provenance mirror was not found' }
+    # The mirror cannot precede the creator: the frozen creator refuses an
+    # existing root, so the tree does not exist before it runs.
+    if ($mirror -lt $create) { throw 'the provenance mirror precedes evidence_tree.create' }
+    $between = $body.Substring($create, $mirror - $create)
+    if ($between -match 'Invoke-K8ShakedownLoggedCommand|Test-K8ShakedownNetworkPreflight|study01_preflight') { throw 'a further step runs between evidence_tree.create and the provenance mirror' }
+
+    $rangeC = Get-K8CommentStrippedSource -Path $RangeCPath
+    if ($rangeC -match 'New-K8ShakedownRunId') { throw 'Range C allocates a raw run ID instead of going through Start-K8ShakedownRun' }
+    $cStart = $rangeC.IndexOf('Start-K8ShakedownRun')
+    if ($cStart -lt 0) { throw 'Range C does not start a tracked run' }
+    foreach ($token in @('Invoke-K8ShakedownCommand', 'Copy-Item', 'cmd.exe')) {
+        $first = $rangeC.IndexOf($token)
+        if ($first -ge 0 -and $first -lt $cStart) { throw "'$token' appears before Start-K8ShakedownRun in Run-K8ShakedownRangeC.ps1" }
+    }
+}
+
+Assert-K8Test 'The in-tree provenance mirror lands at the evidence-tree root, never inside a frozen schema directory' {
+    Import-Module $CommonPath -Force
+    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Copy-K8RunProvenanceIntoEvidence'
+    foreach ($schemaDir in @('environment', 'ground-truth', 'sensor-input', 'collector-output', 'rule-output', 'contract-output')) {
+        if ($body -match [regex]::Escape("$schemaDir\")) { throw "the provenance mirror targets '$schemaDir', which study01/preflight.py requires to be empty at preflight time" }
+    }
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        $tree = Join-Path $sb.Root 'fake-evidence-tree'
+        New-Item -ItemType Directory -Force -Path $tree | Out-Null
+        Copy-K8RunProvenanceIntoEvidence -Run $run -RunEvidence $tree
+        $landed = @(Get-ChildItem $tree -Recurse -File)
+        if ($landed.Count -ne 1) { throw "expected exactly one mirrored file, found $($landed.Count)" }
+        if ($landed[0].Name -ne 'run-provenance.json') { throw "unexpected mirrored file $($landed[0].Name)" }
+        if ($landed[0].Directory.FullName -ne (Resolve-Path $tree).Path) { throw 'the mirror is not at the evidence-tree root' }
+        if ((Get-Content $landed[0].FullName -Raw) -ne (Get-Content (Get-K8RunProvenancePath -RunId $run.RunId) -Raw)) { throw 'the mirror is not byte-identical to the control-plane record' }
+    }
+}
+
+Assert-K8Test 'Binding gate fails closed on a HEAD change and retains the actual mismatching provenance' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        $newHead = Add-K8SandboxCommit -Repo $sb.Repo -Text 'moved'
+        Assert-K8FailsClosed -What 'the binding gate after a HEAD change' -Because 'binding gate FAILED' -Attempt {
+            Assert-K8SequenceBinding -Run $run
+        }
+        $prov = Get-Content (Get-K8RunProvenancePath -RunId $run.RunId) -Raw | ConvertFrom-Json -AsHashtable
+        if ($prov['tooling_head'] -ne $sb.Head) { throw 'provenance does not retain the head the run actually started under' }
+        if ($prov['tooling_head'] -eq $newHead) { throw 'provenance was rewritten to the new head' }
+    }
+}
+
+Assert-K8Test 'Binding gate re-observes git rather than comparing stored values (start-time TOCTOU)' {
+    Import-Module $CommonPath -Force
+    $gate = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Assert-K8SequenceBinding'
+    if ($gate -notmatch 'Get-K8ToolingIdentity') { throw 'the binding gate does not re-read git, so a checkout after run initialization would be invisible to it' }
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        Assert-K8SequenceBinding -Run $run          # clean at this point
+        'dirtied after provenance was written' | Set-Content -Path (Join-Path $sb.Repo 'toctou.txt')
+        Assert-K8FailsClosed -What 'the binding gate after the tree was dirtied' -Because 'not clean now' -Attempt {
+            Assert-K8SequenceBinding -Run $run
+        }
+    }
+}
+
+Assert-K8Test 'All three Range paths and Complete share one binding gate; none re-implements the comparison' {
+    $sources = [ordered]@{
+        'Invoke-K8ShakedownRangeABBody'   = (Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Invoke-K8ShakedownRangeABBody')
+        'Complete-K8ShakedownRangeABBody' = (Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Complete-K8ShakedownRangeABBody')
+        'Run-K8ShakedownRangeC.ps1'       = (Get-K8CommentStrippedSource -Path $RangeCPath)
+    }
+    foreach ($name in $sources.Keys) {
+        $text = $sources[$name]
+        if ($text -notmatch 'Assert-K8SequenceBinding|Assert-K8RunSequenceInvariant') { throw "$name does not go through the shared binding gate" }
+        if ($text -match 'locked_head') { throw "$name compares locked_head itself instead of delegating to the shared gate" }
+    }
+}
+
+Assert-K8Test 'Sequence order is enforced: Range B before A, and B before A completes, are both refused' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        Assert-K8FailsClosed -What 'starting Range B first' -Because 'expects Range a next' -Attempt {
+            Start-K8ShakedownRun -Range b -RepoRoot $sb.Repo
+        }
+        $runA = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        Assert-K8FailsClosed -What 'starting Range B while Range A is still active' -Because 'already active' -Attempt {
+            Start-K8ShakedownRun -Range b -RepoRoot $sb.Repo
+        }
+        Complete-K8ShakedownRunInSequence -Run $runA | Out-Null
+        Assert-K8FailsClosed -What 'starting Range C before Range B' -Because 'expects Range b next' -Attempt {
+            Start-K8ShakedownRun -Range c -RepoRoot $sb.Repo
+        }
+    }
+}
+
+Assert-K8Test 'Only one run may be active at a time' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo | Out-Null
+        Assert-K8FailsClosed -What 'a second concurrent Range A run' -Because 'Only one run may be active' -Attempt {
+            Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        }
+    }
+}
+
+Assert-K8Test 'Completion advances next_range and clears the active run; termination does neither' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $runA = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        $advanced = Complete-K8ShakedownRunInSequence -Run $runA
+        if ($advanced['next_range'] -ne 'b') { throw "next_range = $($advanced['next_range']) after Range A" }
+        if ($null -ne $advanced['active_run']) { throw 'active_run survived completion' }
+        if (@($advanced['completed_runs']).Count -ne 1) { throw 'completed_runs was not appended' }
+
+        $runB = Start-K8ShakedownRun -Range b -RepoRoot $sb.Repo
+        try {
+            Invoke-K8ShakedownRunBoundary -Run $runB -ScriptBlock {
+                Set-K8ShakedownRunStage -Stage 'provision'
+                throw 'simulated Range B failure'
+            }.GetNewClosure()
+        } catch { }
+        $after = Get-K8QualificationSequence
+        if ($after['status'] -ne 'ineligible') { throw "status = $($after['status']) after a termination" }
+        if ($after['next_range'] -ne 'b') { throw "next_range advanced past a terminated run: $($after['next_range'])" }
+    }
+}
+
+Assert-K8Test 'Close then start yields a distinct sequence at the new HEAD, back at Range A' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $first = New-K8QualificationSequence -RepoRoot $sb.Repo
+        $runA = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        Complete-K8ShakedownRunInSequence -Run $runA | Out-Null
+        Close-K8QualificationSequence -Reason 'fixing something' | Out-Null
+        Assert-K8FailsClosed -What 'starting a run after the sequence was closed' -Because 'no live qualification sequence' -Attempt {
+            Start-K8ShakedownRun -Range b -RepoRoot $sb.Repo
+        }
+        $newHead = Add-K8SandboxCommit -Repo $sb.Repo -Text 'the fix'
+        $second = New-K8QualificationSequence -RepoRoot $sb.Repo
+        if ($second['sequence_id'] -eq $first['sequence_id']) { throw 'the new sequence reused the old ID' }
+        if ($second['locked_head'] -ne $newHead) { throw 'the new sequence did not lock the new HEAD' }
+        if ($second['next_range'] -ne 'a') { throw 'the new sequence does not restart from Range A' }
+    }
+}
+
+Assert-K8Test 'Concurrent Start-K8ShakedownRun from two processes: exactly one wins' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $script = Join-Path $sb.Root 'concurrent-start.ps1'
+        @"
+Set-StrictMode -Version Latest
+`$ErrorActionPreference = 'Stop'
+`$env:K8_SHAKEDOWN_ROOT = '$($sb.Root)'
+Import-Module '$CommonPath' -Force
+try { `$r = Start-K8ShakedownRun -Range a -RepoRoot '$($sb.Repo)'; Write-Output "WON `$(`$r.RunId)" }
+catch { Write-Output "LOST `$(`$_.Exception.Message)" }
+"@ | Set-Content -Path $script -Encoding utf8NoBOM
+        $outA = Join-Path $sb.Root 'concurrent-a.txt'
+        $outB = Join-Path $sb.Root 'concurrent-b.txt'
+        $p1 = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $script) -RedirectStandardOutput $outA -PassThru -WindowStyle Hidden
+        $p2 = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $script) -RedirectStandardOutput $outB -PassThru -WindowStyle Hidden
+        if (-not $p1.WaitForExit(240000)) { throw 'concurrent process 1 did not exit' }
+        if (-not $p2.WaitForExit(240000)) { throw 'concurrent process 2 did not exit' }
+        $results = @((Get-Content $outA -Raw), (Get-Content $outB -Raw))
+        $won = @($results | Where-Object { $_ -match 'WON' })
+        if ($won.Count -ne 1) { throw "expected exactly one winner, got $($won.Count): $($results -join ' | ')" }
+        $live = Get-K8QualificationSequence
+        if ($null -eq $live['active_run']) { throw 'no run was reserved at all' }
+        $reserved = @(Get-ChildItem (Join-Path $sb.Root 'run-records') -Directory -ErrorAction SilentlyContinue)
+        if ($reserved.Count -ne 1) { throw "expected one run record, found $($reserved.Count) -- a duplicate active run was created" }
+        # An interleaved write would show up as unparseable JSON here.
+        Get-Content (Join-Path $sb.Root "sequences\$($live['sequence_id']).json") -Raw | ConvertFrom-Json | Out-Null
+    }
+}
+
+Assert-K8Test 'A live sequence whose current.txt is missing permits only CloseSequence' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        Remove-Item (Join-Path $sb.Root 'sequences\current.txt') -Force
+        Assert-K8FailsClosed -What 'creating a second sequence while an orphaned open one exists' -Because 'disagrees with the live sequence' -Attempt {
+            New-K8QualificationSequence -RepoRoot $sb.Repo
+        }
+        Assert-K8FailsClosed -What 'starting a run against an orphaned open sequence' -Because 'disagrees with the live sequence' -Attempt {
+            Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        }
+        Close-K8QualificationSequence -Reason 'resolving the pointer inconsistency' | Out-Null
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+    }
+}
+
+Assert-K8Test 'Two live sequences fail closed everywhere and require -SequenceId to close' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $first = New-K8QualificationSequence -RepoRoot $sb.Repo
+        # Fabricate a second live record directly, as a corrupted control plane would.
+        $clone = Get-Content (Join-Path $sb.Root "sequences\$($first['sequence_id']).json") -Raw | ConvertFrom-Json -AsHashtable
+        $clone['sequence_id'] = 'k8shakedown-seq-19700101-000000'
+        ($clone | ConvertTo-Json -Depth 12) | Set-Content -Path (Join-Path $sb.Root 'sequences\k8shakedown-seq-19700101-000000.json') -Encoding utf8NoBOM
+        Assert-K8FailsClosed -What 'starting a run with two live sequences' -Because 'control-plane corruption' -Attempt {
+            Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        }
+        Assert-K8FailsClosed -What 'closing without -SequenceId' -Because 'never guesses' -Attempt {
+            Close-K8QualificationSequence -Reason 'ambiguous'
+        }
+        Close-K8QualificationSequence -Reason 'resolving corruption' -SequenceId 'k8shakedown-seq-19700101-000000' | Out-Null
+    }
+}
+
+Assert-K8Test 'Orphan detection spans every sequence record, so a closed sequence''s runs are not misreported' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $runA = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        Complete-K8ShakedownRunInSequence -Run $runA | Out-Null
+        Close-K8QualificationSequence -Reason 'done with this one' | Out-Null
+        # runA is now referenced only by a CLOSED record. It must not read as an orphan.
+        if (@((Get-K8ControlPlaneState).Orphans) -contains $runA.RunId) { throw 'a run recorded in a closed sequence was misreported as an orphan' }
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        # A run record that no sequence at all accounts for IS an orphan.
+        New-Item -ItemType Directory -Force -Path (Join-Path $sb.Root 'run-records\k8shakedown-rangea-19700101-000000') | Out-Null
+        if (@((Get-K8ControlPlaneState).Orphans) -notcontains 'k8shakedown-rangea-19700101-000000') { throw 'an unaccounted-for run record was not detected as an orphan' }
+        Assert-K8FailsClosed -What 'starting a run while an orphan record exists' -Because 'orphan run record' -Attempt {
+            Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        }
+    }
+}
+
+Assert-K8Test 'Existing sequence and run records are never overwritten; a taken ID yields a fresh one' {
+    Import-Module $CommonPath -Force
+    $newSeq = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'New-K8QualificationSequence'
+    if ($newSeq -notmatch 'sequence ID collision') { throw 'sequence creation does not guard against an existing record' }
+    $startBody = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Start-K8ShakedownRun'
+    if ($startBody -notmatch 'run-record collision') { throw 'run reservation does not guard against an existing run record' }
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        # Two sequences opened inside the same one-second timestamp must not
+        # collide, and must not overwrite each other.
+        $first = New-K8QualificationSequence -RepoRoot $sb.Repo
+        Close-K8QualificationSequence -Reason 'immediately reopening' | Out-Null
+        $second = New-K8QualificationSequence -RepoRoot $sb.Repo
+        if ($second['sequence_id'] -eq $first['sequence_id']) { throw 'the second sequence reused the first ID' }
+        $firstRecord = Get-Content (Join-Path $sb.Root "sequences\$($first['sequence_id']).json") -Raw | ConvertFrom-Json
+        if ($firstRecord.status -ne 'closed') { throw 'the first record was overwritten rather than preserved' }
+    }
+}
+
+Assert-K8Test 'Interrupted run initialization: the matching continuation is allowed, a new reservation is not' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        # Rewind to the state a crash between ReserveRun and
+        # FinalizeRunInitialization leaves behind.
+        $live = Get-K8QualificationSequence
+        $live['active_run']['state'] = 'initializing'
+        Write-K8SequenceRecord -Record $live
+        Assert-K8FailsClosed -What 'a new reservation over an interrupted initialization' -Because 'already active' -Attempt {
+            Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        }
+        Assert-K8FailsClosed -What 'completing a half-initialized run' -Because 'initialization never finished' -Attempt {
+            Complete-K8ShakedownRunInSequence -Run $run
+        }
+        # The operation that created this state is the one allowed to finish it.
+        Invoke-K8SequenceMutation -Operation 'FinalizeRunInitialization' -RunId $run.RunId -Body {
+            param($State)
+            $s = @($State.Live)[0]
+            $s['active_run']['state'] = 'running'
+            Write-K8SequenceRecord -Record $s
+        } | Out-Null
+        if ((Get-K8QualificationSequence)['active_run']['state'] -ne 'running') { throw 'the matching continuation did not take effect' }
+        # ...and only for the matching run ID.
+        $live2 = Get-K8QualificationSequence
+        $live2['active_run']['state'] = 'initializing'
+        Write-K8SequenceRecord -Record $live2
+        Assert-K8FailsClosed -What 'continuing initialization for a different run ID' -Because 'targets run' -Attempt {
+            Invoke-K8SequenceMutation -Operation 'FinalizeRunInitialization' -RunId 'k8shakedown-rangea-19700101-000000' -Body { param($State) }
+        }
+    }
+}
+
+Assert-K8Test 'Crash before provenance: close still writes a truthful tooling_head from the reservation' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        # Reproduce "reserved, then died before run-provenance.json was written".
+        Remove-Item (Get-K8RunProvenancePath -RunId $run.RunId) -Force
+        $live = Get-K8QualificationSequence
+        $live['active_run']['state'] = 'initializing'
+        Write-K8SequenceRecord -Record $live
+        Assert-K8FailsClosed -What 'a new reservation after an interrupted initialization' -Because 'already active' -Attempt {
+            Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        }
+        # Move HEAD, so substituting the current head would be visible.
+        $newHead = Add-K8SandboxCommit -Repo $sb.Repo -Text 'moved after the crash'
+        Close-K8QualificationSequence -Reason 'crashed before provenance' | Out-Null
+        $term = Get-Content (Get-K8TerminationRecordPath -RunId $run.RunId) -Raw | ConvertFrom-Json
+        if ($term.stage -ne 'operator-close') { throw "stage = $($term.stage)" }
+        if ($term.failure_kind -ne 'non-command') { throw "failure_kind = $($term.failure_kind)" }
+        if ($null -ne $term.command) { throw 'an operator close invented a command record' }
+        if ($term.tooling_head_source -ne 'reservation') { throw "tooling_head_source = $($term.tooling_head_source)" }
+        if ($term.tooling_head -ne $sb.Head) { throw 'tooling_head is not the head the run was reserved under' }
+        if ($term.tooling_head -eq $newHead) { throw 'the current HEAD was substituted for the run''s own' }
+    }
+}
+
+Assert-K8Test 'Interrupted sequence creation after the pointer write requires an explicit close' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $seq = New-K8QualificationSequence -RepoRoot $sb.Repo
+        $path = Join-Path $sb.Root "sequences\$($seq['sequence_id']).json"
+        # Rewind past stage 3: record still 'initializing', pointer already written.
+        $rec = Get-Content $path -Raw | ConvertFrom-Json -AsHashtable
+        $rec['status'] = 'initializing'
+        ($rec | ConvertTo-Json -Depth 12) | Set-Content -Path $path -Encoding utf8NoBOM
+        Assert-K8FailsClosed -What 'creating a sequence over an interrupted creation' -Because 'interrupted after its pointer was written' -Attempt {
+            New-K8QualificationSequence -RepoRoot $sb.Repo
+        }
+        Assert-K8FailsClosed -What 'starting a run against an interrupted creation' -Because 'interrupted after its pointer was written' -Attempt {
+            Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        }
+        Close-K8QualificationSequence -Reason 'interrupted creation' | Out-Null
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+    }
+}
+
+Assert-K8Test 'Provably-unused initializing residue is quarantined as abandoned; anything less fails closed' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $seq = New-K8QualificationSequence -RepoRoot $sb.Repo
+        $path = Join-Path $sb.Root "sequences\$($seq['sequence_id']).json"
+        $rec = Get-Content $path -Raw | ConvertFrom-Json -AsHashtable
+        $rec['status'] = 'initializing'
+        ($rec | ConvertTo-Json -Depth 12) | Set-Content -Path $path -Encoding utf8NoBOM
+        Remove-Item (Join-Path $sb.Root 'sequences\current.txt') -Force   # crash BEFORE the pointer write
+        $fresh = New-K8QualificationSequence -RepoRoot $sb.Repo
+        $quarantined = Get-Content $path -Raw | ConvertFrom-Json
+        if ($quarantined.status -ne 'abandoned') { throw "residue status = $($quarantined.status)" }
+        if ([string]::IsNullOrWhiteSpace($quarantined.abandoned_reason)) { throw 'the quarantine was not explained' }
+        if ($fresh['sequence_id'] -eq $seq['sequence_id']) { throw 'the residue was reused rather than quarantined' }
+    }
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $seq = New-K8QualificationSequence -RepoRoot $sb.Repo
+        $path = Join-Path $sb.Root "sequences\$($seq['sequence_id']).json"
+        $rec = Get-Content $path -Raw | ConvertFrom-Json -AsHashtable
+        $rec['status'] = 'initializing'
+        ($rec | ConvertTo-Json -Depth 12) | Set-Content -Path $path -Encoding utf8NoBOM
+        Remove-Item (Join-Path $sb.Root 'sequences\current.txt') -Force
+        # Break condition 4: a run record naming this sequence still exists.
+        $rr = Join-Path $sb.Root 'run-records\k8shakedown-rangea-19700101-000000'
+        New-Item -ItemType Directory -Force -Path $rr | Out-Null
+        (@{ sequence_id = $seq['sequence_id'] } | ConvertTo-Json) | Set-Content -Path (Join-Path $rr 'run-provenance.json') -Encoding utf8NoBOM
+        Assert-K8FailsClosed -What 'quarantining residue that a run record still references' -Attempt {
+            New-K8QualificationSequence -RepoRoot $sb.Repo
+        }
+    }
+}
+
+Assert-K8Test 'A terminated run makes its sequence ineligible, and only an explicit close moves past it' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        try {
+            Invoke-K8ShakedownRunBoundary -Run $run -ScriptBlock {
+                Set-K8ShakedownRunStage -Stage 'preflight'
+                throw 'simulated failure'
+            }.GetNewClosure()
+        } catch { }
+        if ((Get-K8QualificationSequence)['status'] -ne 'ineligible') { throw 'the sequence was not made ineligible' }
+        Assert-K8FailsClosed -What 'opening a new sequence while one is ineligible' -Because 'still live' -Attempt {
+            New-K8QualificationSequence -RepoRoot $sb.Repo
+        }
+        Assert-K8FailsClosed -What 'starting another run in an ineligible sequence' -Because 'is ineligible' -Attempt {
+            Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        }
+        Assert-K8FailsClosed -What 'completing a run in an ineligible sequence' -Because 'is ineligible' -Attempt {
+            Complete-K8ShakedownRunInSequence -Run $run
+        }
+        Close-K8QualificationSequence -Reason 'after the terminated run' | Out-Null
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+    }
+}
+
+Assert-K8Test 'Partial termination: only the matching RecordTermination or an explicit close moves forward' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        # Half of the termination transaction: the authoritative record is on
+        # disk, the sequence is still 'open'.
+        Write-K8AtomicFile -Path (Get-K8TerminationRecordPath -RunId $run.RunId) -Content (@{
+            schema = 'k8shakedown-termination/1'; run_id = $run.RunId; stage = 'preflight'
+            failure_kind = 'non-command'; command = $null
+        } | ConvertTo-Json)
+        if ((Get-K8QualificationSequence)['status'] -ne 'open') { throw 'the setup did not reproduce the partial state' }
+        Assert-K8FailsClosed -What 'completing a run that already has a termination record' -Because 'authoritative termination record' -Attempt {
+            Complete-K8ShakedownRunInSequence -Run $run
+        }
+        Assert-K8FailsClosed -What 'starting a new run over a partial termination' -Because 'already active' -Attempt {
+            Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        }
+        # Finishing the transaction is permitted.
+        Set-K8SequenceIneligible -Run $run
+        if ((Get-K8QualificationSequence)['status'] -ne 'ineligible') { throw 'the transaction could not be completed' }
+        Close-K8QualificationSequence -Reason 'recovered' | Out-Null
+    }
+}
+
+Assert-K8Test 'Completion independently refuses a run holding a termination record' {
+    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Complete-K8ShakedownRunInSequence'
+    if ($body -notmatch 'Test-K8ActiveRunHasTermination') { throw 'completion does not independently check for a termination record' }
+}
+
+Assert-K8Test 'complete / closed / abandoned are immutable terminal states' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        Close-K8QualificationSequence -Reason 'first close' | Out-Null
+        Assert-K8FailsClosed -What 're-closing a closed sequence' -Because 'immutable terminal states' -Attempt {
+            Close-K8QualificationSequence -Reason 'second close'
+        }
+        Assert-K8FailsClosed -What 're-closing a closed sequence by ID' -Because 'immutable terminal states' -Attempt {
+            Close-K8QualificationSequence -Reason 'second close' -SequenceId 'anything'
+        }
+        if (@((Get-K8ControlPlaneState).Live).Count -ne 0) { throw 'a terminal record is still being treated as live' }
+    }
+}
+
+Assert-K8Test 'Every terminal transition retires current.txt' {
+    Import-Module $CommonPath -Force
+    $transition = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Complete-K8SequenceTerminalTransition'
+    if ($transition -notmatch 'Remove-K8SequencePointer') { throw 'the terminal transition does not retire the pointer' }
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $pointer = Join-Path $sb.Root 'sequences\current.txt'
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        Close-K8QualificationSequence -Reason 'closing' | Out-Null
+        if (Test-Path $pointer) { throw 'current.txt survived a close' }
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        if (-not (Test-Path $pointer)) { throw 'current.txt was not written for the new sequence' }
+        foreach ($range in @('a', 'b', 'c')) {
+            $r = Start-K8ShakedownRun -Range $range -RepoRoot $sb.Repo
+            Complete-K8ShakedownRunInSequence -Run $r | Out-Null
+        }
+        if (Test-Path $pointer) { throw 'current.txt survived a completion' }
+    }
+}
+
+Assert-K8Test 'status=complete requires an uninterrupted a,b,c and claims only c-2b-sequence-valid' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $final = $null
+        foreach ($range in @('a', 'b', 'c')) {
+            $r = Start-K8ShakedownRun -Range $range -RepoRoot $sb.Repo
+            $final = Complete-K8ShakedownRunInSequence -Run $r
+        }
+        if ($final['status'] -ne 'complete') { throw "status = $($final['status'])" }
+        if ($final['completion_claim'] -ne 'c-2b-sequence-valid') { throw "completion_claim = $($final['completion_claim'])" }
+        if (@($final['terminated_runs']).Count -ne 0) { throw 'a complete sequence carries terminated runs' }
+    }
+    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Complete-K8ShakedownRunInSequence'
+    if ($body -notmatch 'terminated_runs') { throw 'completion does not consider terminated runs' }
+    if ($body -notmatch "'a,b,c'") { throw 'completion does not require the exact a,b,c order' }
+}
+
+Assert-K8Test 'The tooling never claims K8-S2 authorization, and offers no same-sequence run retry' {
+    foreach ($file in @($CommonPath, $RangeCPath, (Join-Path $ToolsDir 'Start-K8QualificationSequence.ps1'), (Join-Path $ToolsDir 'Close-K8QualificationSequence.ps1'))) {
+        $text = Get-Content $file -Raw
+        foreach ($line in ($text -split "`n")) {
+            if ($line -match 'K8-S2 authoriz' -and $line -notmatch 'NOT a K8-S2 authorization|not a K8-S2 authorization') {
+                throw "$file claims K8-S2 authorization: $($line.Trim())"
+            }
+        }
+    }
+    if (Test-Path (Join-Path $ToolsDir 'Close-K8ShakedownRun.ps1')) { throw 'a same-sequence run-close/retry entry point exists; a terminated run must end its sequence' }
+    Import-Module $CommonPath -Force
+    if (Get-Command -Name 'Close-K8ShakedownRun' -ErrorAction SilentlyContinue) { throw 'a same-sequence run-close/retry function exists' }
+}
+
+Assert-K8Test 'Non-command termination records the common fields and fabricates no command semantics' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        try {
+            Invoke-K8ShakedownRunBoundary -Run $run -ScriptBlock {
+                Set-K8ShakedownRunStage -Stage 'completeness-gate'
+                throw 'required artifact contract-output\qdisc-post-fault.txt is missing'
+            }.GetNewClosure()
+            throw 'the boundary did not re-throw'
+        }
+        catch { if ($_.Exception.Message -notmatch 'qdisc-post-fault') { throw "the boundary altered the failure: $($_.Exception.Message)" } }
+        $raw = Get-Content (Get-K8TerminationRecordPath -RunId $run.RunId) -Raw
+        $term = $raw | ConvertFrom-Json
+        foreach ($field in @('stage', 'failure_kind', 'timestamp', 'message', 'tooling_head', 'sequence_id')) {
+            if ([string]::IsNullOrWhiteSpace([string]$term.$field)) { throw "required field '$field' is missing or empty" }
+        }
+        if ($term.failure_kind -ne 'non-command') { throw "failure_kind = $($term.failure_kind)" }
+        if ($term.stage -ne 'completeness-gate') { throw "stage = $($term.stage)" }
+        if ($null -ne $term.command) { throw 'a non-command termination carries a command record' }
+        # Not merely null: the keys must not exist at all, so no reader can take
+        # a placeholder for an observation.
+        if ($raw -match '"argv"' -or $raw -match '"exit_code"') { throw 'command semantics were fabricated for a non-command termination' }
+        if ([string]::IsNullOrWhiteSpace($term.exception.type)) { throw 'the exception type was not retained' }
+    }
+}
+
+Assert-K8Test 'External-command termination retains argv, exit code and the full captured transcript' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        try {
+            Invoke-K8ShakedownRunBoundary -Run $run -ScriptBlock {
+                Set-K8ShakedownRunStage -Stage 'preflight'
+                Invoke-K8ShakedownCommand -FilePath 'git' -ArgumentList @('-C', $sb.Repo, 'rev-parse', '--verify', 'refs/heads/no-such-branch')
+            }.GetNewClosure()
+            throw 'the boundary did not re-throw'
+        }
+        catch { }
+        $term = Get-Content (Get-K8TerminationRecordPath -RunId $run.RunId) -Raw | ConvertFrom-Json
+        if ($term.failure_kind -ne 'external-command') { throw "failure_kind = $($term.failure_kind)" }
+        if (@($term.command.argv)[0] -ne 'git') { throw "argv[0] = $(@($term.command.argv)[0])" }
+        if (@($term.command.argv) -notcontains 'refs/heads/no-such-branch') { throw 'argv does not carry the real arguments' }
+        if ($term.command.exit_code -eq 0) { throw 'exit_code is not the real failing code' }
+        # This helper merges the streams, so the transcript is named as combined.
+        if ($term.command.streams_separated -ne $false) { throw 'a merged capture claims separated streams' }
+        if ($null -ne $term.command.stdout -or $null -ne $term.command.stderr) { throw 'a merged transcript was reported as stdout/stderr' }
+        if ([string]::IsNullOrWhiteSpace($term.command.capture_note)) { throw 'the capture note is missing' }
+        $file = Join-Path (Get-K8RunRecordDir -RunId $run.RunId) $term.command.combined_output.path
+        if (-not (Test-Path $file)) { throw 'the captured transcript file was not retained' }
+        if ((Get-Item $file).Length -ne $term.command.combined_output.bytes) { throw 'recorded bytes disagree with the retained file' }
+        if ((Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant() -ne $term.command.combined_output.sha256) { throw 'recorded sha256 disagrees with the retained file' }
+    }
+}
+
+Assert-K8Test 'A tolerated command failure is not grafted onto a later unrelated termination' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        try {
+            Invoke-K8ShakedownRunBoundary -Run $run -ScriptBlock {
+                Set-K8ShakedownRunStage -Stage 'preflight'
+                # Fails, but its exit code is allowed: it must leave nothing behind.
+                Invoke-K8ShakedownCommand -FilePath 'git' -ArgumentList @('-C', $sb.Repo, 'rev-parse', '--verify', 'refs/heads/no-such-branch') -AllowExitCodes @(0, 128) | Out-Null
+                throw 'an unrelated internal assertion'
+            }.GetNewClosure()
+        }
+        catch { }
+        $raw = Get-Content (Get-K8TerminationRecordPath -RunId $run.RunId) -Raw
+        $term = $raw | ConvertFrom-Json
+        if ($term.failure_kind -ne 'non-command') { throw "a tolerated command failure was attributed to a later throw: failure_kind = $($term.failure_kind)" }
+        if ($null -ne $term.command) { throw 'stale command context leaked into an unrelated termination' }
+        if ($raw -match '"argv"') { throw 'stale argv leaked into an unrelated termination' }
+    }
+}
+
+Assert-K8Test 'Command context travels on the exception itself, not a module-global slot' {
+    $source = Get-K8CommentStrippedSource -Path $CommonPath
+    if ($source -notmatch "Data\['k8_command_context'\]") { throw 'command context is not attached to the exception' }
+    if ($source -match '\$script:K8LastCommandFailure') { throw 'a module-global last-failure slot exists' }
+    $lookup = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Get-K8CommandFailureContext'
+    if ($lookup -notmatch 'InnerException') { throw 'the lookup does not walk the exception chain' }
+    if ($lookup -match 'script:') { throw 'the lookup consults module state instead of the handled exception' }
+}
+
+Assert-K8Test 'Captured transcripts are retained in full; the JSON preview is a convenience only' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        $big = ('x' * 200000)
+        $ex = New-K8CommandFailure -Argv @('fake', 'command') -ExitCode 9 -StreamsSeparated -Stdout $big -Stderr 'short' -Message 'synthetic large-output failure'
+        try {
+            Invoke-K8ShakedownRunBoundary -Run $run -ScriptBlock {
+                Set-K8ShakedownRunStage -Stage 'target-decode'
+                throw $ex
+            }.GetNewClosure()
+        }
+        catch { }
+        $term = Get-Content (Get-K8TerminationRecordPath -RunId $run.RunId) -Raw | ConvertFrom-Json
+        $stdoutFile = Join-Path (Get-K8RunRecordDir -RunId $run.RunId) $term.command.stdout.path
+        # The retained artifact must equal the full transcript the TOOLING
+        # captured. It is not a claim about the native process's own bytes,
+        # which this synthetic failure never had.
+        if ((Get-Content $stdoutFile -Raw) -ne $big) { throw 'the retained transcript is not the full captured text' }
+        if ($term.command.stdout.bytes -ne (Get-Item $stdoutFile).Length) { throw 'recorded bytes disagree with the retained file' }
+        if ($term.command.stdout.preview_truncated -ne $true) { throw 'a truncated preview was not flagged' }
+        if ($term.command.stdout.preview.Length -ge $big.Length) { throw 'the preview was not truncated at all' }
+        if ($term.command.stderr.preview_truncated -ne $false) { throw 'a short stream was flagged as truncated' }
+        if ($term.command.streams_separated -ne $true) { throw 'separated streams were recorded as merged' }
+    }
+}
+
+Assert-K8Test 'Termination records never touch the frozen evidence tree' {
+    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Write-K8TerminationRecord'
+    if ($body -match '\$RunEvidence') { throw 'the termination writer references the evidence tree' }
+    if ($body -notmatch 'Get-K8TerminationRecordPath') { throw 'the termination writer does not use the control-plane path' }
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        # An already-finalized evidence tree: adding any file to it would put it
+        # permanently at odds with its own manifest.
+        $tree = Join-Path $sb.Root "runs\$($run.RunId)"
+        New-Item -ItemType Directory -Force -Path $tree | Out-Null
+        Copy-K8RunProvenanceIntoEvidence -Run $run -RunEvidence $tree
+        'placeholder' | Set-Content -Path (Join-Path $tree 'evidence.txt')
+        (@(Get-ChildItem $tree -Recurse -File | ForEach-Object { $_.Name }) | Sort-Object) -join "`n" | Set-Content -Path (Join-Path $tree 'hashes.sha256')
+        $before = @(Get-ChildItem $tree -Recurse -File | ForEach-Object { $_.Name }) | Sort-Object
+        try {
+            Invoke-K8ShakedownRunBoundary -Run $run -ScriptBlock {
+                Set-K8ShakedownRunStage -Stage 'final-verify'
+                throw 'failure after the tree was finalized'
+            }.GetNewClosure()
+        }
+        catch { }
+        $after = @(Get-ChildItem $tree -Recurse -File | ForEach-Object { $_.Name }) | Sort-Object
+        if (($before -join '|') -ne ($after -join '|')) { throw "the evidence tree gained files after finalize: $(@($after | Where-Object { $before -notcontains $_ }) -join ', ')" }
+        if (-not (Test-Path (Get-K8TerminationRecordPath -RunId $run.RunId))) { throw 'the termination record was not written to the control plane' }
+    }
+}
+
+Assert-K8Test 'The boundary re-throws the original failure even when the record cannot be written' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        # Put a FILE where the per-run record directory has to be.
+        Remove-Item (Get-K8RunRecordDir -RunId $run.RunId) -Recurse -Force
+        'not a directory' | Set-Content -Path (Get-K8RunRecordDir -RunId $run.RunId)
+        $caught = $null
+        try {
+            Invoke-K8ShakedownRunBoundary -Run $run -ScriptBlock {
+                Set-K8ShakedownRunStage -Stage 'provision'
+                throw 'THE ORIGINAL REASON'
+            }.GetNewClosure()
+        }
+        catch { $caught = $_.Exception.Message }
+        if ($caught -ne 'THE ORIGINAL REASON') { throw "a record-write failure replaced the original reason: '$caught'" }
+    }
+}
+
+Assert-K8Test 'Writing a termination record never converts a failure into a success' {
+    $boundary = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Invoke-K8ShakedownRunBoundary'
+    if ($boundary -notmatch 'throw \$original') { throw 'the boundary does not re-throw the original error record' }
+    foreach ($guarded in @('Write-K8TerminationRecord', 'Set-K8SequenceIneligible')) {
+        if ($boundary -notmatch [regex]::Escape($guarded)) { throw "the boundary does not call $guarded" }
+    }
+}
+
+Assert-K8Test 'Each stage is set immediately before that stage''s first fallible operation' {
+    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Invoke-K8ShakedownRangeABBody'
+    foreach ($pair in @(
+        @{ Stage = 'sequence-binding';        Anchor = 'Assert-K8SequenceBinding' }
+        @{ Stage = 'evidence-tree';           Anchor = 'evidence_tree import create' }
+        @{ Stage = 'preflight';               Anchor = 'study01_preflight.py' }
+        @{ Stage = 'network-preflight';       Anchor = 'Test-K8ShakedownNetworkPreflight' }
+        @{ Stage = 'provision';               Anchor = 'Invoke-K8ShakedownLoggedCommand' }
+        @{ Stage = 'compose-readiness';       Anchor = 'Wait-K8ComposeReady' }
+        @{ Stage = 'application-readiness';   Anchor = 'Wait-K8ElasticsearchReady' }
+        @{ Stage = 'image-inventory';         Anchor = 'Write-K8ImageInventory' }
+        @{ Stage = 'gateway-resolution';      Anchor = 'Resolve-K8GatewayInterface' }
+        @{ Stage = 'fault-injection';         Anchor = 'Invoke-K8FaultObservationCommand' }
+        @{ Stage = 'runtime-contract-record'; Anchor = 'Write-K8RuntimeContractRecord' }
+        @{ Stage = 'window-start';            Anchor = 'Wait-K8CaptureWindowStart' }
+        @{ Stage = 'sender-trigger';          Anchor = 'study01_sender.py' }
+        @{ Stage = 'window-end';              Anchor = 'Wait-K8CaptureWindowEnd' }
+        @{ Stage = 'capture-lifecycle-check'; Anchor = 'Test-K8CaptureLifecycleEarly' }
+        @{ Stage = 'target-decode';           Anchor = 'Write-K8TargetCaptureDecode' }
+        @{ Stage = 'completeness-gate';       Anchor = 'Test-K8ScoringInputArtifactCompleteness' }
+    )) {
+        $marker = $body.IndexOf("Set-K8ShakedownRunStage -Stage '$($pair.Stage)'")
+        if ($marker -lt 0) { throw "stage '$($pair.Stage)' is never set in Invoke-K8ShakedownRangeABBody" }
+        $anchor = $body.IndexOf($pair.Anchor)
+        if ($anchor -lt 0) { throw "anchor operation '$($pair.Anchor)' not found" }
+        if ($anchor -lt $marker) { throw "stage '$($pair.Stage)' is set AFTER '$($pair.Anchor)'; a failure there would be attributed to the previous stage" }
+    }
+    $completeBody = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Complete-K8ShakedownRangeABBody'
+    foreach ($pair in @(
+        @{ Stage = 'complete-preconditions'; Anchor = 'Assert-K8RunSequenceInvariant' }
+        @{ Stage = 'pre-teardown-validate';  Anchor = 'validate-evidence' }
+        @{ Stage = 'teardown';               Anchor = "'down', '-v'" }
+        @{ Stage = 'final-verify';           Anchor = 'verify-integrity' }
+    )) {
+        $marker = $completeBody.IndexOf("Set-K8ShakedownRunStage -Stage '$($pair.Stage)'")
+        if ($marker -lt 0) { throw "stage '$($pair.Stage)' is never set in Complete-K8ShakedownRangeABBody" }
+        $anchor = $completeBody.IndexOf($pair.Anchor)
+        if ($anchor -lt 0) { throw "anchor '$($pair.Anchor)' not found in Complete-K8ShakedownRangeABBody" }
+        if ($anchor -lt $marker) { throw "stage '$($pair.Stage)' is set after '$($pair.Anchor)'" }
+    }
+    $rangeC = Get-K8CommentStrippedSource -Path $RangeCPath
+    foreach ($pair in @(
+        @{ Stage = 'sequence-binding'; Anchor = 'Assert-K8SequenceBinding' }
+        @{ Stage = 'worktree-copy';    Anchor = 'Copy-Item -Recurse' }
+        @{ Stage = 'validator-run';    Anchor = 'cmd.exe' }
+    )) {
+        $marker = $rangeC.IndexOf("Set-K8ShakedownRunStage -Stage '$($pair.Stage)'")
+        if ($marker -lt 0) { throw "stage '$($pair.Stage)' is never set in Run-K8ShakedownRangeC.ps1" }
+        $anchor = $rangeC.IndexOf($pair.Anchor)
+        if ($anchor -lt 0) { throw "anchor '$($pair.Anchor)' not found in Run-K8ShakedownRangeC.ps1" }
+        if ($anchor -lt $marker) { throw "stage '$($pair.Stage)' is set after '$($pair.Anchor)' in Run-K8ShakedownRangeC.ps1" }
+    }
+}
+
+Assert-K8Test 'No control-plane record path resolves under Study01/' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $frozen = (Resolve-Path $Study01).Path
+        $workspace = (Resolve-Path $sb.Root -ErrorAction SilentlyContinue)
+        $workspaceRoot = $(if ($workspace) { $workspace.Path } else { $sb.Root })
+        foreach ($p in @(
+            (Get-K8SequenceDir), (Get-K8RunRecordsDir), (Get-K8SequencePointerPath), (Get-K8SequenceLockPath),
+            (Get-K8SequenceRecordPath -SequenceId 'k8shakedown-seq-19700101-000000'),
+            (Get-K8RunProvenancePath -RunId 'k8shakedown-rangea-19700101-000000'),
+            (Get-K8TerminationRecordPath -RunId 'k8shakedown-rangea-19700101-000000')
+        )) {
+            if ($p.StartsWith($frozen, [System.StringComparison]::OrdinalIgnoreCase)) { throw "control-plane path '$p' resolves under the frozen Study01 tree" }
+            if (-not $p.StartsWith($workspaceRoot, [System.StringComparison]::OrdinalIgnoreCase)) { throw "control-plane path '$p' escapes the Shakedown workspace" }
+        }
     }
 }
 

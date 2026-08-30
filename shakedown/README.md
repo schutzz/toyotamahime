@@ -17,8 +17,10 @@ at a time.
 Unlike a formal K8-3 attempt:
 
 - Commands can be re-run.
-- A failure can be debugged and fixed mid-run, then resumed from where it
-  stopped, rather than closing the attempt and starting over.
+- A failure can be debugged and fixed, then the whole sequence restarted at the
+  fixed commit, rather than closing a formal attempt and starting over.
+  (Note: inside a *qualification sequence* a terminated run is not resumed --
+  see "Qualification sequences" below.)
 - Nothing produced here is scored, judged for Gate K8, or written into
   Kakuriyo's `evidence/reproduction/`.
 - A result that differs from `Study01/expected/` is retained as a Shakedown
@@ -44,6 +46,70 @@ Unlike a formal K8-3 attempt:
 - It executes the fixed Elasticsearch requests and mechanical correlations,
   retaining the instantiated requests and full raw responses. It does not
   change selectors after seeing results or assign scientific scores.
+
+## Qualification sequences
+
+The first full Shakedown's three "qualification runs" turned out to span
+*different* tooling commits, and nothing detected it. A **qualification
+sequence** makes the single-HEAD, uninterrupted `A → B → C` property
+machine-enforced instead of conventional.
+
+`Start-K8QualificationSequence.ps1` records, once:
+
+| field | meaning |
+| --- | --- |
+| `sequence_id` | which sequence this is |
+| `locked_head` | the exact commit it commits to |
+| `started_utc`, `initial_tree_clean` | when, and that the tree was clean |
+
+`sequence_id` and `locked_head` are deliberately **separate facts**. Every run
+independently records the `tooling_head` it actually ran under, and the gate at
+the start of each run compares the two, re-reading git at that moment rather
+than trusting a stored value. Binding the HEAD into the ID would make them
+indistinguishable and leave nothing to check.
+
+The sequence also enforces the order: a run starts only if it is the range the
+sequence expects next and no other run is active.
+
+**A terminated run ends its sequence.** There is no retry inside the same
+sequence and no resuming a failed run. The only way forward is
+`Close-K8QualificationSequence.ps1 -Reason '...'` → fix → *new* sequence →
+restart from Range A. Close before fixing: opening a sequence locks whatever
+HEAD is checked out.
+
+Reaching `status = complete` stamps `completion_claim = "c-2b-sequence-valid"`,
+which means exactly one thing — an uninterrupted `A → B → C` at one locked HEAD.
+It is **not** a K8-S2 authorization.
+
+### Control plane vs. scientific evidence
+
+These are kept strictly apart:
+
+```text
+<workspace>/sequences/<sequence_id>.json    what the sequence committed to
+<workspace>/sequences/current.txt           pointer to the live sequence
+<workspace>/run-records/<run_id>/           provenance, termination, captured streams
+<workspace>/runs/<run_id>/                  the scientific evidence tree
+```
+
+`run-provenance.json` is written to `run-records/` the moment a run ID is issued
+— before any scientific or runtime step — and mirrored, byte for byte, into the
+evidence tree as soon as the frozen `evidence_tree.create()` has made it. It
+goes at the tree *root*: the frozen preflight requires the eight schema
+directories to be empty, and the root is what `finalize-evidence` hashes.
+
+A **termination record** is written only to `run-records/`, never into the
+evidence tree. After `finalize-evidence` has hashed a tree, any file added to it
+would leave that tree permanently inconsistent with its own `hashes.sha256`.
+
+A termination record carries `stage`, `failure_kind`, `timestamp`, `message`,
+`exception`, `tooling_head` and `sequence_id` always — and `argv`, `exit_code`
+and the retained streams **only when the failure actually came from an external
+command**. A gate that failed on a missing artifact, a `ValueError` on a
+successfully-retrieved response, a zero-row decode or a completeness assertion
+has no argv and no exit code, and none is invented for it. Where the capturing
+helper merged the streams, the transcript is recorded as `combined_output` — not
+as `stdout`.
 
 ## Two-phase Range A/B
 
@@ -71,6 +137,8 @@ shakedown/
 ├─ README.md                                  <- you are here
 ├─ tools/
 │  ├─ K8ShakedownCommon.psm1                   <- pinned constants + shared functions
+│  ├─ Start-K8QualificationSequence.ps1        <- opens a sequence and locks the tooling HEAD
+│  ├─ Close-K8QualificationSequence.ps1        <- the only way out of a live sequence
 │  ├─ Start-K8Shakedown.ps1                    <- Setup
 │  ├─ Run-K8ShakedownRangeA.ps1                <- phase 1: provision through capture/trigger; leaves the range UP
 │  ├─ Run-K8ShakedownRangeB.ps1                <- same, + the fault

@@ -125,6 +125,1032 @@ function New-K8ShakedownRunId {
     return "k8shakedown-range$Range-$ts"
 }
 
+function New-K8QualificationSequenceId {
+    <#
+        A sequence ID states WHICH SEQUENCE a run belongs to. It deliberately
+        embeds NO part of the locked HEAD: `sequence_id` and `locked_head` are
+        two different facts, and the whole point of the C-2b gate is to compare
+        them. Binding the HEAD into the ID would make them indistinguishable
+        and leave nothing to check.
+
+        Same namespace rule as run IDs: k8shakedown-*, never k8-repro-*.
+
+        The timestamp has one-second granularity, and closing a sequence and
+        opening the next one can easily happen inside the same second, so a
+        taken ID gets a `-2`, `-3`, ... suffix. That allocates a FRESH unused
+        ID; it never reuses or overwrites an existing record, which stays a
+        fail-closed condition. Must be called while holding the sequence lock.
+    #>
+    $ts = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+    $base = "k8shakedown-seq-$ts"
+    if (-not (Test-Path -LiteralPath (Get-K8SequenceRecordPath -SequenceId $base))) { return $base }
+    for ($n = 2; $n -le 100; $n++) {
+        $candidate = "$base-$n"
+        if (-not (Test-Path -LiteralPath (Get-K8SequenceRecordPath -SequenceId $candidate))) { return $candidate }
+    }
+    throw "Could not allocate an unused sequence ID from '$base' after 100 attempts. Refusing to overwrite an existing control-plane record."
+}
+
+# ===========================================================================
+# Qualification-sequence control plane (C-2b), per-run provenance (C-2) and
+# termination records (C-1).
+#
+# WHY THIS EXISTS (K8-SHAKEDOWN-RETROSPECTIVE.md SS5 / SS7):
+#   - Root causes for the first Shakedown were recoverable only because
+#     somebody later wrote a commit message naming the run. SD-01/02/07 have
+#     no such commit and stay unattributed to this day. C-1/C-2 remove that
+#     dependency.
+#   - The bundle's three "qualification runs" span DIFFERENT tooling HEADs and
+#     nothing detected it. C-2b makes a single-HEAD, uninterrupted A -> B -> C
+#     sequence machine-enforced rather than conventional.
+#
+# STRICT SEPARATION: everything this section writes is CONTROL-PLANE record
+# under <root>/sequences/ and <root>/run-records/. The only thing that ever
+# enters the frozen scientific evidence tree is run-provenance.json, mirrored
+# once, early, long before study01_collect.py finalize-evidence hashes the
+# tree. A termination record is NEVER written into the evidence tree: after
+# `finalize-evidence` any added file would make `verify-integrity` disagree
+# with hashes.sha256 for the rest of that run's life.
+# ===========================================================================
+
+$script:K8SequenceSchema           = 'k8shakedown-qualification-sequence/1'
+$script:K8ProvenanceSchema         = 'k8shakedown-run-provenance/1'
+$script:K8TerminationSchema        = 'k8shakedown-termination/1'
+$script:K8LiveSequenceStatus       = @('initializing', 'open', 'ineligible')
+$script:K8TerminalSequenceStatus   = @('complete', 'closed', 'abandoned')
+$script:K8SequenceLockTimeoutSec   = 120
+$script:K8TerminationPreviewChars  = 4096
+$script:K8CaptureNote = 'bytes/sha256 describe the retained capture file, i.e. the full transcript this tooling captured. They are not a claim about the native process''s original stream bytes.'
+
+# The current run, for stage tracking and termination attribution. Per-process
+# and deliberately NOT persisted: the durable facts live in the sequence record
+# and in run-records/.
+$script:K8CurrentRun = $null
+
+function Get-K8SequenceDir { Join-Path (Get-K8ShakedownRoot) 'sequences' }
+function Get-K8RunRecordsDir { Join-Path (Get-K8ShakedownRoot) 'run-records' }
+function Get-K8SequencePointerPath { Join-Path (Get-K8SequenceDir) 'current.txt' }
+function Get-K8SequenceLockPath { Join-Path (Get-K8SequenceDir) '.lock' }
+function Get-K8SequenceRecordPath { param([Parameter(Mandatory)][string] $SequenceId) Join-Path (Get-K8SequenceDir) "$SequenceId.json" }
+function Get-K8RunRecordDir { param([Parameter(Mandatory)][string] $RunId) Join-Path (Get-K8RunRecordsDir) $RunId }
+function Get-K8RunProvenancePath { param([Parameter(Mandatory)][string] $RunId) Join-Path (Get-K8RunRecordDir -RunId $RunId) 'run-provenance.json' }
+function Get-K8TerminationRecordPath { param([Parameter(Mandatory)][string] $RunId) Join-Path (Get-K8RunRecordDir -RunId $RunId) 'termination.json' }
+
+function Get-K8UtcNow { (Get-Date).ToUniversalTime().ToString('o') }
+
+function Write-K8AtomicFile {
+    <#
+        Writes via a sibling temp file and an atomic replace, so a crash mid-
+        write can never leave a half-written control-plane record that the next
+        process would parse as truth. Same directory throughout, so the replace
+        stays within one volume.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string] $Content
+    )
+    $parent = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    $tmp = "$Path.tmp-" + [guid]::NewGuid().ToString('N')
+    [System.IO.File]::WriteAllText($tmp, $Content, (New-Object System.Text.UTF8Encoding($false)))
+    # Move-with-overwrite rather than File.Replace: Replace's third argument is
+    # a nullable backup path, and PowerShell coerces $null to an empty string
+    # for it, which fails with "The path is empty". Move(src, dst, overwrite)
+    # handles both the create and the replace case in one call.
+    [System.IO.File]::Move($tmp, $Path, $true)
+}
+
+function Invoke-K8WithSequenceLock {
+    <#
+        Inter-PROCESS exclusive lock. A same-process check is not enough: two
+        shells running Start-K8ShakedownRun at the same moment would both read
+        active_run == null and both reserve a run, which is exactly the
+        single-active-run guarantee C-2b is supposed to make. Fails closed on
+        timeout -- two processes must never both decide that a run may start.
+
+        The parameter is deliberately NOT named $Body: PowerShell resolves a
+        scriptblock's free variables against the CALLER's scope chain, so a
+        caller whose scriptblock also refers to its own $Body would, inside this
+        function, find THIS parameter instead -- and re-invoke the very
+        scriptblock it is running. Callers additionally pin their captures with
+        .GetNewClosure() so the binding cannot drift again.
+    #>
+    param([Parameter(Mandatory)][scriptblock] $Action)
+    $dir = Get-K8SequenceDir
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $lockPath = Get-K8SequenceLockPath
+    $deadline = (Get-Date).AddSeconds($script:K8SequenceLockTimeoutSec)
+    $stream = $null
+    while ($true) {
+        try {
+            $stream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            break
+        }
+        catch [System.IO.IOException] {
+            if ((Get-Date) -ge $deadline) {
+                throw "Could not acquire the Shakedown sequence lock at $lockPath within $($script:K8SequenceLockTimeoutSec)s. Another Shakedown process is mutating the qualification sequence. This is fail-closed on purpose."
+            }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    try { & $Action }
+    finally { if ($stream) { $stream.Dispose() } }
+}
+
+function ConvertTo-K8CanonicalActiveRun {
+    <# Guarantees every documented active_run field exists after a JSON round
+       trip, so callers never have to guess whether a key is present. #>
+    param($ActiveRun)
+    if ($null -eq $ActiveRun) { return $null }
+    $o = [ordered]@{}
+    foreach ($k in @('run_id', 'range', 'state', 'reserved_utc', 'tooling_head', 'tree_clean',
+                     'dirty_paths', 'tooling_repo_root', 'sequence_locked_head', 'observed_utc')) {
+        $o[$k] = $(if ($ActiveRun.Contains($k)) { $ActiveRun[$k] } else { $null })
+    }
+    return $o
+}
+
+function ConvertTo-K8CanonicalSequenceRecord {
+    <# Fixed field order on every write, so a sequence record diffs cleanly and
+       every documented key always exists for readers. #>
+    param($Record)
+    $o = [ordered]@{}
+    foreach ($k in @('schema', 'sequence_id', 'locked_head', 'started_utc', 'initial_tree_clean',
+                     'tooling_repo_root', 'status', 'ineligible_reason', 'abandoned_reason',
+                     'completion_claim', 'next_range', 'active_run', 'completed_runs',
+                     'terminated_runs', 'closed_utc', 'closed_reason')) {
+        $o[$k] = $(if ($Record.Contains($k)) { $Record[$k] } else { $null })
+    }
+    $o['active_run'] = ConvertTo-K8CanonicalActiveRun -ActiveRun $o['active_run']
+    $o['completed_runs'] = @($o['completed_runs'])
+    $o['terminated_runs'] = @($o['terminated_runs'])
+    return $o
+}
+
+function New-K8SequenceRecordObject {
+    param(
+        [Parameter(Mandatory)][string] $SequenceId,
+        [Parameter(Mandatory)][string] $LockedHead,
+        [Parameter(Mandatory)][string] $RepoRoot
+    )
+    return [ordered]@{
+        schema             = $script:K8SequenceSchema
+        sequence_id        = $SequenceId
+        locked_head        = $LockedHead
+        started_utc        = (Get-K8UtcNow)
+        initial_tree_clean = $true
+        tooling_repo_root  = $RepoRoot
+        status             = 'initializing'
+        ineligible_reason  = $null
+        abandoned_reason   = $null
+        completion_claim   = $null
+        next_range         = 'a'
+        active_run         = $null
+        completed_runs     = @()
+        terminated_runs    = @()
+        closed_utc         = $null
+        closed_reason      = $null
+    }
+}
+
+function Write-K8SequenceRecord {
+    param([Parameter(Mandatory)] $Record)
+    $canonical = ConvertTo-K8CanonicalSequenceRecord -Record $Record
+    Write-K8AtomicFile -Path (Get-K8SequenceRecordPath -SequenceId $canonical['sequence_id']) -Content (($canonical | ConvertTo-Json -Depth 12) + "`n")
+}
+
+function Set-K8SequencePointer {
+    param([Parameter(Mandatory)][string] $SequenceId)
+    Write-K8AtomicFile -Path (Get-K8SequencePointerPath) -Content ($SequenceId + "`n")
+}
+
+function Remove-K8SequencePointer {
+    $p = Get-K8SequencePointerPath
+    if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force }
+}
+
+function Complete-K8SequenceTerminalTransition {
+    <#
+        complete / closed / abandoned are IMMUTABLE TERMINAL states: nothing
+        mutates a record once it reaches one. current.txt names only the
+        current LIVE sequence, so a terminal transition retires the pointer in
+        the same locked mutation that writes the terminal status -- never
+        "reconciles" it later.
+    #>
+    param(
+        [Parameter(Mandatory)] $Record,
+        [Parameter(Mandatory)][ValidateSet('complete', 'closed', 'abandoned')][string] $Status
+    )
+    $Record['status'] = $Status
+    Write-K8SequenceRecord -Record $Record
+    Remove-K8SequencePointer
+}
+
+function Test-K8StaleInitializingSequence {
+    <#
+        An `initializing` record left by a crash between creation stages may be
+        quarantined as `abandoned` ONLY when all four conditions below are
+        machine-provable. Anything less is not "harmless garbage" -- it is an
+        unexplained control-plane record, and this tooling fails closed on it.
+    #>
+    param([Parameter(Mandatory)] $Record, $Pointer, [string[]] $RunRecordSequenceIds)
+    if ([string]::IsNullOrWhiteSpace([string]$Record['sequence_id'])) { return $false }
+    if ([string]::IsNullOrWhiteSpace([string]$Record['started_utc'])) { return $false }
+    if ([string]$Record['locked_head'] -notmatch '^[0-9a-f]{40}$') { return $false }
+    # The discriminator: a pointer still naming it means the crash happened
+    # AFTER the pointer write, which needs an explicit operator close.
+    if ($Pointer -eq [string]$Record['sequence_id']) { return $false }
+    if ($null -ne $Record['active_run']) { return $false }
+    if (@($Record['completed_runs']).Count -ne 0) { return $false }
+    if (@($Record['terminated_runs']).Count -ne 0) { return $false }
+    if (@($RunRecordSequenceIds) -contains [string]$Record['sequence_id']) { return $false }
+    return $true
+}
+
+function Get-K8ControlPlaneState {
+    <#
+        Read-only scan of the whole control plane. sequences/*.json is the
+        truth source; current.txt is a convenience pointer that is CROSS-CHECKED
+        against it, never trusted as truth (a crash between the record write and
+        the pointer write must not let a second "open" sequence be created).
+
+        Orphan detection compares run-records/ against the run IDs referenced by
+        EVERY sequence record regardless of status -- not only live ones, or a
+        run belonging to an old closed sequence would be misreported as orphaned.
+    #>
+    $records = @()
+    $seqDir = Get-K8SequenceDir
+    if (Test-Path -LiteralPath $seqDir) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $seqDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+            $parsed = (Get-Content -LiteralPath $f.FullName -Raw) | ConvertFrom-Json -AsHashtable
+            $records += , (ConvertTo-K8CanonicalSequenceRecord -Record $parsed)
+        }
+    }
+
+    $pointer = $null
+    $pp = Get-K8SequencePointerPath
+    if (Test-Path -LiteralPath $pp) { $pointer = (Get-Content -LiteralPath $pp -Raw).Trim() }
+
+    $known = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($r in $records) {
+        if ($null -ne $r['active_run']) { [void]$known.Add([string]$r['active_run']['run_id']) }
+        foreach ($c in @($r['completed_runs']))  { if ($null -ne $c) { [void]$known.Add([string]$c['run_id']) } }
+        foreach ($t in @($r['terminated_runs'])) { if ($null -ne $t) { [void]$known.Add([string]$t['run_id']) } }
+    }
+
+    $runRecordIds = @()
+    $runSeqIds = @()
+    $rrd = Get-K8RunRecordsDir
+    if (Test-Path -LiteralPath $rrd) {
+        foreach ($d in @(Get-ChildItem -LiteralPath $rrd -Directory -ErrorAction SilentlyContinue)) {
+            $runRecordIds += $d.Name
+            $prov = Join-Path $d.FullName 'run-provenance.json'
+            if (Test-Path -LiteralPath $prov) {
+                try {
+                    $p = (Get-Content -LiteralPath $prov -Raw) | ConvertFrom-Json -AsHashtable
+                    if ($p.Contains('sequence_id')) { $runSeqIds += [string]$p['sequence_id'] }
+                }
+                catch { Write-K8ShakedownLog -Level WARN -Message "unreadable run provenance at ${prov}: $($_.Exception.Message)" }
+            }
+        }
+    }
+    $orphans = @($runRecordIds | Where-Object { -not $known.Contains($_) })
+
+    $live = @($records | Where-Object { $script:K8LiveSequenceStatus -contains [string]$_['status'] })
+
+    return [pscustomobject]@{
+        Records              = $records
+        Live                 = $live
+        Pointer              = $pointer
+        Orphans              = $orphans
+        RunRecordIds         = @($runRecordIds)
+        RunRecordSequenceIds = @($runSeqIds)
+    }
+}
+
+function Test-K8ActiveRunHasTermination {
+    param($ActiveRun)
+    if ($null -eq $ActiveRun) { return $false }
+    return (Test-Path -LiteralPath (Get-K8TerminationRecordPath -RunId ([string]$ActiveRun['run_id'])))
+}
+
+function Assert-K8SequenceOperationAllowed {
+    <#
+        OPERATION-AWARE transition gate. A single generic "is the control plane
+        healthy?" test cannot work here, because two of the states it would
+        reject are states this tooling itself creates on the way to a correct
+        outcome:
+
+          - active_run.state == 'initializing' is what ReserveRun leaves behind,
+            and FinalizeRunInitialization is the operation that clears it;
+          - termination.json present while status is still 'open' is what
+            step 1 of a termination leaves behind, and RecordTermination is the
+            operation that completes it.
+
+        So the gate distinguishes an EXTERNAL new start from the INTERNAL
+        continuation of an already-reserved run, by requiring -RunId to match
+        the sequence's own active_run. Everything else still fails closed.
+
+        Terminal records (complete/closed/abandoned) are immutable and are
+        never live, so no operation can ever target one.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $Operation,
+        [Parameter(Mandatory)] $State,
+        [string] $RunId,
+        [string] $SequenceId
+    )
+    $deny = {
+        param([string] $Why)
+        throw "Operation '$Operation' is not permitted by the qualification-sequence control plane: $Why"
+    }
+    $live = @($State.Live)
+
+    if ($live.Count -eq 0) {
+        if ($State.Pointer) {
+            & $deny "current.txt names '$($State.Pointer)' but no live sequence exists. current.txt is a pointer, not evidence -- inspect $(Get-K8SequenceDir), remove the stale pointer by hand, then retry."
+        }
+        if ($Operation -eq 'NewSequence') { return }
+        if ($Operation -eq 'CloseSequence') {
+            & $deny 'no live qualification sequence exists. complete / closed / abandoned are immutable terminal states and are never re-closed.'
+        }
+        & $deny 'no live qualification sequence exists. Run .\tools\Start-K8QualificationSequence.ps1 first.'
+    }
+
+    if ($live.Count -ge 2) {
+        $ids = @($live | ForEach-Object { [string]$_['sequence_id'] }) -join ', '
+        if ($Operation -eq 'CloseSequence') {
+            if (-not $SequenceId) { & $deny "control-plane corruption: $($live.Count) live sequences ($ids). Pass -SequenceId to say which one to close; this tooling never guesses." }
+            return
+        }
+        & $deny "control-plane corruption: $($live.Count) live sequences ($ids). Close them one at a time with -SequenceId before anything else."
+    }
+
+    $s = $live[0]
+    $sid = [string]$s['sequence_id']
+    $status = [string]$s['status']
+    $pointerMatches = ($State.Pointer -eq $sid)
+
+    if ($status -eq 'initializing') {
+        if ($Operation -eq 'CloseSequence') { return }
+        if ($pointerMatches) {
+            & $deny "sequence '$sid' was interrupted after its pointer was written but before it became open. Close it explicitly (.\tools\Close-K8QualificationSequence.ps1 -Reason ...) -- it is not provably-unused residue."
+        }
+        if ($Operation -eq 'NewSequence' -and (Test-K8StaleInitializingSequence -Record $s -Pointer $State.Pointer -RunRecordSequenceIds $State.RunRecordSequenceIds)) { return }
+        & $deny "sequence '$sid' is still 'initializing' and cannot be proven unused. Close it explicitly before creating another."
+    }
+
+    if (@($State.Orphans).Count -gt 0) {
+        if ($Operation -eq 'CloseSequence') { return }
+        & $deny "orphan run record(s) exist that no sequence accounts for: $(@($State.Orphans) -join ', '). A started run whose lifecycle cannot be reconstructed is exactly what C-2 exists to prevent, so this is not ignored silently. run-records/<id>/ is control-plane record; its scientific counterpart, if any, is runs/<id>/. Resolving it is an operator judgment -- this tooling never deletes a record."
+    }
+
+    if (-not $pointerMatches) {
+        if ($Operation -eq 'CloseSequence') { return }
+        # Reported before the plain "a live sequence exists" refusal below,
+        # because an inconsistent control plane is what the operator has to
+        # resolve first -- and closing is the remedy for both.
+        & $deny "current.txt ($(if ($State.Pointer) { "'$($State.Pointer)'" } else { '<absent>' })) disagrees with the live sequence '$sid'. Close the sequence explicitly to resolve it."
+    }
+
+    # Now that the control plane is known consistent, a NewSequence refusal can
+    # state the real reason: a sequence is live and is never stepped over.
+    if ($Operation -eq 'NewSequence') {
+        & $deny "sequence '$sid' is still live (status '$status'). Close it explicitly with .\tools\Close-K8QualificationSequence.ps1 -Reason '...' before opening another; a sequence is never stepped over."
+    }
+
+    if ($status -eq 'ineligible') {
+        if ($Operation -eq 'CloseSequence') { return }
+        & $deny "sequence '$sid' is ineligible: $([string]$s['ineligible_reason']). A terminated run ends its sequence -- close it, fix, open a NEW sequence and restart from Range A. Retrying inside the same sequence is not permitted."
+    }
+
+    # status = open
+    if ($Operation -eq 'CloseSequence') { return }
+    $active = $s['active_run']
+
+    if ($null -eq $active) {
+        if ($Operation -eq 'ReserveRun') { return }
+        & $deny "sequence '$sid' has no active run, so there is nothing for '$Operation' to act on."
+    }
+
+    $activeId = [string]$active['run_id']
+    if ($Operation -eq 'ReserveRun') {
+        & $deny "run '$activeId' is already active in sequence '$sid'. Only one run may be active at a time."
+    }
+    if ($RunId -ne $activeId) {
+        & $deny "'$Operation' targets run '$RunId' but the active run is '$activeId'."
+    }
+
+    if (Test-K8ActiveRunHasTermination -ActiveRun $active) {
+        # Authoritative termination already on disk; only completing the
+        # open -> ineligible half of that transaction is left.
+        if ($Operation -eq 'RecordTermination') { return }
+        & $deny "run '$activeId' already has an authoritative termination record, so it can never be completed. Finish the transition (RecordTermination) or close the sequence."
+    }
+
+    if ([string]$active['state'] -eq 'initializing') {
+        if ($Operation -eq 'FinalizeRunInitialization') { return }
+        & $deny "run '$activeId' was reserved but its initialization never finished. Close the sequence -- a half-initialized run is not resumed."
+    }
+
+    if ($Operation -eq 'CompleteRun' -or $Operation -eq 'RecordTermination') { return }
+    & $deny "unhandled state for '$Operation' on run '$activeId'."
+}
+
+function Invoke-K8SequenceMutation {
+    <#
+        The one entry point for every control-plane mutation: take the
+        inter-process lock, RE-READ the control plane inside it (never trust a
+        value read before the lock), check the operation against the transition
+        gate, then let $Body write via the atomic helpers. $Body receives the
+        freshly-read state.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('NewSequence', 'ReserveRun', 'FinalizeRunInitialization', 'RecordTermination', 'CompleteRun', 'CloseSequence')][string] $Operation,
+        [string] $RunId,
+        [string] $SequenceId,
+        [Parameter(Mandatory)][scriptblock] $Body
+    )
+    # Pinned into a closure: the mutation body must stay the caller's, and the
+    # operation/run identifiers must stay this call's, regardless of what names
+    # exist in the scopes this ends up executing under.
+    $mutation = $Body
+    return Invoke-K8WithSequenceLock -Action {
+        $state = Get-K8ControlPlaneState
+        Assert-K8SequenceOperationAllowed -Operation $Operation -State $state -RunId $RunId -SequenceId $SequenceId
+        & $mutation $state
+    }.GetNewClosure()
+}
+
+function Get-K8ToolingIdentity {
+    <#
+        One observation of "what tooling is on disk right now": exact HEAD plus
+        whether the worktree is clean. Untracked files count as dirty, matching
+        the Range C source-cleanliness check this repo already uses.
+
+        Streams are captured SEPARATELY -- a git hint on stderr must never be
+        parsed as part of a commit SHA.
+    #>
+    param([Parameter(Mandatory)][string] $RepoRoot)
+    $resolved = (Resolve-Path -LiteralPath $RepoRoot).Path
+    $headCapture = Invoke-K8SeparatedNativeCapture -FilePath 'git' -ArgumentList @('-C', $resolved, 'rev-parse', 'HEAD')
+    if ($headCapture.ExitCode -ne 0) { throw "git rev-parse HEAD failed in $resolved (exit $($headCapture.ExitCode)): $($headCapture.Stderr.Trim())" }
+    $head = ((@($headCapture.Stdout) -join '') -replace '\s', '')
+    if ($head -notmatch '^[0-9a-f]{40}$') { throw "git rev-parse HEAD in $resolved did not return a 40-hex commit: '$head'" }
+    $statusCapture = Invoke-K8SeparatedNativeCapture -FilePath 'git' -ArgumentList @('-C', $resolved, 'status', '--porcelain')
+    if ($statusCapture.ExitCode -ne 0) { throw "git status --porcelain failed in $resolved (exit $($statusCapture.ExitCode)): $($statusCapture.Stderr.Trim())" }
+    $dirty = @(@($statusCapture.Stdout) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { "$_".TrimEnd() })
+    return [pscustomobject]@{
+        Head       = $head
+        TreeClean  = ($dirty.Count -eq 0)
+        DirtyPaths = $dirty
+        RepoRoot   = $resolved
+    }
+}
+
+function New-K8QualificationSequence {
+    <#
+        Opens a qualification sequence and LOCKS the tooling HEAD it commits to.
+        Refuses on a dirty tree, and refuses while ANY live sequence exists --
+        including an `ineligible` one, so a terminated sequence cannot be
+        stepped over without an explicit close.
+
+        Created in three stages inside the lock so a crash is always recoverable:
+        record(initializing) -> pointer -> record(open).
+    #>
+    param([Parameter(Mandatory)][string] $RepoRoot)
+    $identity = Get-K8ToolingIdentity -RepoRoot $RepoRoot
+    if (-not $identity.TreeClean) {
+        throw "Refusing to open a qualification sequence: the tooling worktree at $($identity.RepoRoot) is not clean. A sequence locks an exact commit, and a dirty tree means the running code is not that commit.`n$($identity.DirtyPaths -join "`n")"
+    }
+    return Invoke-K8SequenceMutation -Operation 'NewSequence' -Body {
+        param($State)
+        foreach ($residue in @($State.Live)) {
+            # The gate above already proved this is quarantinable residue.
+            $residue['abandoned_reason'] = "provably-unused 'initializing' residue quarantined at $(Get-K8UtcNow); no pointer, no runs, no run-record references it"
+            Complete-K8SequenceTerminalTransition -Record $residue -Status 'abandoned'
+            Write-K8ShakedownLog -Level WARN -Message "quarantined stale initializing sequence $([string]$residue['sequence_id']) as 'abandoned' (it is retained, not deleted)."
+        }
+        $id = New-K8QualificationSequenceId
+        $path = Get-K8SequenceRecordPath -SequenceId $id
+        if (Test-Path -LiteralPath $path) { throw "sequence ID collision: $path already exists. Refusing to overwrite an existing control-plane record." }
+        $record = New-K8SequenceRecordObject -SequenceId $id -LockedHead $identity.Head -RepoRoot $identity.RepoRoot
+        Write-K8SequenceRecord -Record $record          # stage 1
+        Set-K8SequencePointer -SequenceId $id           # stage 2
+        $record['status'] = 'open'
+        Write-K8SequenceRecord -Record $record          # stage 3
+        Write-K8ShakedownLog -Level STEP -Message "qualification sequence $id opened; locked_head=$($identity.Head); next_range=a"
+        ConvertTo-K8CanonicalSequenceRecord -Record $record
+    }.GetNewClosure()
+}
+
+function Get-K8QualificationSequence {
+    <# The current live sequence. Resolved by scanning the records, not by
+       trusting current.txt. #>
+    $state = Get-K8ControlPlaneState
+    $live = @($state.Live)
+    if ($live.Count -eq 0) { throw 'No live qualification sequence exists. Run .\tools\Start-K8QualificationSequence.ps1 first.' }
+    if ($live.Count -ge 2) { throw "Control-plane corruption: $($live.Count) live sequences. Close them one at a time with .\tools\Close-K8QualificationSequence.ps1 -SequenceId <id>." }
+    return $live[0]
+}
+
+function Write-K8OperatorCloseTermination {
+    <#
+        A run closed by the operator still gets an authoritative, machine-
+        readable termination record -- otherwise closing would manufacture
+        exactly the unattributed termination C-1 exists to abolish.
+
+        tooling_head comes from the run's OWN records: its provenance if it got
+        that far, otherwise the reservation the sequence made durable at
+        ReserveRun time. The head at close time is a different fact and is never
+        substituted here.
+    #>
+    param(
+        [Parameter(Mandatory)] $Sequence,
+        [Parameter(Mandatory)] $ActiveRun,
+        [Parameter(Mandatory)][string] $Reason
+    )
+    $runId = [string]$ActiveRun['run_id']
+    $provPath = Get-K8RunProvenancePath -RunId $runId
+    $head = $null
+    $source = $null
+    if (Test-Path -LiteralPath $provPath) {
+        $prov = (Get-Content -LiteralPath $provPath -Raw) | ConvertFrom-Json -AsHashtable
+        $head = [string]$prov['tooling_head']
+        $source = 'run-provenance'
+    }
+    elseif ($null -ne $ActiveRun['tooling_head']) {
+        $head = [string]$ActiveRun['tooling_head']
+        $source = 'reservation'
+    }
+    else {
+        throw "Cannot write an operator-close termination for $runId : neither its run-provenance.json nor its reservation records a tooling_head, and this tooling will not substitute the current HEAD."
+    }
+    $record = [ordered]@{
+        schema       = $script:K8TerminationSchema
+        run_id       = $runId
+        sequence_id  = [string]$Sequence['sequence_id']
+        tooling_head = $head
+        tooling_head_source = $source
+        stage        = 'operator-close'
+        failure_kind = 'non-command'
+        timestamp    = (Get-K8UtcNow)
+        message      = $Reason
+        exception    = $null
+        command      = $null
+    }
+    Write-K8AtomicFile -Path (Get-K8TerminationRecordPath -RunId $runId) -Content (($record | ConvertTo-Json -Depth 12) + "`n")
+    Write-K8ShakedownLog -Message "operator-close termination retained for $runId (tooling_head from $source)."
+}
+
+function Close-K8QualificationSequence {
+    <#
+        The only way out of a live sequence. Closing preserves an existing
+        termination record byte-for-byte and synthesises one only when none
+        exists, so no run ever ends up terminated-but-unrecorded.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $Reason,
+        [string] $SequenceId
+    )
+    return Invoke-K8SequenceMutation -Operation 'CloseSequence' -SequenceId $SequenceId -Body {
+        param($State)
+        $live = @($State.Live)
+        $target = $(if ($SequenceId) { @($live | Where-Object { [string]$_['sequence_id'] -eq $SequenceId })[0] } else { $live[0] })
+        if ($null -eq $target) { throw "No live sequence named '$SequenceId'. Terminal records are immutable and are never re-closed." }
+        $active = $target['active_run']
+        if ($null -ne $active) {
+            if (Test-K8ActiveRunHasTermination -ActiveRun $active) {
+                Write-K8ShakedownLog -Message "run $([string]$active['run_id']) already has a termination record; preserving it unchanged."
+            }
+            else {
+                Write-K8OperatorCloseTermination -Sequence $target -ActiveRun $active -Reason $Reason
+            }
+            $target['terminated_runs'] = @(@($target['terminated_runs']) + , ([ordered]@{
+                range      = [string]$active['range']
+                run_id     = [string]$active['run_id']
+                closed_utc = (Get-K8UtcNow)
+                reason     = $Reason
+            }))
+            $target['active_run'] = $null
+        }
+        $target['closed_utc'] = (Get-K8UtcNow)
+        $target['closed_reason'] = $Reason
+        Complete-K8SequenceTerminalTransition -Record $target -Status 'closed'
+        Write-K8ShakedownLog -Level STEP -Message "qualification sequence $([string]$target['sequence_id']) closed: $Reason"
+        ConvertTo-K8CanonicalSequenceRecord -Record $target
+    }.GetNewClosure()
+}
+
+function Start-K8ShakedownRun {
+    <#
+        Allocates a run inside the sequence and makes its provenance durable
+        BEFORE any scientific/runtime step. Three commits, in this order:
+
+          1. ReserveRun -- writes active_run INCLUDING the tooling identity just
+             observed. Doing this first is what lets a crash before step 2 still
+             be closed out with a truthful tooling_head.
+          2. run-provenance.json, built from those same observed values.
+          3. FinalizeRunInitialization -- active_run.state = 'running'.
+
+        The sequence-binding gate is deliberately NOT here: it belongs inside the
+        run boundary, so a refused run still leaves a termination record.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('a', 'b', 'c')][string] $Range,
+        [Parameter(Mandatory)][string] $RepoRoot
+    )
+    $identity = Get-K8ToolingIdentity -RepoRoot $RepoRoot
+    $runId = New-K8ShakedownRunId -Range $Range
+    $observedUtc = Get-K8UtcNow
+
+    $sequence = Invoke-K8SequenceMutation -Operation 'ReserveRun' -RunId $runId -Body {
+        param($State)
+        $s = @($State.Live)[0]
+        if ([string]$s['next_range'] -ne $Range) {
+            throw "Sequence $([string]$s['sequence_id']) expects Range $([string]$s['next_range']) next, not Range $Range. A qualification sequence is one uninterrupted A -> B -> C at one locked HEAD."
+        }
+        if (Test-Path -LiteralPath (Get-K8RunRecordDir -RunId $runId)) {
+            throw "run-record collision: $(Get-K8RunRecordDir -RunId $runId) already exists. Refusing to overwrite an existing control-plane record."
+        }
+        $s['active_run'] = [ordered]@{
+            run_id               = $runId
+            range                = $Range
+            state                = 'initializing'
+            reserved_utc         = $observedUtc
+            tooling_head         = $identity.Head
+            tree_clean           = $identity.TreeClean
+            dirty_paths          = @($identity.DirtyPaths)
+            tooling_repo_root    = $identity.RepoRoot
+            sequence_locked_head = [string]$s['locked_head']
+            observed_utc         = $observedUtc
+        }
+        Write-K8SequenceRecord -Record $s
+        ConvertTo-K8CanonicalSequenceRecord -Record $s
+    }.GetNewClosure()
+
+    $provenance = [ordered]@{
+        schema               = $script:K8ProvenanceSchema
+        run_id               = $runId
+        range                = $Range
+        sequence_id          = [string]$sequence['sequence_id']
+        tooling_head         = $identity.Head
+        tree_clean           = $identity.TreeClean
+        dirty_paths          = @($identity.DirtyPaths)
+        started_utc          = $observedUtc
+        tooling_repo_root    = $identity.RepoRoot
+        sequence_locked_head = [string]$sequence['locked_head']
+        observation_point    = 'run-initialization'
+    }
+    Write-K8AtomicFile -Path (Get-K8RunProvenancePath -RunId $runId) -Content (($provenance | ConvertTo-Json -Depth 12) + "`n")
+
+    Invoke-K8SequenceMutation -Operation 'FinalizeRunInitialization' -RunId $runId -Body {
+        param($State)
+        $s = @($State.Live)[0]
+        $s['active_run']['state'] = 'running'
+        Write-K8SequenceRecord -Record $s
+    }.GetNewClosure() | Out-Null
+
+    $script:K8CurrentRun = [pscustomobject]@{
+        RunId       = $runId
+        Range       = $Range
+        SequenceId  = [string]$sequence['sequence_id']
+        ToolingHead = $identity.Head
+        LockedHead  = [string]$sequence['locked_head']
+        RepoRoot    = $identity.RepoRoot
+        Stage       = 'run-initialization'
+    }
+    Write-K8ShakedownLog -Level STEP -Message "run $runId reserved in sequence $([string]$sequence['sequence_id']); provenance retained before any scientific/runtime step."
+    return $script:K8CurrentRun
+}
+
+function Set-K8ShakedownRunStage {
+    <# Call this IMMEDIATELY BEFORE the first fallible operation of the stage.
+       Setting it afterwards would attribute that operation's failure to the
+       previous stage. #>
+    param([Parameter(Mandatory)][string] $Stage)
+    if ($null -eq $script:K8CurrentRun) { throw "Set-K8ShakedownRunStage -Stage '$Stage' was called with no active run context." }
+    $script:K8CurrentRun.Stage = $Stage
+    Write-K8ShakedownLog -Message "stage -> $Stage"
+}
+
+function Set-K8ShakedownRunContext {
+    <# Re-establishes the run context for the second phase of an already-started
+       run (Complete), so stage tracking and termination attribution work there
+       too. #>
+    param([Parameter(Mandatory)][string] $RunId, [Parameter(Mandatory)][string] $RepoRoot)
+    $provPath = Get-K8RunProvenancePath -RunId $RunId
+    if (-not (Test-Path -LiteralPath $provPath)) { throw "No run-provenance record for $RunId at $provPath." }
+    $prov = (Get-Content -LiteralPath $provPath -Raw) | ConvertFrom-Json -AsHashtable
+    $script:K8CurrentRun = [pscustomobject]@{
+        RunId       = $RunId
+        Range       = [string]$prov['range']
+        SequenceId  = [string]$prov['sequence_id']
+        ToolingHead = [string]$prov['tooling_head']
+        LockedHead  = [string]$prov['sequence_locked_head']
+        RepoRoot    = (Resolve-Path -LiteralPath $RepoRoot).Path
+        Stage       = 'run-context-restore'
+    }
+    return $script:K8CurrentRun
+}
+
+function Assert-K8SequenceBinding {
+    <#
+        The C-2b gate, run immediately before the first scientific/runtime step.
+
+        It RE-OBSERVES git rather than comparing stored values against each
+        other. run-provenance records the run-INITIALIZATION observation; the
+        sequence lock does not lock the Git worktree, so a checkout or an edit
+        between reservation and the first step is only visible here.
+    #>
+    param([Parameter(Mandatory)] $Run)
+    $now = Get-K8ToolingIdentity -RepoRoot $Run.RepoRoot
+    $provPath = Get-K8RunProvenancePath -RunId $Run.RunId
+    if (-not (Test-Path -LiteralPath $provPath)) { throw "Sequence binding gate: no run-provenance record for $($Run.RunId) at $provPath." }
+    $prov = (Get-Content -LiteralPath $provPath -Raw) | ConvertFrom-Json -AsHashtable
+    $seq = Get-K8QualificationSequence
+
+    $problems = @()
+    if ($now.Head -ne [string]$prov['tooling_head']) { $problems += "current HEAD $($now.Head) != run-provenance tooling_head $([string]$prov['tooling_head']) (the tooling changed after this run was initialized)" }
+    if ($now.Head -ne [string]$seq['locked_head'])   { $problems += "current HEAD $($now.Head) != sequence locked_head $([string]$seq['locked_head'])" }
+    if ([string]$prov['tooling_head'] -ne [string]$seq['locked_head']) { $problems += "run-provenance tooling_head $([string]$prov['tooling_head']) != sequence locked_head $([string]$seq['locked_head'])" }
+    if (-not $now.TreeClean) { $problems += "the tooling worktree is not clean now:`n$($now.DirtyPaths -join "`n")" }
+    if ($prov['tree_clean'] -ne $true) { $problems += 'run-provenance records tree_clean=false at run initialization' }
+    if ($now.RepoRoot -ne [string]$prov['tooling_repo_root']) { $problems += "repo root $($now.RepoRoot) != run-provenance tooling_repo_root $([string]$prov['tooling_repo_root'])" }
+    if ($now.RepoRoot -ne [string]$seq['tooling_repo_root'])  { $problems += "repo root $($now.RepoRoot) != sequence tooling_repo_root $([string]$seq['tooling_repo_root'])" }
+    if ([string]$prov['sequence_id'] -ne [string]$seq['sequence_id']) { $problems += "run belongs to sequence $([string]$prov['sequence_id']) but the live sequence is $([string]$seq['sequence_id'])" }
+
+    if ($problems.Count -gt 0) {
+        throw "Sequence binding gate FAILED for $($Run.RunId); no scientific or runtime step has been executed.`n - $($problems -join "`n - ")`nClose this sequence, fix, open a NEW sequence and restart from Range A."
+    }
+    Write-K8ShakedownLog -Message "sequence binding verified for $($Run.RunId): HEAD $($now.Head) == provenance == locked_head, tree clean."
+}
+
+function Copy-K8RunProvenanceIntoEvidence {
+    <#
+        Mirrors the pre-tree provenance into the run evidence tree, byte for
+        byte, as soon as the frozen evidence_tree.create() has made the tree.
+
+        It goes at the tree ROOT, never inside one of the eight schema
+        directories: study01/preflight.py's evidence_tree() check requires those
+        eight to be empty at preflight time and does not look at the root. Being
+        at the root also means finalize-evidence hashes it, and it is never
+        written again afterwards.
+    #>
+    param([Parameter(Mandatory)] $Run, [Parameter(Mandatory)][string] $RunEvidence)
+    $src = Get-K8RunProvenancePath -RunId $Run.RunId
+    if (-not (Test-Path -LiteralPath $src)) { throw "run-provenance record missing at $src; refusing to continue without it." }
+    Copy-Item -LiteralPath $src -Destination (Join-Path $RunEvidence 'run-provenance.json') -Force
+}
+
+function New-K8CommandFailure {
+    <#
+        Builds the exception for a genuine external/native-command failure and
+        attaches the command context TO THE EXCEPTION INSTANCE ITSELF
+        (Exception.Data), so the run boundary reads it from the error it is
+        actually handling.
+
+        No module-global "last failure" slot: that would need reference-equality
+        bookkeeping to avoid grafting a stale, already-tolerated command failure
+        onto a later unrelated internal throw, and would break under nested
+        catch/rethrow.
+
+        Only call this where a real argv AND a real exit code are in hand.
+        Everything else is a non-command termination and must stay that way --
+        SD-05 (missing artifact), SD-12 (ValueError on an HTTP 200 body), SD-13
+        (zero-row decode) and SD-14 (completeness gate) had no command to
+        describe, and inventing one would misrepresent them.
+    #>
+    param(
+        [Parameter(Mandatory)][string[]] $Argv,
+        [Parameter(Mandatory)][int] $ExitCode,
+        [Parameter(Mandatory)][string] $Message,
+        [AllowEmptyString()][string] $Stdout,
+        [AllowEmptyString()][string] $Stderr,
+        [AllowEmptyString()][string] $CombinedOutput,
+        [switch] $StreamsSeparated,
+        [string] $LogPath
+    )
+    $ex = New-Object System.Management.Automation.RuntimeException($Message)
+    $ex.Data['k8_command_context'] = @{
+        Argv             = @($Argv)
+        ExitCode         = $ExitCode
+        StreamsSeparated = [bool]$StreamsSeparated
+        Stdout           = $Stdout
+        Stderr           = $Stderr
+        CombinedOutput   = $CombinedOutput
+        LogPath          = $LogPath
+    }
+    return $ex
+}
+
+function Get-K8CommandFailureContext {
+    <# Walks the InnerException chain of the error being handled. Nothing else
+       is consulted, so an unrelated earlier failure can never be attributed. #>
+    param([Parameter(Mandatory)] $Exception)
+    $probe = $Exception
+    while ($null -ne $probe) {
+        if ($null -ne $probe.Data -and $probe.Data.Contains('k8_command_context')) { return $probe.Data['k8_command_context'] }
+        $probe = $probe.InnerException
+    }
+    return $null
+}
+
+function Save-K8CapturedStream {
+    <#
+        Retains the FULL transcript this tooling captured, never truncated, and
+        returns a descriptor for the JSON record. The `preview` is a reading
+        convenience; the file is the retention.
+
+        bytes/sha256 describe the retained capture FILE. For the merged-capture
+        helpers PowerShell has already decoded the stream into text, so this is
+        not a claim about the native process's original bytes -- see
+        capture_note in the record.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string] $Name,
+        [AllowNull()][AllowEmptyString()][string] $Text
+    )
+    $body = $(if ($null -eq $Text) { '' } else { $Text })
+    $path = Join-Path (Get-K8RunRecordDir -RunId $RunId) $Name
+    Write-K8AtomicFile -Path $path -Content $body
+    $preview = $(if ($body.Length -gt $script:K8TerminationPreviewChars) { $body.Substring(0, $script:K8TerminationPreviewChars) } else { $body })
+    return [ordered]@{
+        path              = $Name
+        bytes             = (Get-Item -LiteralPath $path).Length
+        sha256            = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        preview           = $preview
+        preview_truncated = ($preview.Length -lt $body.Length)
+    }
+}
+
+function Write-K8TerminationRecord {
+    <#
+        The authoritative record of where and why a run stopped. Written to the
+        CONTROL PLANE only -- run-records/<run_id>/termination.json -- and never
+        into the run evidence tree, because a file added after finalize-evidence
+        would leave that tree permanently inconsistent with its own manifest.
+
+        failure_kind is a deliberately two-valued vocabulary:
+        external-command / non-command. No taxonomy is guessed from the
+        exception text; exception.type and stage carry the detail as fact. A
+        non-command termination has command = null, with no argv or exit_code
+        key present anywhere in the record.
+    #>
+    param([Parameter(Mandatory)] $ErrorRecord)
+    $run = $script:K8CurrentRun
+    if ($null -eq $run) { return $null }
+    $runId = $run.RunId
+    New-Item -ItemType Directory -Force -Path (Get-K8RunRecordDir -RunId $runId) | Out-Null
+
+    $ex = $ErrorRecord.Exception
+    $ctx = Get-K8CommandFailureContext -Exception $ex
+
+    $command = $null
+    if ($null -ne $ctx) {
+        $command = [ordered]@{
+            argv              = @($ctx.Argv)
+            exit_code         = $ctx.ExitCode
+            streams_separated = [bool]$ctx.StreamsSeparated
+            capture_note      = $script:K8CaptureNote
+            stdout            = $null
+            stderr            = $null
+            combined_output   = $null
+            log_path          = $ctx.LogPath
+        }
+        if ($ctx.StreamsSeparated) {
+            $command['stdout'] = Save-K8CapturedStream -RunId $runId -Name 'command-stdout.txt' -Text $ctx.Stdout
+            $command['stderr'] = Save-K8CapturedStream -RunId $runId -Name 'command-stderr.txt' -Text $ctx.Stderr
+        }
+        else {
+            # Merged at capture time: it is a combined transcript and is named
+            # as one. Calling it stdout would misdescribe the observation.
+            $command['combined_output'] = Save-K8CapturedStream -RunId $runId -Name 'command-combined.txt' -Text $ctx.CombinedOutput
+        }
+    }
+
+    $record = [ordered]@{
+        schema       = $script:K8TerminationSchema
+        run_id       = $runId
+        sequence_id  = $run.SequenceId
+        tooling_head = $run.ToolingHead
+        stage        = $run.Stage
+        failure_kind = $(if ($null -ne $ctx) { 'external-command' } else { 'non-command' })
+        timestamp    = (Get-K8UtcNow)
+        message      = $ex.Message
+        exception    = [ordered]@{
+            type               = $ex.GetType().FullName
+            message            = $ex.Message
+            script_stack_trace = "$($ErrorRecord.ScriptStackTrace)"
+        }
+        command      = $command
+    }
+    Write-K8AtomicFile -Path (Get-K8TerminationRecordPath -RunId $runId) -Content (($record | ConvertTo-Json -Depth 12) + "`n")
+    Write-K8ShakedownLog -Level ERROR -Message "termination record retained for $runId at stage '$($run.Stage)' (failure_kind=$($record['failure_kind']))."
+    return $record
+}
+
+function Set-K8SequenceIneligible {
+    <# Second half of the termination transaction. The record on disk is
+       authoritative and is written first; if this half fails, the control plane
+       recognises the partial state and permits only completing it or closing
+       the sequence. #>
+    param([Parameter(Mandatory)] $Run)
+    Invoke-K8SequenceMutation -Operation 'RecordTermination' -RunId $Run.RunId -Body {
+        param($State)
+        $s = @($State.Live)[0]
+        $s['status'] = 'ineligible'
+        $s['ineligible_reason'] = "run $($Run.RunId) terminated at stage '$($Run.Stage)'"
+        Write-K8SequenceRecord -Record $s
+    }.GetNewClosure() | Out-Null
+}
+
+function Complete-K8ShakedownRunInSequence {
+    <#
+        Advances the sequence after a run genuinely completed. Refuses -- always,
+        independently of the transition gate -- to complete a run that has an
+        authoritative termination record.
+
+        The final Range C advance sets status=complete only for an UNINTERRUPTED
+        [a, b, c] at one locked HEAD, and stamps completion_claim to say exactly
+        that much. It is NOT a K8-S2 authorization.
+    #>
+    param([Parameter(Mandatory)] $Run)
+    return Invoke-K8SequenceMutation -Operation 'CompleteRun' -RunId $Run.RunId -Body {
+        param($State)
+        $s = @($State.Live)[0]
+        $active = $s['active_run']
+        if (Test-K8ActiveRunHasTermination -ActiveRun $active) {
+            throw "Refusing to complete run $($Run.RunId): it has an authoritative termination record. A terminated run is never promoted to completed."
+        }
+        $range = [string]$active['range']
+        $s['completed_runs'] = @(@($s['completed_runs']) + , ([ordered]@{
+            range         = $range
+            run_id        = [string]$active['run_id']
+            completed_utc = (Get-K8UtcNow)
+        }))
+        $s['active_run'] = $null
+        $s['next_range'] = $(switch ($range) { 'a' { 'b' } 'b' { 'c' } default { $null } })
+        if ($null -eq $s['next_range']) {
+            $completedRanges = @(@($s['completed_runs']) | ForEach-Object { [string]$_['range'] })
+            if (@($s['terminated_runs']).Count -ne 0) {
+                throw "Sequence $([string]$s['sequence_id']) completed Range C but carries $(@($s['terminated_runs']).Count) terminated run(s); it is not an uninterrupted A -> B -> C and must not be marked complete."
+            }
+            if (($completedRanges -join ',') -ne 'a,b,c') {
+                throw "Sequence $([string]$s['sequence_id']) completed Range C but its completed runs are [$($completedRanges -join ', ')], not a, b, c in order."
+            }
+            $s['completion_claim'] = 'c-2b-sequence-valid'
+            Complete-K8SequenceTerminalTransition -Record $s -Status 'complete'
+            Write-K8ShakedownLog -Level STEP -Message "sequence $([string]$s['sequence_id']) is c-2b-sequence-valid (uninterrupted A -> B -> C at $([string]$s['locked_head'])). This is NOT a K8-S2 authorization."
+        }
+        else {
+            Write-K8SequenceRecord -Record $s
+        }
+        ConvertTo-K8CanonicalSequenceRecord -Record $s
+    }.GetNewClosure()
+}
+
+function Assert-K8RunSequenceInvariant {
+    <#
+        The whole-run invariant, enforced again at the start of a run's second
+        phase. A run must not have its phase 1 and phase 2 executed at different
+        tooling HEADs -- that is the same across-HEADs hazard C-2b exists for.
+    #>
+    param([Parameter(Mandatory)] $Run)
+    Assert-K8SequenceBinding -Run $Run
+    $seq = Get-K8QualificationSequence
+    $active = $seq['active_run']
+    if ($null -eq $active) { throw "Sequence $([string]$seq['sequence_id']) has no active run; $($Run.RunId) cannot be completed." }
+    if ([string]$active['run_id'] -ne $Run.RunId) { throw "Sequence $([string]$seq['sequence_id']) has active run $([string]$active['run_id']), not $($Run.RunId)." }
+    if ([string]$active['state'] -ne 'running') { throw "Run $($Run.RunId) is in state '$([string]$active['state'])', not 'running'." }
+    if (Test-K8ActiveRunHasTermination -ActiveRun $active) { throw "Run $($Run.RunId) already has an authoritative termination record and cannot be completed." }
+}
+
+function Invoke-K8ShakedownRunBoundary {
+    <#
+        Top-level execution boundary. Every failure inside a run is caught HERE,
+        recorded against the run ID and provenance already issued, and then
+        re-thrown unchanged -- writing a record never converts a failure into a
+        success.
+
+        Both record-writing steps are individually guarded so that a failure to
+        record can never destroy the original failure reason.
+    #>
+    param([Parameter(Mandatory)] $Run, [Parameter(Mandatory)][scriptblock] $ScriptBlock)
+    try {
+        & $ScriptBlock
+    }
+    catch {
+        $original = $_
+        try { Write-K8TerminationRecord -ErrorRecord $original | Out-Null }
+        catch { Write-K8ShakedownLog -Level ERROR -Message "FAILED to write the termination record ($($_.Exception.Message)). The original failure is re-thrown below and is NOT lost." }
+        try { Set-K8SequenceIneligible -Run $Run }
+        catch { Write-K8ShakedownLog -Level ERROR -Message "FAILED to mark the sequence ineligible ($($_.Exception.Message)). The termination record on disk is authoritative; recover with .\tools\Close-K8QualificationSequence.ps1." }
+        throw $original
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Fail-closed helpers -- these throw rather than "fixing" anything, per the
 # Shakedown rule: the runner records and stops, it does not repair.
@@ -154,7 +1180,12 @@ function Invoke-K8ShakedownCommand {
     $output | ForEach-Object { Write-K8ShakedownLog -Message "  | $_" }
     Write-K8ShakedownLog -Message "EXIT: $exit"
     if ($AllowExitCodes -notcontains $exit) {
-        throw "Command failed (exit $exit, expected one of $($AllowExitCodes -join ',')): $FilePath $argvDisplay"
+        # This capture is `2>&1`, so what it holds is a COMBINED transcript.
+        # It is recorded as combined_output, never as stdout.
+        throw (New-K8CommandFailure `
+            -Argv (@($FilePath) + @($ArgumentList)) -ExitCode $exit `
+            -CombinedOutput ((@($output) | ForEach-Object { "$_" }) -join "`n") `
+            -Message "Command failed (exit $exit, expected one of $($AllowExitCodes -join ',')): $FilePath $argvDisplay")
     }
     return [pscustomobject]@{ ExitCode = $exit; Output = $output }
 }
@@ -263,7 +1294,14 @@ function Invoke-K8ShakedownLoggedCommand {
         Get-Content -LiteralPath $LogPath -Tail $FailureTailLines | ForEach-Object {
             Write-K8ShakedownLog -Level ERROR -Message "  | $_"
         }
-        throw "Command failed (exit $exit): $FilePath $argvDisplay. Full Shakedown runtime log: $LogPath"
+        # `*>` redirected every stream into one file, so this too is a COMBINED
+        # transcript. The full log is retained whole; log_path keeps the pointer
+        # to the original runtime log as well.
+        throw (New-K8CommandFailure `
+            -Argv (@($FilePath) + @($ArgumentList)) -ExitCode $exit `
+            -CombinedOutput $(if (Test-Path -LiteralPath $LogPath) { Get-Content -LiteralPath $LogPath -Raw } else { '' }) `
+            -LogPath $LogPath `
+            -Message "Command failed (exit $exit): $FilePath $argvDisplay. Full Shakedown runtime log: $LogPath")
     }
     return [pscustomobject]@{ ExitCode=$exit; LogPath=$LogPath }
 }
@@ -1156,7 +2194,10 @@ function Invoke-K8FaultObservationCommand {
     $capture = Invoke-K8SeparatedNativeCapture -FilePath $Argv[0] -ArgumentList @($Argv[1..($Argv.Count - 1)])
     $stdout = ($capture.Stdout | Out-String)
     return [pscustomobject]@{
-        Label = $Label; Argv = ($Argv -join ' '); ExitCode = $capture.ExitCode
+        # Argv is the display string the retained artifact prints; ArgvList is
+        # the real argument vector, kept so a failure record can report the
+        # exact argv instead of re-splitting a joined string.
+        Label = $Label; Argv = ($Argv -join ' '); ArgvList = @($Argv); ExitCode = $capture.ExitCode
         Stdout = $stdout; Stderr = $capture.Stderr
         StdoutEmpty = [string]::IsNullOrWhiteSpace($stdout); TimestampUtc = $timestamp
     }
@@ -1208,7 +2249,12 @@ function Assert-K8FaultObservationsSucceeded {
     param([Parameter(Mandatory)][object[]] $Observations, [Parameter(Mandatory)][string] $Stage)
     foreach ($o in $Observations) {
         if ($o.ExitCode -ne 0) {
-            throw "Range B $Stage STOP: '$($o.Argv)' exited $($o.ExitCode). An empty stdout is never read as success when the command itself failed. stderr: $($o.Stderr.Trim())"
+            # Streams really were separated here, so both are recorded as
+            # themselves.
+            throw (New-K8CommandFailure `
+                -Argv $o.ArgvList -ExitCode $o.ExitCode -StreamsSeparated `
+                -Stdout $o.Stdout -Stderr $o.Stderr `
+                -Message "Range B $Stage STOP: '$($o.Argv)' exited $($o.ExitCode). An empty stdout is never read as success when the command itself failed. stderr: $($o.Stderr.Trim())")
         }
     }
 }
@@ -1225,8 +2271,14 @@ function Assert-K8UnrelatedMirrorFilter {
     #>
     param([Parameter(Mandatory)] $Gateway, [Parameter(Mandatory)][string] $RunEvidence)
     $contractDir = Join-Path $RunEvidence 'contract-output'
-    $linksCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $Gateway.Router, 'ip', '-o', 'link', 'show')
-    if ($linksCapture.ExitCode -ne 0) { throw "could not enumerate gateway interfaces for the unrelated mirror-filter gate (exit $($linksCapture.ExitCode)). stderr: $($linksCapture.Stderr.Trim())" }
+    $linkArgv = @('docker', 'exec', $Gateway.Router, 'ip', '-o', 'link', 'show')
+    $linksCapture = Invoke-K8SeparatedNativeCapture -FilePath $linkArgv[0] -ArgumentList @($linkArgv[1..($linkArgv.Count - 1)])
+    if ($linksCapture.ExitCode -ne 0) {
+        throw (New-K8CommandFailure `
+            -Argv $linkArgv -ExitCode $linksCapture.ExitCode -StreamsSeparated `
+            -Stdout ((@($linksCapture.Stdout) -join "`n")) -Stderr $linksCapture.Stderr `
+            -Message "could not enumerate gateway interfaces for the unrelated mirror-filter gate (exit $($linksCapture.ExitCode)). stderr: $($linksCapture.Stderr.Trim())")
+    }
     $links = @($linksCapture.Stdout)
     $records = @()
     $found = $false
@@ -2213,8 +3265,32 @@ function Test-K8ScoringInputArtifactCompleteness {
 }
 
 function Invoke-K8ShakedownRangeAB {
+    <#
+        Thin lifecycle shell around the Range A/B body.
+
+        The run ID and its provenance are issued by Start-K8ShakedownRun BEFORE
+        this enters the boundary, so a run that is refused -- or that dies at
+        stage one -- still leaves a machine-readable record naming the tooling it
+        ran under. The body itself never allocates a run ID.
+    #>
     param(
         [Parameter(Mandatory)][ValidateSet('a', 'b')][string] $Range
+    )
+
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = 'Stop'
+
+    $state = Get-K8ShakedownState
+    $run = Start-K8ShakedownRun -Range $Range -RepoRoot $state.repo_root
+    return Invoke-K8ShakedownRunBoundary -Run $run -ScriptBlock {
+        Invoke-K8ShakedownRangeABBody -Range $Range -Run $run
+    }.GetNewClosure()
+}
+
+function Invoke-K8ShakedownRangeABBody {
+    param(
+        [Parameter(Mandatory)][ValidateSet('a', 'b')][string] $Range,
+        [Parameter(Mandatory)] $Run
     )
 
     Set-StrictMode -Version Latest
@@ -2227,18 +3303,32 @@ function Invoke-K8ShakedownRangeAB {
     $SenderAssetHost = Join-Path $ScriptsDir '..\experiments\shared\traffic\send_direct_operate.py' | Resolve-Path
     $WorktreeDir = $state.amenonuboco_gen_dir
 
-    $RunId = New-K8ShakedownRunId -Range $Range
+    $RunId = $Run.RunId
     $RunEvidence = Join-Path $state.shakedown_root "runs\$RunId"
     $ComposeFile = "power-grid-reference.range-$Range.docker-compose.yml"
     $ComposePath = Join-Path $WorktreeDir "manifests\$ComposeFile"
 
     Write-K8ShakedownLog -Level STEP -Message "=== Shakedown Range $($Range.ToUpper()) starting: $RunId ==="
 
+    # 0. C-2b binding gate, before ANY scientific or runtime step. It re-observes
+    # git rather than comparing stored values, so a checkout or edit made after
+    # this run was initialized is caught here and not later.
+    Set-K8ShakedownRunStage -Stage 'sequence-binding'
+    Assert-K8SequenceBinding -Run $Run
+
     # 1. Run evidence tree, via the frozen evidence_tree.create() -- not reimplemented here.
+    Set-K8ShakedownRunStage -Stage 'evidence-tree'
     $createScript = "import sys; sys.path.insert(0, r'$ScriptsDir'); from pathlib import Path; from study01.evidence_tree import create; create(Path(r'$RunEvidence'))"
     Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @('-c', $createScript) -Description 'run evidence tree (frozen evidence_tree.create)'
 
+    # 1a. Mirror the pre-tree provenance into the evidence tree the instant the
+    # frozen creator has made it. At the tree ROOT: the frozen preflight requires
+    # the eight schema directories to be empty, and finalize-evidence hashes the
+    # root, so this file is covered by the manifest and never rewritten after.
+    Copy-K8RunProvenanceIntoEvidence -Run $Run -RunEvidence $RunEvidence
+
     # 2. Generate the Compose file fresh for this run (never reuse a stale one).
+    Set-K8ShakedownRunStage -Stage 'compose-generate'
     Push-Location $WorktreeDir
     try {
         Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @('platform/cli.py', 'provision', 'manifests/power-grid-reference.yaml', '-o', "manifests/$ComposeFile") `
@@ -2249,6 +3339,7 @@ function Invoke-K8ShakedownRangeAB {
     $composeHash = (Get-FileHash -Path $ComposePath -Algorithm SHA256).Hash
 
     # 3. Execution preflight gate -- do not provision if this fails.
+    Set-K8ShakedownRunStage -Stage 'preflight'
     Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @(
         (Join-Path $ScriptsDir 'study01_preflight.py'),
         '--run-id', $RunId, '--worktree', $WorktreeDir, '--compose', $ComposePath,
@@ -2270,10 +3361,12 @@ function Invoke-K8ShakedownRangeAB {
     # as `docker compose up`'s own opaque "invalid pool request: Pool
     # overlaps with other one on this address space" failure. Read-only:
     # never removes/prunes a network itself.
+    Set-K8ShakedownRunStage -Stage 'network-preflight'
     Test-K8ShakedownNetworkPreflight -RunId $RunId -ComposePath $ComposePath
 
     # 4. Provision. Compose build output is intentionally kept outside the
     # scientific evidence tree as a per-run Shakedown runtime/debug log.
+    Set-K8ShakedownRunStage -Stage 'provision'
     $buildLog = Join-Path $state.shakedown_root "runtime-logs\$RunId\docker-compose-up-build.log"
     Invoke-K8ShakedownLoggedCommand -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'up', '-d', '--build') `
         -LogPath $buildLog -Description "provision Range $($Range.ToUpper())" | Out-Null
@@ -2282,6 +3375,7 @@ function Invoke-K8ShakedownRangeAB {
     # running state before doing anything else (README SS5.1 step 4:
     # "establish readiness ... before the event window opens"). Fails closed
     # on timeout rather than proceeding against a half-up stack.
+    Set-K8ShakedownRunStage -Stage 'compose-readiness'
     Wait-K8ComposeReady -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
 
     # 4a-2. APPLICATION readiness, shared identically by Range A and Range B,
@@ -2298,6 +3392,7 @@ function Invoke-K8ShakedownRangeAB {
     # gates run for both Ranges from these same three call sites -- not
     # duplicated, not Range-specific. See each function's own docstring for
     # the real VM failure / pinned-source root cause it closes.
+    Set-K8ShakedownRunStage -Stage 'application-readiness'
     Wait-K8ElasticsearchReady -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
     Wait-K8LogStructurerReady -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
     Wait-K8ZoneDetectorReady -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
@@ -2307,13 +3402,16 @@ function Invoke-K8ShakedownRangeAB {
     # inspect` on each resolved ID for its immutable Id + RepoDigests, exactly
     # as the frozen collection command specifies -- not just the compose-level
     # summary.
+    Set-K8ShakedownRunStage -Stage 'image-inventory'
     Write-K8ImageInventory -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
 
     # 5. Resolve gateway interface (needed for capture AND, on Range B, the fault).
+    Set-K8ShakedownRunStage -Stage 'gateway-resolution'
     $gw = Resolve-K8GatewayInterface -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
 
     # 6. Range B only: the sole permitted fault.
     if ($Range -eq 'b') {
+        Set-K8ShakedownRunStage -Stage 'fault-injection'
         Write-K8ShakedownLog -Level STEP -Message '--- Range B fault: deleting ingress qdisc on the resolved gateway interface ---'
         $contractDir = Join-Path $RunEvidence 'contract-output'
         New-Item -ItemType Directory -Force -Path $contractDir | Out-Null
@@ -2359,9 +3457,11 @@ function Invoke-K8ShakedownRangeAB {
     # Pass/Fail/Unresolved verdict itself -- that is derived by the operator at
     # scoring-input time (README SS6.2), from this record plus the other
     # stages.
+    Set-K8ShakedownRunStage -Stage 'runtime-contract-record'
     Write-K8RuntimeContractRecord -Range $Range -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence -Gateway $gw
 
     # 7. Capture: resolve then start, both stages, in this fixed order.
+    Set-K8ShakedownRunStage -Stage 'capture-start'
     foreach ($stage in @('ground-truth', 'sensor')) {
         Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @(
             (Join-Path $ScriptsDir 'study01_capture.py'), 'resolve',
@@ -2390,9 +3490,11 @@ function Invoke-K8ShakedownRangeAB {
     # have COMPLETED at least 5s before T0 (which the sender is about to
     # stamp). Waits only the remaining time actually needed; never touches
     # the sender.
+    Set-K8ShakedownRunStage -Stage 'window-start'
     Wait-K8CaptureWindowStart -RunEvidence $RunEvidence
 
     # 8. Sender: directory prep -> docker cp -> hash verify -> exactly one invocation.
+    Set-K8ShakedownRunStage -Stage 'sender-trigger'
     $senderContainer = (docker compose -p $RunId -f $ComposePath ps -q sub_a_ied_02 | Out-String).Trim()
     if ([string]::IsNullOrWhiteSpace($senderContainer)) { throw 'sub_a_ied_02 container was not resolved' }
     Invoke-K8ShakedownCommand -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'exec', '-T', 'sub_a_ied_02', 'sh', '-lc', 'mkdir -p /study/traffic') `
@@ -2416,11 +3518,13 @@ function Invoke-K8ShakedownRangeAB {
     # T0+15s (study01_capture.py's own docstring; stop_export() itself has
     # no wait). Waits only the remaining time actually needed; never
     # re-sends the sender.
+    Set-K8ShakedownRunStage -Stage 'window-end'
     Wait-K8CaptureWindowEnd -RunEvidence $RunEvidence
 
     # 9. Stop/export both captures. The T0+15s wait is Wait-K8CaptureWindowEnd's
     # job (above), not this loop's or capture.py's own -- see that function's
     # docstring for the real VM failure this fixed.
+    Set-K8ShakedownRunStage -Stage 'capture-stop-export'
     foreach ($stage in @('ground-truth', 'sensor')) {
         Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @(
             (Join-Path $ScriptsDir 'study01_capture.py'), 'stop-export',
@@ -2445,11 +3549,13 @@ function Invoke-K8ShakedownRangeAB {
     # until later steps); this is not a substitute for it, and
     # Complete-K8ShakedownRangeAB's own pre-teardown validate-evidence call
     # is unchanged.
+    Set-K8ShakedownRunStage -Stage 'capture-lifecycle-check'
     Test-K8CaptureLifecycleEarly -ScriptsDir $ScriptsDir -RunId $RunId -RunEvidence $RunEvidence
 
     # 10. Instantiate the fixed queries from retained T0. The exact requests,
     # raw responses and mechanical correlations are executed below without
     # retries, selector changes, field substitution, or result-driven widening.
+    Set-K8ShakedownRunStage -Stage 'queries'
     $t0Path = Join-Path $RunEvidence 'metadata-t0.txt'
     if (-not (Test-Path $t0Path)) {
         throw "T0 record not found at $t0Path after stop-export; cannot window the Collector/Rule queries. This is a STOP condition -- do not proceed to teardown without it."
@@ -2462,6 +3568,7 @@ function Invoke-K8ShakedownRangeAB {
     # the frozen Ground Truth/Sensor selector (freeze-decision-table.md SS3).
     # Must run before Complete's teardown (log_structurer must still be up)
     # and before finalize-evidence (so the artifact is hashed).
+    Set-K8ShakedownRunStage -Stage 'target-decode'
     Write-K8TargetCaptureDecode -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence -Stage 'ground-truth' -WindowStartIso $windowStart -WindowEndIso $windowEnd
     Write-K8TargetCaptureDecode -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence -Stage 'sensor' -WindowStartIso $windowStart -WindowEndIso $windowEnd
 
@@ -2483,6 +3590,10 @@ function Invoke-K8ShakedownRangeAB {
         Write-K8ShakedownLog -Message 'Fixed R-OBS-05 request retained; mapping/query/correlation gates will execute mechanically.'
     }
 
+    # Back to the query stage: step 9b's decode sat between the T0/window read
+    # and the requests themselves, so re-mark it rather than let a query
+    # failure be attributed to the decode.
+    Set-K8ShakedownRunStage -Stage 'queries'
     Invoke-K8AutomatedQueries -Range $Range -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence -WindowStart $windowStart -WindowEnd $windowEnd
 
     # 11. metadata.md / deviations.md -- required by study01_collect.py validate-evidence.
@@ -2490,6 +3601,7 @@ function Invoke-K8ShakedownRangeAB {
     # the operator's -- this only removes the mechanical transcription of what the
     # machine-readable records already say. Cleanup is NOT YET performed (see below),
     # so this is updated again by Complete-K8ShakedownRangeAB once it is.
+    Set-K8ShakedownRunStage -Stage 'run-metadata'
     @"
 # Run metadata -- $RunId (Shakedown, NOT a formal K8-3 attempt, NOT Gate K8 evidence)
 
@@ -2523,6 +3635,7 @@ See environment/, ground-truth/, sensor-input/, contract-output/ for the machine
     # already-closed run. study01_collect.py validate-evidence does not
     # catch this class of gap (it does not know README requires a pcap
     # decode at all); this is a Shakedown-side check on top of it.
+    Set-K8ShakedownRunStage -Stage 'completeness-gate'
     Test-K8ScoringInputArtifactCompleteness -Range $Range -RunEvidence $RunEvidence
 
     # 12. Leave the range running only until Complete performs the mandatory
@@ -3028,12 +4141,37 @@ function Complete-K8ShakedownRangeAB {
         throw "No Range $($Range.ToUpper()) run is awaiting completion (state.$stageKey = $(if ($state.PSObject.Properties[$stageKey]) { $state.$stageKey } else { '<none>' })). Run .\tools\Run-K8ShakedownRange$($Range.ToUpper()).ps1 first."
     }
     $RunId = $state."range_$($Range)_run_id"
+    # Re-establish the run context so this phase's stage tracking and
+    # termination attribution work exactly as phase 1's did.
+    $run = Set-K8ShakedownRunContext -RunId $RunId -RepoRoot $state.repo_root
+    return Invoke-K8ShakedownRunBoundary -Run $run -ScriptBlock {
+        Complete-K8ShakedownRangeABBody -Range $Range -Run $run
+    }.GetNewClosure()
+}
+
+function Complete-K8ShakedownRangeABBody {
+    param(
+        [Parameter(Mandatory)][ValidateSet('a', 'b')][string] $Range,
+        [Parameter(Mandatory)] $Run
+    )
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = 'Stop'
+
+    $state = Get-K8ShakedownState
+    $stageKey = "range_$($Range)_stage"
+    $RunId = $Run.RunId
     $RunEvidence = $state."range_$($Range)_evidence"
     $ComposePath = $state."range_$($Range)_compose"
     $Study01 = Join-Path $state.repo_root 'Study01'
     $ScriptsDir = Join-Path $Study01 'studies\study-01-negative-result\scripts'
 
     Write-K8ShakedownLog -Level STEP -Message "=== Completing Shakedown Range $($Range.ToUpper()): $RunId ==="
+
+    # Whole-run invariant. Phase 2 must not execute at a different tooling HEAD
+    # than phase 1 -- that is the same across-HEADs hazard C-2b exists for --
+    # and the run being completed must be the one the sequence has active.
+    Set-K8ShakedownRunStage -Stage 'complete-preconditions'
+    Assert-K8RunSequenceInvariant -Run $Run
 
     foreach ($required in @('collector-output\collector-response.json', 'rule-output\rule-response.json', 'rule-output\collector-rule-correlation.json')) {
         if (-not (Test-Path (Join-Path $RunEvidence $required))) { throw "required automated runtime evidence missing: $required" }
@@ -3049,15 +4187,19 @@ function Complete-K8ShakedownRangeAB {
 
     # Frozen ordering: prove the runtime evidence is complete and hash it while
     # the project still exists. Only then may cleanup destroy project/volumes.
+    Set-K8ShakedownRunStage -Stage 'pre-teardown-validate'
     Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'validate-evidence', $RunEvidence) -Description 'pre-teardown validate-evidence'
+    Set-K8ShakedownRunStage -Stage 'pre-teardown-finalize'
     Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'finalize-evidence', $RunEvidence) -Description 'pre-teardown finalize/hash'
     if (-not (Test-Path (Join-Path $RunEvidence 'hashes.sha256'))) { throw 'pre-teardown finalize did not create hashes.sha256; refusing teardown' }
 
+    Set-K8ShakedownRunStage -Stage 'teardown'
     Invoke-K8ShakedownCommand -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'down', '-v', '--remove-orphans') `
         -Description 'destroy project + volumes (prevent state carry-over)'
     $finalPs = (docker compose -p $RunId -f $ComposePath ps 2>&1 | Out-String)
     $finalPs | Add-Content -Path (Join-Path $RunEvidence 'environment\compose-ps.txt') -Encoding utf8NoBOM
 
+    Set-K8ShakedownRunStage -Stage 'cleanup-record'
     (Get-Content (Join-Path $RunEvidence 'metadata.md') -Raw) -replace `
         '\| Cleanup \| NOT YET PERFORMED.*\|', `
         "| Cleanup | destroyed via 'docker compose down -v --remove-orphans' at $((Get-Date).ToUniversalTime().ToString('o')); final ps: see environment/compose-ps.txt |" |
@@ -3065,9 +4207,14 @@ function Complete-K8ShakedownRangeAB {
 
     "cleanup_utc=$((Get-Date).ToUniversalTime().ToString('o'))`ncommand=docker compose -p $RunId -f $ComposePath down -v --remove-orphans`nresult=PASS" |
         Set-Content -Path (Join-Path $RunEvidence 'environment\cleanup-result.txt') -Encoding utf8NoBOM
+    Set-K8ShakedownRunStage -Stage 'final-finalize'
     Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'finalize-evidence', $RunEvidence) -Description 'final finalize/hash including cleanup record'
+    Set-K8ShakedownRunStage -Stage 'final-verify'
     Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'verify-integrity', $RunEvidence) -Description 'final verify-integrity'
 
+    # Only now does the sequence advance. A run that terminated anywhere above
+    # never reaches this line, so next_range never moves past a failure.
+    Complete-K8ShakedownRunInSequence -Run $Run | Out-Null
     Set-K8ShakedownState -Updates @{ $stageKey = 'complete'; "range_$($Range)_complete_utc" = (Get-Date).ToUniversalTime().ToString('o') }
 
     Write-K8ShakedownLog -Level STEP -Message "=== Shakedown Range $($Range.ToUpper()) complete: $RunId ==="

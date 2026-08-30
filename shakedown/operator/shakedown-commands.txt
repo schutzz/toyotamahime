@@ -6,6 +6,11 @@ This file only calls the scripts in ../tools/. It does not restate what they
 do -- read ../README.md and the script comments for that, so this file never
 drifts out of sync with the actual implementation.
 
+Open a qualification sequence first. It locks the exact tooling commit that
+every run in the sequence must execute at:
+
+    .\tools\Start-K8QualificationSequence.ps1
+
 One-time, per VM/session (run from inside the cloned repo's shakedown/ dir):
 
     .\tools\Start-K8Shakedown.ps1
@@ -23,10 +28,43 @@ Then, in order, once Setup has passed:
     .\tools\Run-K8ShakedownRangeC.ps1
     (no live-query dependency -- this one is a single command)
 
-If something fails partway through a Range run: fix the branch on your dev
-machine, push, then on the VM:
+The order is enforced, not just documented: each run refuses to start unless it
+is the range the sequence expects next, no other run is active, the tooling HEAD
+still equals the sequence's locked_head, and the worktree is clean.
+
+If something fails partway through a Range run
+----------------------------------------------
+A terminated run ends its sequence. There is no retry inside the same sequence
+and no resuming the failed run -- both would break the "one uninterrupted
+A -> B -> C at one exact HEAD" property the sequence exists to establish.
+
+    .\tools\Close-K8QualificationSequence.ps1 -Reason "<what happened>"
+
+    (fix on your dev machine, push)
 
     git pull
-    .\tools\Run-K8ShakedownRange<X>.ps1
+    pwsh -File .\tests\Test-K8ShakedownRegression.ps1
+    git status --short                  # must be empty
 
-(a fresh run ID is allocated automatically each time -- nothing to type.)
+    .\tools\Start-K8QualificationSequence.ps1     <- new sequence, new locked_head
+    .\tools\Run-K8ShakedownRangeA.ps1             <- restart from Range A
+
+Close BEFORE fixing, not after: opening a sequence locks whatever HEAD is
+checked out, and the fix is about to change it.
+
+Closing never modifies, resumes, re-queries or deletes the failed run's
+evidence. It records why the sequence ended, and -- if the run had no
+termination record of its own -- writes one.
+
+A fresh run ID is allocated automatically each time; nothing to type.
+
+Where the records live (under the workspace root, default C:\K8\shakedown)
+-------------------------------------------------------------------------
+    sequences\<sequence_id>.json      what the sequence committed to
+    sequences\current.txt             pointer to the live sequence, if any
+    run-records\<run_id>\             provenance, termination, captured streams
+    runs\<run_id>\                    the scientific evidence tree
+
+run-records\ is control-plane record and is never mixed into the evidence tree.
+The one thing that crosses over is run-provenance.json, mirrored into the
+evidence tree right after it is created.

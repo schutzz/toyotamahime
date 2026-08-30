@@ -32,17 +32,35 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'K8ShakedownCommon.psm1') -Force
 
 $state = Get-K8ShakedownState
+
+# Same run lifecycle as Range A/B -- one shared code path, not a third copy.
+# The run ID and its provenance exist before any Range C step runs, and every
+# failure below is caught by the same boundary.
+$Run = Start-K8ShakedownRun -Range c -RepoRoot $state.repo_root
+Invoke-K8ShakedownRunBoundary -Run $Run -ScriptBlock {
+# ---- run boundary begins. Left at column 0 rather than re-indenting the whole
+# ---- script; the matching end marker is at the bottom of the file.
+
 $Study01 = Join-Path $state.repo_root 'Study01'
 $PatchSource = Join-Path $Study01 'studies\study-01-negative-result\experiments\range-c-negative-manifest\power-grid-reference.range-c-negative.patch'
+
+Set-K8ShakedownRunStage -Stage 'sequence-binding'
+Assert-K8SequenceBinding -Run $Run
+
 if (-not (Test-Path $PatchSource)) { throw "Frozen Range C patch not found at $PatchSource" }
 
-$RunId = New-K8ShakedownRunId -Range c
+$RunId = $Run.RunId
 $RunEvidence = Join-Path $state.shakedown_root "runs\$RunId"
 New-Item -ItemType Directory -Force -Path $RunEvidence | Out-Null
+# Range C builds its own run directory (it never calls the frozen
+# evidence_tree.create), so the provenance mirror lands here rather than
+# immediately after a create() call.
+Copy-K8RunProvenanceIntoEvidence -Run $Run -RunEvidence $RunEvidence
 
 Write-K8ShakedownLog -Level STEP -Message "=== Shakedown Range C starting: $RunId ==="
 
 # 1. Disposable worktree copied from the pinned v0.13.0 checkout; confirm clean before use.
+Set-K8ShakedownRunStage -Stage 'source-worktree-check'
 $rangeCSource = $state.amenonuboco_rangec_dir
 $disposable = Join-Path $state.shakedown_root "runs\$RunId\worktree"
 $sourceStatus = (git -C $rangeCSource status --porcelain | Out-String).Trim()
@@ -51,6 +69,7 @@ if ($sourceStatus) {
 }
 Assert-K8PinnedCommit -WorktreePath $rangeCSource -ExpectedCommit (Get-K8ShakedownConstants).RangeCCommit -Label 'Range C source worktree (pre-copy)'
 
+Set-K8ShakedownRunStage -Stage 'worktree-copy'
 Write-K8ShakedownLog -Message "Copying $rangeCSource -> $disposable"
 Copy-Item -Recurse -Force -Path $rangeCSource -Destination $disposable
 Assert-K8PinnedCommit -WorktreePath $disposable -ExpectedCommit (Get-K8ShakedownConstants).RangeCCommit -Label 'Range C disposable worktree (post-copy)'
@@ -59,6 +78,7 @@ Assert-K8PinnedCommit -WorktreePath $disposable -ExpectedCommit (Get-K8Shakedown
 #    then apply the fixed patch retargeted to that filename via literal string substitution
 #    (c2-dnp3-range-derivation.md SS4 -- a known maintenance limitation, not a second patch
 #    mechanism; not changed here).
+Set-K8ShakedownRunStage -Stage 'manifest-derivation'
 $baseManifest = Join-Path $disposable 'manifests\power-grid-reference.yaml'
 $negativeManifest = Join-Path $disposable 'manifests\power-grid-reference.range-c-negative.yaml'
 if (-not (Test-Path $baseManifest)) { throw "Base manifest not found at $baseManifest" }
@@ -73,6 +93,7 @@ $patchRaw = Get-Content -Raw -Path $PatchSource
 $derivedPatch = Join-Path $disposable 'range-c-derived.patch'
 $patchRaw.Replace('power-grid-reference.yaml', 'power-grid-reference.range-c-negative.yaml') | Set-Content -NoNewline -Path $derivedPatch -Encoding utf8NoBOM
 
+Set-K8ShakedownRunStage -Stage 'patch-apply'
 Push-Location $disposable
 try {
     Invoke-K8ShakedownCommand -FilePath 'git' -ArgumentList @('apply', '--ignore-space-change', '--check', $derivedPatch) -Description 'derived patch check'
@@ -80,6 +101,7 @@ try {
 
     # 3. Exactly one command. Byte-exact stdout/stderr capture via cmd.exe redirection
     #    (PowerShell's own pipeline capture re-encodes text; this does not).
+    Set-K8ShakedownRunStage -Stage 'validator-run'
     $stdoutPath = Join-Path $RunEvidence 'validate.stdout.txt'
     $stderrPath = Join-Path $RunEvidence 'validate.stderr.txt'
     Write-K8ShakedownLog -Level STEP -Message 'RUN: python platform/cli.py validate manifests/power-grid-reference.range-c-negative.yaml'
@@ -91,6 +113,7 @@ try {
 finally { Pop-Location }
 
 # 4. Retain: derived manifest, derivation, command, stdout, stderr, exit code, tool versions.
+Set-K8ShakedownRunStage -Stage 'retention'
 Copy-Item -Path $negativeManifest -Destination (Join-Path $RunEvidence 'power-grid-reference.range-c-negative.yaml')
 Copy-Item -Path $derivedPatch -Destination (Join-Path $RunEvidence 'range-c-derived.patch')
 @"
@@ -115,9 +138,18 @@ before drawing a conclusion.
 Remove-Item -Recurse -Force $disposable
 Write-K8ShakedownLog -Message "Disposable worktree removed after retention (README SS5.2: only the disposable worktree and generated static artifacts are removed; no Docker cleanup applies to Range C)."
 
+# Range C is single-phase, so the sequence advances here rather than in a
+# separate Complete script. If this is the third run of an uninterrupted
+# A -> B -> C at one locked HEAD, the sequence becomes c-2b-sequence-valid --
+# which is NOT a K8-S2 authorization.
+Complete-K8ShakedownRunInSequence -Run $Run | Out-Null
 Set-K8ShakedownState -Updates @{ range_c_run_id = $RunId; range_c_evidence = $RunEvidence; range_c_exit_code = $exitCode; range_c_complete_utc = (Get-Date).ToUniversalTime().ToString('o') }
 
 Write-K8ShakedownLog -Level STEP -Message "=== Shakedown Range C complete: $RunId (validator exit $exitCode) ==="
 Write-Host ''
 Write-Host "Range C evidence: $RunEvidence"
 Write-Host 'Compare validate.stdout.txt / validate.stderr.txt / exit code against Study01/expected/range-c/ yourself.'
+
+# ---- run boundary ends. GetNewClosure pins $Run/$state to this script's scope
+# ---- so the boundary helper's own parameter names cannot rebind them.
+}.GetNewClosure()
