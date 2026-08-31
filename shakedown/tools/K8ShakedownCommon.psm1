@@ -956,7 +956,7 @@ $script:K8CommandObservationSchema = 'k8shakedown-command-observation/1'
 $script:K8FinalizeIdentitySchema   = 'k8shakedown-finalize-identity/1'
 $script:K8ObservationSuffix        = '.observation.json'
 
-# C-7: the ONLY repository prefixes a machine-generated narrative may cite as
+# C-7: the ONLY repository locations a machine-generated narrative may cite as
 # a frozen protocol document. Left as "somewhere in the repo" this would be an
 # implementer's judgment call, and a narrative writer could justify pointing at
 # any file at all as a "frozen protocol reference". Measured against every
@@ -964,10 +964,18 @@ $script:K8ObservationSuffix        = '.observation.json'
 # plus c2-dnp3-capture-procedure.md, c2-dnp3-image-inventory.md,
 # c2-dnp3-range-derivation.md, evidence-schema.md, freeze-decision-table.md and
 # c2-dnp3-step4-range-b-fault-pilot.md, all of which live under the protocol
-# directory -- these two prefixes are closed. Widening them is a Plan revision,
+# directory -- these two entries are closed. Widening them is a Plan revision,
 # never a quiet code change.
-$script:K8FrozenProtocolDocPrefixes = @(
-    'Study01/README.md',
+#
+# THE TWO ENTRIES ARE DIFFERENT KINDS AND ARE STORED SEPARATELY ON PURPOSE.
+# Holding them in one array forced one comparison to serve both, and the only
+# comparison that works for a directory -- a prefix test -- is wrong for a
+# file: `Study01/README.md` then also admits `README.md.bak`, `README.md.tmp`
+# and `README.md/anything`. A file entry is an EXACT match and nothing else.
+$script:K8FrozenProtocolDocFiles = @(
+    'Study01/README.md'
+)
+$script:K8FrozenProtocolDocDirectories = @(
     'Study01/studies/study-01-negative-result/protocol/'
 )
 
@@ -1346,6 +1354,48 @@ function New-K8ArtifactReference {
     return [pscustomobject]@{ Kind = $Kind; Path = $Path }
 }
 
+function Get-K8SafeRelativeSegments {
+    <#
+        The one place a reference path is decided to be structurally safe.
+
+        Every rule here exists because a spelling that is not literally an
+        allowlisted path must never be able to REACH one. `..` is the obvious
+        case: `.../protocol/../scripts/study01_collect.py` starts with the
+        protocol directory as a STRING while naming a file in the frozen
+        apparatus. Rejecting the segment outright is the fix; canonicalizing
+        and re-checking afterwards (below) is the belt-and-braces.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string] $Path, [Parameter(Mandatory)][string] $What)
+    $normalized = ($Path -replace '\\', '/').Trim()
+    if (-not $normalized) { throw "C-7 narrative reference: $What path is empty." }
+    if ($normalized.StartsWith('/') -or ($normalized.Length -gt 1 -and $normalized[1] -eq ':')) {
+        throw "C-7 narrative reference: $What path '$Path' must be relative, not absolute."
+    }
+    $segments = @($normalized.Split('/'))
+    if ($segments -contains '..') {
+        throw "C-7 narrative reference: $What path '$Path' contains a '..' segment. A reference must name its target directly, never traverse out of and back into an allowed location."
+    }
+    # @() around the pipeline: under Set-StrictMode a Where-Object that matches
+    # nothing returns $null, and $null.Count throws.
+    if ($segments -contains '.' -or @($segments | Where-Object { $_ -eq '' }).Count -gt 0) {
+        throw "C-7 narrative reference: $What path '$Path' contains an empty or '.' segment; a reference must be spelled canonically."
+    }
+    return [pscustomobject]@{ Normalized = $normalized; Segments = $segments }
+}
+
+function Test-K8PathIsUnder {
+    <# Canonical containment. Compares fully-resolved paths, so no alternate
+       spelling of the same location can pass a check the literal path would
+       fail -- and no path that merely SHARES A STRING PREFIX with a directory
+       (`...\protocol-notes` vs `...\protocol`) is mistaken for being inside
+       it, because the separator is required. #>
+    param([Parameter(Mandatory)][string] $Candidate, [Parameter(Mandatory)][string] $Root)
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd($sep) + $sep
+    $candidateFull = [System.IO.Path]::GetFullPath($Candidate)
+    return $candidateFull.StartsWith($rootFull, [System.StringComparison]::Ordinal)
+}
+
 function Resolve-K8NarrativeReference {
     <#
         Validates one typed reference and returns the text the narrative may
@@ -1361,14 +1411,11 @@ function Resolve-K8NarrativeReference {
     $path = [string]$Reference.Path
     switch ($kind) {
         'run-local' {
-            $normalized = ($path -replace '\\', '/').Trim()
-            if ($normalized.StartsWith('/') -or ($normalized.Length -gt 1 -and $normalized[1] -eq ':')) {
-                throw "C-7 narrative reference: run-local path '$path' must be run-relative, not absolute."
-            }
-            if (@($normalized.Split('/')) -contains '..') {
-                throw "C-7 narrative reference: run-local path '$path' escapes the run evidence root."
-            }
+            $normalized = (Get-K8SafeRelativeSegments -Path $path -What 'run-local').Normalized
             $full = Join-Path $RunEvidence ($normalized -replace '/', '\')
+            if (-not (Test-K8PathIsUnder -Candidate $full -Root $RunEvidence)) {
+                throw "C-7 narrative reference: run-local path '$path' resolves outside the run evidence root."
+            }
             if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
                 throw "C-7 narrative reference: run-local artifact '$normalized' does not exist under $RunEvidence. A generated narrative must not cite an artifact that is not there."
             }
@@ -1376,12 +1423,36 @@ function Resolve-K8NarrativeReference {
         }
         'frozen-protocol-doc' {
             if (-not $RepoRoot) { throw "C-7 narrative reference: a frozen-protocol-doc reference needs -RepoRoot to resolve '$path'." }
-            $normalized = ($path -replace '\\', '/').Trim()
-            $allowed = @($script:K8FrozenProtocolDocPrefixes | Where-Object { $normalized -eq $_ -or $normalized.StartsWith($_) })
-            if ($allowed.Count -eq 0) {
-                throw "C-7 narrative reference: '$normalized' is not inside the frozen-protocol-doc allowlist ($($script:K8FrozenProtocolDocPrefixes -join ', ')). Widening the allowlist is a Plan revision, not a code change."
+            $normalized = (Get-K8SafeRelativeSegments -Path $path -What 'frozen-protocol-doc').Normalized
+            $allowlist = @($script:K8FrozenProtocolDocFiles + $script:K8FrozenProtocolDocDirectories)
+
+            # A FILE entry is an exact match. A prefix test here would also
+            # admit `README.md.bak`, `README.md.tmp` and `README.md/anything`.
+            $matchedFile = @($script:K8FrozenProtocolDocFiles | Where-Object { $_ -eq $normalized })
+            # A DIRECTORY entry requires something strictly inside it. The
+            # entry carries its trailing '/', so `protocol-notes/x.md` cannot
+            # satisfy `protocol/`.
+            $matchedDirectory = @($script:K8FrozenProtocolDocDirectories | Where-Object {
+                $normalized.StartsWith($_, [System.StringComparison]::Ordinal) -and $normalized.Length -gt $_.Length
+            })
+            if ($matchedFile.Count -eq 0 -and $matchedDirectory.Count -eq 0) {
+                throw "C-7 narrative reference: '$normalized' is not in the frozen-protocol-doc allowlist ($($allowlist -join ', ')). A file entry must match exactly; a directory entry must contain the target. Widening the allowlist is a Plan revision, not a code change."
             }
+
             $full = Join-Path $RepoRoot ($normalized -replace '/', '\')
+            # Re-verify against the CANONICAL location, not the string that was
+            # matched above, so string matching alone can never be the whole
+            # authority.
+            $anchor = $(if ($matchedFile.Count -gt 0) { $matchedFile[0] } else { $matchedDirectory[0] })
+            $anchorFull = Join-Path $RepoRoot ($anchor -replace '/', '\')
+            $canonicalOk = $(if ($matchedFile.Count -gt 0) {
+                [System.IO.Path]::GetFullPath($full) -eq [System.IO.Path]::GetFullPath($anchorFull)
+            } else {
+                Test-K8PathIsUnder -Candidate $full -Root $anchorFull
+            })
+            if (-not $canonicalOk) {
+                throw "C-7 narrative reference: '$normalized' resolves outside the allowlisted location it appeared to match ($anchor)."
+            }
             if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
                 throw "C-7 narrative reference: frozen protocol document '$normalized' does not exist under $RepoRoot."
             }

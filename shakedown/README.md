@@ -178,6 +178,34 @@ A zero-byte stream is retained and described, never skipped: Range C's empty
 `validate.stdout.txt` is the frozen *expected* observation, so it must exist as
 a file with a stated byte count and hash.
 
+## Narrative artifact references
+
+Where a generated narrative (`metadata.md`, `deviations.md`,
+`runtime-contract-record.md`) names an artifact, that reference arrives as a
+typed value and is checked before the sentence is written. Nothing scans prose
+for path-shaped text -- measured, a naive path regex produced four false
+positives on a healthy run.
+
+| kind | checked? |
+| --- | --- |
+| `run-local` | must resolve inside the run evidence and exist |
+| `frozen-protocol-doc` | must be inside the allowlist below and exist |
+| `in-container`, `host-path` | recorded as-is; not resolvable from here |
+| anything else | fails closed |
+
+The frozen-protocol-doc allowlist is one **exact file**, `Study01/README.md`,
+plus one **directory**, `Study01/studies/study-01-negative-result/protocol/`.
+They are held apart on purpose: a single list forces one comparison to serve
+both, and the only comparison that works for a directory -- a prefix test -- is
+wrong for a file, since `Study01/README.md` would then also admit
+`README.md.bak`, `README.md.tmp` and `README.md/anything`. `..`, `.`, empty
+segments and absolute paths are refused before any path is built, so a spelling
+like `.../protocol/../scripts/study01_collect.py` -- which begins with the
+allowlisted directory as a *string* while naming a file in the frozen
+apparatus -- cannot reach the allowlist at all. Both kinds are then re-checked
+against the canonical resolved location, so string matching is never the whole
+authority. Widening the allowlist is a Plan revision, not a code change.
+
 ## Scoring-input structural contract
 
 `tools/k8_scoring_input_contract.py` is the single source of truth for the

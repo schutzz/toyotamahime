@@ -47,6 +47,27 @@ $ToolsDir = Join-Path $ShakedownDir 'tools'
 $Study01 = Join-Path $RepoRoot 'Study01'
 $SenderProcedureDoc = Join-Path $Study01 'studies\study-01-negative-result\protocol\c2-dnp3-sender-procedure.md'
 
+# Hermetic workspace for the whole suite.
+#
+# Get-K8ShakedownRoot falls back to C:\K8\shakedown, and Write-K8ShakedownLog
+# creates <root>\logs\shakedown.log on essentially every module call. Without
+# this, any test that touches a logging function writes to that fixed absolute
+# path -- so on a machine where it is not writable the suite fails in bulk for
+# a reason that has nothing to do with what is being tested, and an independent
+# reviewer cannot reproduce a clean run at all. (Observed: 33 checks failing on
+# "access denied" to that log.) The sequence sandbox overrides this per test and
+# restores it afterwards, which still works because it saves whatever it finds.
+$SuiteRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('k8suite-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $SuiteRoot | Out-Null
+$PreviousShakedownRoot = $env:K8_SHAKEDOWN_ROOT
+$env:K8_SHAKEDOWN_ROOT = $SuiteRoot
+
+function Restore-K8SuiteWorkspace {
+    if ($null -eq $script:PreviousShakedownRoot) { Remove-Item Env:\K8_SHAKEDOWN_ROOT -ErrorAction SilentlyContinue }
+    else { $env:K8_SHAKEDOWN_ROOT = $script:PreviousShakedownRoot }
+    Remove-Item $script:SuiteRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 $failures = @()
 function Assert-K8Test {
     param([Parameter(Mandatory)][string] $Name, [Parameter(Mandatory)][scriptblock] $Body)
@@ -4437,10 +4458,15 @@ Assert-K8Test 'C-7: references are TYPED; run-local paths must exist, and nothin
         Assert-K8FailsClosed -What 'a run-local reference to a file that is not there' -Because 'does not exist under' -Attempt {
             Resolve-K8NarrativeReference -RunEvidence $d -Reference (New-K8ArtifactReference -Kind 'run-local' -Path 'contract-output/absent.txt')
         }
-        Assert-K8FailsClosed -What 'a run-local reference escaping the run root' -Because 'escapes the run evidence root' -Attempt {
+        Assert-K8FailsClosed -What 'a run-local reference escaping the run root' -Because "'\.\.' segment" -Attempt {
             Resolve-K8NarrativeReference -RunEvidence $d -Reference (New-K8ArtifactReference -Kind 'run-local' -Path '../../../etc/passwd')
         }
-        Assert-K8FailsClosed -What 'an absolute run-local reference' -Because 'must be run-relative' -Attempt {
+        # Traversal that stays inside by arithmetic is still refused: a
+        # reference names its target directly or not at all.
+        Assert-K8FailsClosed -What 'a run-local reference that traverses out and back in' -Because "'\.\.' segment" -Attempt {
+            Resolve-K8NarrativeReference -RunEvidence $d -Reference (New-K8ArtifactReference -Kind 'run-local' -Path 'contract-output/../contract-output/present.txt')
+        }
+        Assert-K8FailsClosed -What 'an absolute run-local reference' -Because 'must be relative, not absolute' -Attempt {
             Resolve-K8NarrativeReference -RunEvidence $d -Reference (New-K8ArtifactReference -Kind 'run-local' -Path 'C:/Windows/win.ini')
         }
         # in-container and host-path are not resolvable from here and are not checked.
@@ -4462,7 +4488,7 @@ Assert-K8Test 'C-7: references are TYPED; run-local paths must exist, and nothin
     finally { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
-Assert-K8Test 'C-7: the frozen-protocol-doc allowlist is exactly two prefixes and is closed against everything else' {
+Assert-K8Test 'C-7: the frozen-protocol-doc allowlist is one exact file plus one directory, and is closed against siblings and traversal' {
     Import-Module $CommonPath -Force
     $d = New-K8TempDir -Prefix 'k8c7a'
     try {
@@ -4482,16 +4508,80 @@ Assert-K8Test 'C-7: the frozen-protocol-doc allowlist is exactly two prefixes an
             Resolve-K8NarrativeReference -RunEvidence $d -RepoRoot $RepoRoot -Reference (
                 New-K8ArtifactReference -Kind 'frozen-protocol-doc' -Path 'Study01/studies/study-01-negative-result/protocol/no-such-doc.md')
         }
-        # The allowlist itself: exactly the two prefixes the Plan fixes.
+
+        # TRAVERSAL. `.../protocol/../scripts/study01_collect.py` starts with
+        # the allowlisted directory as a STRING while naming a file in the
+        # frozen apparatus. Refused on the segment, before any path is built.
+        foreach ($escape in @(
+            'Study01/studies/study-01-negative-result/protocol/../scripts/study01_collect.py'
+            'Study01/studies/study-01-negative-result/protocol/../../../../README.md'
+            'Study01/README.md/../PROVENANCE.md'
+        )) {
+            Assert-K8FailsClosed -What "the traversal '$escape'" -Because "'\.\.' segment" -Attempt {
+                Resolve-K8NarrativeReference -RunEvidence $d -RepoRoot $RepoRoot -Reference (
+                    New-K8ArtifactReference -Kind 'frozen-protocol-doc' -Path $escape)
+            }
+        }
+        # An absolute path must not reach the allowlist test at all.
+        Assert-K8FailsClosed -What 'an absolute frozen-protocol-doc path' -Because 'must be relative' -Attempt {
+            Resolve-K8NarrativeReference -RunEvidence $d -RepoRoot $RepoRoot -Reference (
+                New-K8ArtifactReference -Kind 'frozen-protocol-doc' -Path (Join-Path $RepoRoot 'Study01\README.md'))
+        }
+
+        # A FILE entry is an exact match, not a prefix. These are checked
+        # against a throwaway repository root where the sibling files ACTUALLY
+        # EXIST, so the refusal comes from the allowlist rather than from the
+        # existence check happening to save us.
+        $fakeRepo = New-K8TempDir -Prefix 'k8c7repo'
+        try {
+            $protocol = Join-Path $fakeRepo 'Study01\studies\study-01-negative-result\protocol'
+            $scripts = Join-Path $fakeRepo 'Study01\studies\study-01-negative-result\scripts'
+            New-Item -ItemType Directory -Force -Path $protocol, $scripts, (Join-Path $fakeRepo 'Study01\README.md.d') | Out-Null
+            foreach ($rel in @('Study01\README.md', 'Study01\README.md.bak', 'Study01\README.md.tmp',
+                               'Study01\README.md.d\inner.md')) {
+                'frozen' | Set-Content -LiteralPath (Join-Path $fakeRepo $rel) -Encoding utf8NoBOM
+            }
+            'apparatus' | Set-Content -LiteralPath (Join-Path $scripts 'study01_collect.py') -Encoding utf8NoBOM
+            'frozen' | Set-Content -LiteralPath (Join-Path $protocol 'evidence-schema.md') -Encoding utf8NoBOM
+
+            foreach ($sibling in @('Study01/README.md.bak', 'Study01/README.md.tmp', 'Study01/README.md.d/inner.md')) {
+                Assert-K8FailsClosed -What "'$sibling' (a file entry must match EXACTLY, never by prefix)" -Because 'allowlist' -Attempt {
+                    Resolve-K8NarrativeReference -RunEvidence $d -RepoRoot $fakeRepo -Reference (
+                        New-K8ArtifactReference -Kind 'frozen-protocol-doc' -Path $sibling)
+                }
+            }
+            Assert-K8FailsClosed -What 'traversal out of the protocol directory into the frozen apparatus, with the target really present' -Because "'\.\.' segment" -Attempt {
+                Resolve-K8NarrativeReference -RunEvidence $d -RepoRoot $fakeRepo -Reference (
+                    New-K8ArtifactReference -Kind 'frozen-protocol-doc' -Path 'Study01/studies/study-01-negative-result/protocol/../scripts/study01_collect.py')
+            }
+            # The two genuine cases still resolve, so none of the above is
+            # passing merely because everything is refused.
+            foreach ($ok in @('Study01/README.md', 'Study01/studies/study-01-negative-result/protocol/evidence-schema.md')) {
+                $resolved = Resolve-K8NarrativeReference -RunEvidence $d -RepoRoot $fakeRepo -Reference (
+                    New-K8ArtifactReference -Kind 'frozen-protocol-doc' -Path $ok)
+                if ($resolved -ne $ok) { throw "a legitimately allowlisted document was refused or rewritten: '$ok' -> '$resolved'" }
+            }
+        }
+        finally { Remove-Item $fakeRepo -Recurse -Force -ErrorAction SilentlyContinue }
+
+        # The allowlist itself: one exact FILE and one directory, held apart so
+        # that one comparison can never have to serve both.
         $source = Get-Content $CommonPath -Raw
-        $block = [regex]::Match($source, "(?s)K8FrozenProtocolDocPrefixes = @\((.*?)\)")
-        if (-not $block.Success) { throw 'the allowlist declaration could not be found' }
-        $entries = @([regex]::Matches($block.Groups[1].Value, "'([^']+)'") | ForEach-Object { $_.Groups[1].Value })
-        $expected = @('Study01/README.md', 'Study01/studies/study-01-negative-result/protocol/')
-        $left = (($entries | Sort-Object) -join '|')
-        $right = (($expected | Sort-Object) -join '|')
-        if ($left -ne $right) {
-            throw "the allowlist is [$left], not the two prefixes the Plan fixes ([$right]). Widening it is a Plan revision, not a code change."
+        if ($source -match 'K8FrozenProtocolDocPrefixes') { throw 'the file and directory entries are back in one array; a prefix test would then also admit README.md.bak' }
+        $declared = @{}
+        foreach ($name in @('K8FrozenProtocolDocFiles', 'K8FrozenProtocolDocDirectories')) {
+            $block = [regex]::Match($source, "(?s)$name = @\((.*?)\)")
+            if (-not $block.Success) { throw "the $name allowlist declaration could not be found" }
+            $declared[$name] = @([regex]::Matches($block.Groups[1].Value, "'([^']+)'") | ForEach-Object { $_.Groups[1].Value })
+        }
+        if (($declared['K8FrozenProtocolDocFiles'] -join '|') -ne 'Study01/README.md') {
+            throw "the frozen-protocol-doc FILE allowlist is [$($declared['K8FrozenProtocolDocFiles'] -join ', ')], not the single file the Plan fixes."
+        }
+        if (($declared['K8FrozenProtocolDocDirectories'] -join '|') -ne 'Study01/studies/study-01-negative-result/protocol/') {
+            throw "the frozen-protocol-doc DIRECTORY allowlist is [$($declared['K8FrozenProtocolDocDirectories'] -join ', ')], not the single directory the Plan fixes."
+        }
+        foreach ($dir in $declared['K8FrozenProtocolDocDirectories']) {
+            if (-not $dir.EndsWith('/')) { throw "directory entry '$dir' has no trailing separator, so a sibling like 'protocol-notes/x.md' would match it" }
         }
     }
     finally { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue }
@@ -4635,6 +4725,7 @@ Assert-K8Test 'Study01/ is byte-for-byte unchanged versus origin/main' {
 # --- Summary -------------------------------------------------------------------
 
 Write-Host ''
+Restore-K8SuiteWorkspace
 if ($failures.Count -gt 0) {
     Write-Host "$($failures.Count) check(s) FAILED: $($failures -join ', ')" -ForegroundColor Red
     exit 1
