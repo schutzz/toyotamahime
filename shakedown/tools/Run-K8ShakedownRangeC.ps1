@@ -51,11 +51,17 @@ if (-not (Test-Path $PatchSource)) { throw "Frozen Range C patch not found at $P
 
 $RunId = $Run.RunId
 $RunEvidence = Join-Path $state.shakedown_root "runs\$RunId"
-New-Item -ItemType Directory -Force -Path $RunEvidence | Out-Null
+
 # Range C builds its own run directory (it never calls the frozen
-# evidence_tree.create), so the provenance mirror lands here rather than
-# immediately after a create() call.
+# evidence_tree.create), so it gets an EXPLICIT evidence-init stage that does
+# the same job at the same point in its own lifecycle as Range A/B's
+# evidence-tree stage. Without it the provenance mirror happened at a timing
+# the C-6 contract could not name, and `run-provenance.json` would have had to
+# carry a per-range exception instead of a real producer stage.
+Set-K8ShakedownRunStage -Stage 'evidence-init'
+New-Item -ItemType Directory -Force -Path $RunEvidence | Out-Null
 Copy-K8RunProvenanceIntoEvidence -Run $Run -RunEvidence $RunEvidence
+Set-K8ShakedownRunEvidence -Path $RunEvidence | Out-Null
 
 Write-K8ShakedownLog -Level STEP -Message "=== Shakedown Range C starting: $RunId ==="
 
@@ -92,12 +98,22 @@ if ((Get-Item $baseManifest).Length -ne (Get-Item $negativeManifest).Length) {
 $patchRaw = Get-Content -Raw -Path $PatchSource
 $derivedPatch = Join-Path $disposable 'range-c-derived.patch'
 $patchRaw.Replace('power-grid-reference.yaml', 'power-grid-reference.range-c-negative.yaml') | Set-Content -NoNewline -Path $derivedPatch -Encoding utf8NoBOM
+# The derived patch is complete NOW, so this is the stage that owns it. The
+# negative manifest deliberately is NOT retained here: at this instant it is
+# still a byte copy of the BASE manifest, and the patch that makes it negative
+# has not been applied yet. Retaining it here would preserve bytes the
+# validator never reads.
+Copy-Item -Path $derivedPatch -Destination (Join-Path $RunEvidence 'range-c-derived.patch')
 
 Set-K8ShakedownRunStage -Stage 'patch-apply'
 Push-Location $disposable
 try {
     Invoke-K8ShakedownCommand -FilePath 'git' -ArgumentList @('apply', '--ignore-space-change', '--check', $derivedPatch) -Description 'derived patch check'
     Invoke-K8ShakedownCommand -FilePath 'git' -ArgumentList @('apply', '--ignore-space-change', $derivedPatch) -Description 'derived patch apply'
+    # Retained HERE, immediately after `git apply` succeeded and before the
+    # validator runs: these are exactly the bytes the validator is about to
+    # read, and nothing modifies the file between this copy and that read.
+    Copy-Item -Path $negativeManifest -Destination (Join-Path $RunEvidence 'power-grid-reference.range-c-negative.yaml')
 
     # 3. Exactly one command. Byte-exact stdout/stderr capture via cmd.exe redirection
     #    (PowerShell's own pipeline capture re-encodes text; this does not).
@@ -106,37 +122,91 @@ try {
     $stderrPath = Join-Path $RunEvidence 'validate.stderr.txt'
     Write-K8ShakedownLog -Level STEP -Message 'RUN: python platform/cli.py validate manifests/power-grid-reference.range-c-negative.yaml'
     $pyVersion = (python --version 2>&1 | Out-String).Trim()
+    $validatorArgv = @('cmd.exe', '/c', 'python', 'platform\cli.py', 'validate', 'manifests\power-grid-reference.range-c-negative.yaml')
+    $validatorStartedUtc = Get-K8UtcNow
     & cmd.exe /c "python platform\cli.py validate manifests\power-grid-reference.range-c-negative.yaml > `"$stdoutPath`" 2> `"$stderrPath`""
     $exitCode = $LASTEXITCODE
     Write-K8ShakedownLog -Message "validate exit code: $exitCode (exit 1 is the EXPECTED outcome per README SS5.3/SS6.1 -- not treated as failure)"
+
+    # C-4. This is the closed-world's only `direct cmd.exe` producer, and the
+    # one whose emptiness matters most: a Range C stdout of 0 bytes is the
+    # EXPECTED observation (README SS5.3/SS6.1), so an empty stream must be
+    # retained as a described file, never silently skipped. `file-backed`
+    # semantics: cmd.exe wrote both streams itself, so the descriptors hash
+    # the files' raw bytes with no re-encoding in between.
+    Write-K8CommandObservation -RunEvidence $RunEvidence `
+        -ArtifactRelativePath 'validate.stdout.txt' -ObservationRelativePath 'validate.observation.json' `
+        -Producer 'Run-K8ShakedownRangeC.ps1' -Stage 'validator-run' -Range 'c' -RunId $RunId `
+        -Observations @(
+            New-K8FileBackedCommandObservation -Label 'Range C static validation (the one permitted command)' `
+                -Argv $validatorArgv -ExitCode $exitCode -TimestampUtc $validatorStartedUtc `
+                -RunEvidence $RunEvidence -StdoutRelativePath 'validate.stdout.txt' -StderrRelativePath 'validate.stderr.txt'
+        ) | Out-Null
 }
 finally { Pop-Location }
 
-# 4. Retain: derived manifest, derivation, command, stdout, stderr, exit code, tool versions.
+# 4. Retain the narrative record. The derived patch, the negative manifest and
+#    the two stream files were each retained by the stage that produced them.
 Set-K8ShakedownRunStage -Stage 'retention'
-Copy-Item -Path $negativeManifest -Destination (Join-Path $RunEvidence 'power-grid-reference.range-c-negative.yaml')
-Copy-Item -Path $derivedPatch -Destination (Join-Path $RunEvidence 'range-c-derived.patch')
+# C7-R2: typed references, existence-checked before they are named. The
+# worktree paths below are host paths and are recorded as-is -- they are not
+# resolvable as run-local artifacts and are not checked as such.
+$cRefs = Get-K8NarrativeReferenceText -RunEvidence $RunEvidence -References @(
+    (New-K8ArtifactReference -Kind 'run-local' -Path 'validate.stdout.txt')
+    (New-K8ArtifactReference -Kind 'run-local' -Path 'validate.stderr.txt')
+    (New-K8ArtifactReference -Kind 'run-local' -Path 'power-grid-reference.range-c-negative.yaml')
+    (New-K8ArtifactReference -Kind 'run-local' -Path 'range-c-derived.patch')
+    (New-K8ArtifactReference -Kind 'run-local' -Path 'validate.observation.json')
+    (New-K8ArtifactReference -Kind 'host-path' -Path $rangeCSource)
+    (New-K8ArtifactReference -Kind 'host-path' -Path $disposable)
+)
+# C7-R4: run identity from the authoritative structured source; the command
+# fact (exit code) from the C-4 observation this run just retained, not from a
+# loose local variable.
+$cIdentity = Get-K8RunIdentityFacts -RunId $RunId
+$cObservation = (Get-Content -LiteralPath (Join-Path $RunEvidence 'validate.observation.json') -Raw | ConvertFrom-Json).observations[0]
 @"
 # Range C validation record -- $RunId (Shakedown, NOT a formal K8-3 attempt, NOT Gate K8 evidence)
 
 | Field | Value |
 | --- | --- |
-| Source worktree | $rangeCSource (pinned $((Get-K8ShakedownConstants).RangeCCommit)) |
-| Disposable worktree | $disposable |
-| Command | python platform/cli.py validate manifests/power-grid-reference.range-c-negative.yaml |
-| Exit code | $exitCode |
+| Run ID | $($cIdentity.RunId) |
+| Qualification sequence | $($cIdentity.SequenceId) |
+| Tooling HEAD (locked for this sequence) | $($cIdentity.LockedHead) |
+| Source worktree | $($cRefs[5]) (pinned $((Get-K8ShakedownConstants).RangeCCommit)) |
+| Disposable worktree | $($cRefs[6]) |
+| Command | $($cObservation.argv -join ' ') |
+| Exit code | $($cObservation.exit_code) |
 | Python | $pyVersion |
-| stdout | validate.stdout.txt (raw bytes, no newline translation) |
-| stderr | validate.stderr.txt (raw bytes, no newline translation) |
+| Derived patch | $($cRefs[3]) (retained at manifest-derivation) |
+| Validated manifest | $($cRefs[2]) (retained at patch-apply, after \`git apply\` succeeded -- these are the bytes the validator read) |
+| stdout | $($cRefs[0]) -- $($cObservation.stdout.bytes) byte(s), sha256 $($cObservation.stdout.sha256) |
+| stderr | $($cRefs[1]) -- $($cObservation.stderr.bytes) byte(s), sha256 $($cObservation.stderr.sha256) |
+| Structured command observation | $($cRefs[4]) |
 
 Expected, not forced (README SS5.3/SS6.1): exit 1, empty stdout, stderr naming
 observability_contract.required_segments and sub_a_l2_lan. This record states
 what was actually observed; compare it against expected/range-c/ yourself
 before drawing a conclusion.
+
+An empty stdout is a RETAINED observation, not a missing artifact: the file
+exists and is described above with its byte count and hash.
+
+Scope note: this run satisfies the Shakedown SS5.3 execution-retention
+contract. It is NOT the frozen evidence-schema.md static-validation package
+shape (\`static-validations/\`), and nothing here claims it is.
 "@ | Set-Content -Path (Join-Path $RunEvidence 'metadata.md') -Encoding utf8NoBOM
 
 Remove-Item -Recurse -Force $disposable
 Write-K8ShakedownLog -Message "Disposable worktree removed after retention (README SS5.2: only the disposable worktree and generated static artifacts are removed; no Docker cleanup applies to Range C)."
+
+# C-6 final gate, BEFORE the sequence is advanced. A Range C run must not be
+# recorded as completed -- still less become the third leg of a
+# c-2b-sequence-valid sequence -- while an artifact it contracted to retain is
+# missing. Defense in depth over the per-stage gates above, from the same
+# single contract.
+Set-K8ShakedownRunStage -Stage 'completeness-gate'
+Assert-K8RunArtifactCompleteness -Range 'c' -RunEvidence $RunEvidence
 
 # Range C is single-phase, so the sequence advances here rather than in a
 # separate Complete script. If this is the third run of an uninterrupted

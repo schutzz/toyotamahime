@@ -32,6 +32,46 @@ The order is enforced, not just documented: each run refuses to start unless it
 is the range the sequence expects next, no other run is active, the tooling HEAD
 still equals the sequence's locked_head, and the worktree is clean.
 
+Artifact completeness is also enforced per stage, not only at the end: leaving a
+stage checks the artifacts that stage was responsible for producing. A missing
+file stops the run there, naming the stage that owed it.
+
+Scoring input (Range A and Range B)
+-----------------------------------
+Still transcribed BY HAND, still before opening expected/. Nothing below fills
+in a value; the shape is checked, the judgment is not.
+
+Complete-K8ShakedownRange.ps1 prints these two paths when it finishes. The
+template is intentionally incomplete and intentionally not scorable:
+
+    <shakedown root>\run-records\<run_id>\scoring-input.template.json
+    <shakedown root>\run-records\<run_id>\finalize-identity.json
+
+Copy the template, fill every <FILL-IN> from the retained evidence, and in
+"derivation" record which artifact each value came from. Then check the shape:
+
+    python .\tools\k8_scoring_input_contract.py validate `
+        --range a `
+        --input <your-scoring-input.json> `
+        --run-evidence <run evidence dir> `
+        --finalize-snapshot <shakedown root>\run-records\<run_id>\finalize-identity.json
+
+It verifies presence, token domains, that each recorded value matches the
+input, and that each cited artifact is inside the run evidence, covered by the
+finalized manifest, still hashing to what the manifest says, against the
+manifest that actually passed verify-integrity. It does not check whether you
+read the artifact correctly, and it never opens expected/.
+
+To see the contract itself as data:
+
+    python .\tools\k8_scoring_input_contract.py describe --range b
+
+If it refuses "r_obs_05": "Unresolved", that is deliberate. The token is a valid
+R-OBS-05 query outcome, but no frozen source fixes what it propagates to in
+scoring, and the tooling will not invent one. The observation is retained in the
+R-OBS-05 correlation record; the scoring value is your decision to make and to
+justify.
+
 If something fails partway through a Range run
 ----------------------------------------------
 A terminated run ends its sequence. There is no retry inside the same sequence

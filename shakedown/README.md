@@ -42,7 +42,14 @@ Unlike a formal K8-3 attempt:
 - It does not write `scoring-input.json`. README §6.2 requires that to be
   transcribed by hand from evidence, derived before looking at `expected/`;
   auto-generating it would erase the exact discipline the study's own
-  limitations analysis (`claims/limitations.md` R6) is about.
+  limitations analysis (`claims/limitations.md` R6) is about. It does emit a
+  **template** (see "Scoring-input structural contract" below), which is
+  deliberately not scorable: every judgment slot holds a placeholder, so the
+  tooling cannot be read as having chosen a default.
+- It does not decide whether an absence is acceptable. Where an observer finds
+  nothing, the record now separates *what was observed* from *whether a frozen
+  source permits it* -- but which of those two an absent index is remains
+  frozen policy transcribed into the tooling, never a judgment made by it.
 - It executes the fixed Elasticsearch requests and mechanical correlations,
   retaining the instantiated requests and full raw responses. It does not
   change selectors after seeing results or assign scientific scores.
@@ -130,6 +137,77 @@ before live evidence was retained would make it permanently unobtainable.
 `Complete-K8ShakedownRange.ps1` refuses teardown if any required automated
 artifact or Range B R-OBS-05 gate is missing or failed.
 
+## Artifact completeness, per stage
+
+Every artifact a run is required to retain is declared once, in
+`$script:K8ArtifactContract` (`tools/K8ShakedownCommon.psm1`), with the stage
+that produces it and the ranges it applies to. There is no second list.
+
+- **Leaving a stage checks that stage.** `Set-K8ShakedownRunStage` asserts the
+  outgoing stage's artifacts before the next stage begins, so a missing file
+  stops the run at the stage that owed it rather than several stages later.
+- **The end-of-run gate reads the same contract.** It is defense in depth: if
+  it ever reports something the stage gates let past, that is a regression
+  defect in the stage gates, not a requirement discovered late.
+- **Legitimate absence is never expressed by omitting an artifact.** It is
+  recorded *inside* the artifact (`absence_admissible`), so "we observed
+  nothing, admissibly" and "we retained nothing" stay distinguishable.
+
+Range C has its own `evidence-init` stage so that `run-provenance.json` has a
+real producer stage in all three ranges rather than a per-range exception, and
+its completeness gate runs **before** the sequence is advanced.
+
+Range C's scope here is the Shakedown §5.3 execution-retention contract only.
+It is **not** the frozen `evidence-schema.md` static-validation package shape
+(`static-validations/`), and nothing claims it is.
+
+## Retained command observations
+
+Every Shakedown-owned command whose output is retained as an observation also
+gets a structured `<artifact>.observation.json` beside its existing text
+artifact -- same capture instance, no re-parsing of the text, and no new `.txt`
+files. Each record states its `capture_semantics`:
+
+| | what it means |
+| --- | --- |
+| `separated` | stdout and stderr really were captured apart and are described as themselves |
+| `combined` | `2>&1` merged them; `stdout`/`stderr` are `null`, because per-stream emptiness is unrecoverable and will not be invented |
+| `file-backed` | the producer redirected each stream straight to a file; the descriptors hash those files' raw bytes |
+
+A zero-byte stream is retained and described, never skipped: Range C's empty
+`validate.stdout.txt` is the frozen *expected* observation, so it must exist as
+a file with a stated byte count and hash.
+
+## Scoring-input structural contract
+
+`tools/k8_scoring_input_contract.py` is the single source of truth for the
+shape of a Range A/B `scoring-input.json`. Frozen value domains are imported
+from `study01/frozen/semantics.py`; the presence rules, derivation addressing
+and token domains are Batch 2 structural additions. The template, the
+validator, and the regression tests are all derived from it.
+
+After `Complete-K8ShakedownRange.ps1` finishes, it writes an intentionally
+incomplete template into the run's control-plane record directory and prints
+the command to check your completed file. That check is **shape only**:
+
+- every field the frozen scorer will read is present for this Range;
+- every value is inside its frozen (or contract-fixed) token domain;
+- every such field records which artifact it was read from and what value was
+  read, and that recorded value matches the input;
+- that artifact exists, is inside the run evidence, is covered by the finalized
+  integrity manifest, still hashes to what the manifest says, and the manifest
+  itself is the one that actually passed `verify-integrity`.
+
+Whether you read the artifact *correctly* is not checked and cannot be: that is
+the judgment README §6.2 reserves for you. The tool never opens `expected/`.
+
+One token is deliberately refused: `"r_obs_05": "Unresolved"`. It is a valid
+R-OBS-05 *query outcome*, but no frozen source fixes what it propagates to in
+scoring -- the frozen scorer special-cases only `== "Fail"` -- so accepting it
+would let a structurally valid input carry a value the scorer silently ignores.
+It is retained in the observer record instead, and the scoring value is yours
+to resolve.
+
 ## Layout
 
 ```text
@@ -144,12 +222,14 @@ shakedown/
 │  ├─ Run-K8ShakedownRangeB.ps1                <- same, + the fault
 │  ├─ Complete-K8ShakedownRange.ps1            <- phase 2: pre-hash + teardown + cleanup re-hash/verify
 │  ├─ k8_shakedown_evidence.py                  <- mapping, hit-ID, and integer-ns correlation checks
+│  ├─ k8_scoring_input_contract.py              <- ONE source for the scoring-input template, validator and tests
 │  ├─ Run-K8ShakedownRangeC.ps1                <- Range C is one script; no live-query dependency
 │  ├─ collector-query.template.json            <- frozen target-event Collector query, T0 substituted at runtime
 │  ├─ rule-query.template.json                 <- frozen target-event Rule query, T0 substituted at runtime
 │  └─ r-obs-05-query.template.json             <- frozen R-OBS-05 (Range B) query, T0 substituted at runtime
 ├─ tests/
-│  └─ Test-K8ShakedownRegression.ps1           <- repo-side checks, see below
+│  ├─ Test-K8ShakedownRegression.ps1           <- repo-side checks, see below
+│  └─ k8_synthetic_evidence_tree.py            <- test fixture: a Range A/B tree the FROZEN collector accepts
 └─ operator/
    └─ shakedown-commands.txt                   <- copy/paste reference; calls the scripts above, does not restate their contents
 ```
@@ -198,7 +278,13 @@ Even once Shakedown completes end to end, these remain manual by design (see
 "What Shakedown is not allowed to do" above):
 
 1. `scoring-input.json` for Range A and Range B (README §6.2), including the
-   scientific interpretation of retained mechanical evidence.
+   scientific interpretation of retained mechanical evidence. A structural
+   template is emitted for you and a shape-only validator is available (see
+   "Scoring-input structural contract"), but neither supplies a value, and
+   both refuse to run against `expected/`.
+2. Resolving any `r_obs_05` outcome the frozen sources do not map to a scoring
+   token. The observer record retains what was observed; the scoring value is
+   yours.
 
 ## Status
 

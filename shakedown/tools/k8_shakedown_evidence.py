@@ -11,6 +11,57 @@ from pathlib import Path
 
 LIMIT_NS = 1_000_000
 
+# ---------------------------------------------------------------------------
+# C-5 legitimate-absence contract.
+#
+# An observer can end up with nothing to look at for reasons that are NOT
+# interchangeable, and collapsing them is how a run silently turns "we never
+# observed the thing" into "the thing was fine":
+#
+#   observer_status      did the OBSERVER work?  `succeeded` means it read the
+#                        response and could say what is there -- including
+#                        saying "nothing is there".  `malformed` means the
+#                        response could not be evaluated at all, so nothing may
+#                        be concluded from it in either direction.  There is
+#                        deliberately no `failed`: acquisition and command
+#                        failures are C-4 / C-1 territory and this module never
+#                        produces one.
+#   index_present /      WHAT was observed.  `null` only when the observer is
+#   evaluated_count      `malformed`, never as a stand-in for "no".
+#   absence_admissible   whether a frozen source PERMITS that absence.  This is
+#                        a transcription of frozen policy, not a judgment made
+#                        here, and it differs per observer (see below).
+#   correlation_applicable /   whether a universal predicate had anything to
+#   predicate result           range over.  A predicate over an EMPTY set is
+#                              vacuously true as mathematics and says nothing
+#                              as an observation, so it is recorded as `null`,
+#                              never as `true`.
+#
+# EMPTY IS NOT MALFORMED.  An observer that correctly reports "this index does
+# not exist" SUCCEEDED.  Whether that absence is acceptable is the separate
+# `absence_admissible` axis.  Conflating the two would either excuse a frozen
+# fail-close as "just a broken observer" or condemn a legitimate negative
+# observation as a defect.
+#
+# Nothing here changes any fail-close: every case that stopped before still
+# stops, in the same place, with the same effect. What changes is that the
+# observation is RETAINED FIRST, so a stop is diagnosable instead of silent.
+# ---------------------------------------------------------------------------
+OBSERVER_SUCCEEDED = "succeeded"
+OBSERVER_MALFORMED = "malformed"
+
+# Per-observer transcription of frozen policy. Rule mapping: the
+# ot-signals-zone-violation-* index is created LAZILY by zone_violation.py's
+# first alert write, and no frozen Study 01 document requires it to exist, so
+# its absence is a legitimate negative observation (see rule_mapping below).
+# Collector and R-OBS-05 mapping: k6-r-obs-05-collector-query-contract.md SS2
+# freezes the ot-logs-dnp3-* selector fields and the pre-T0 functional-
+# readiness canary already guarantees that index exists, so absence there is a
+# frozen fail-close and must NOT be relaxed into a "legitimate absence".
+RULE_MAPPING_ABSENCE_ADMISSIBLE = True
+COLLECTOR_MAPPING_ABSENCE_ADMISSIBLE = False
+R_OBS_05_MAPPING_ABSENCE_ADMISSIBLE = False
+
 
 def load(path: str):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
@@ -64,14 +115,34 @@ def target(args):
         source_id = scalar(get_path(row.get("_source", {}), "source_dnp3_doc_id"))
         rule_rows.append({"rule_id": row["_id"], "source_dnp3_doc_id": source_id,
                           "correlates_to_accepted_collector_hit": source_id in collector_set})
-    all_correlate = all(row["correlates_to_accepted_collector_hit"] for row in rule_rows)
+    # C5-R4, the vacuous-truth guard. `all([])` is True, so the previous
+    # record answered "did every Rule hit correlate?" with `true` for a run
+    # that returned NO Rule hits at all -- turning "we observed no
+    # counterexample" into "we confirmed the correlation". Range B's frozen
+    # expected Rule output is "No alert", so that empty case is the NORMAL
+    # one, not a corner case. The predicate is now `null` when it had nothing
+    # to range over, and `correlation_applicable` says so explicitly.
+    correlation_applicable = bool(rule_rows)
+    all_correlate = (all(row["correlates_to_accepted_collector_hit"] for row in rule_rows)
+                     if correlation_applicable else None)
     write(args.output, {
         "mechanical_check": "complete frozen-selector Collector set to Rule source_dnp3_doc_id",
+        "observer_status": OBSERVER_SUCCEEDED,
         "collector_hit_count": len(collector_ids),
         "accepted_collector_hit_ids": collector_ids,
         "rule_hit_count": len(rule_rows),
         "rule_correlations": rule_rows,
+        "evaluated_count": len(rule_rows),
+        "correlation_applicable": correlation_applicable,
+        # An empty Rule hit set is a legitimate observation here: the Rule
+        # index is lazily created and "No alert" is a frozen expected outcome.
+        # It is the PREDICATE that becomes null, not the observation that
+        # becomes a failure.
+        "absence_admissible": True,
         "all_rule_hits_correlate": all_correlate,
+        "all_rule_hits_correlate_note": (
+            "null means the predicate had no Rule hits to range over. It is NOT "
+            "an assertion that the correlation holds."),
     })
     # Independent mechanical verification, not just retention: the Rule
     # query itself now filters server-side on source_dnp3_doc_id.keyword IN
@@ -128,10 +199,54 @@ def mapping_field(properties, dotted):
     return None
 
 
-def mapping_gate(mapping_path: str, output_path: str, fields: dict, gate_label: str):
+def mapping_observation(gate_label, *, observer_status, index_present, evaluated_count,
+                        absence_admissible, mapping_gate_pass, decisions):
+    """The C-5 observer record. Written BEFORE any fail-close, so a stop is
+    always accompanied by the observation that caused it."""
+    return {
+        "gate": gate_label,
+        "observer_status": observer_status,
+        "index_present": index_present,
+        "evaluated_count": evaluated_count,
+        "absence_admissible": absence_admissible,
+        "mapping_gate_pass": mapping_gate_pass,
+        "decisions": decisions,
+    }
+
+
+def mapping_gate(mapping_path: str, output_path: str, fields: dict, gate_label: str,
+                 *, absence_admissible: bool):
     response = load(mapping_path)
+
+    # MALFORMED: the observer could not evaluate the response at all, so it
+    # cannot say whether an index is present. index_present/evaluated_count
+    # stay null rather than being flattened to false/0 -- "unknown" is not
+    # "no".
+    if not isinstance(response, dict):
+        write(output_path, mapping_observation(
+            gate_label, observer_status=OBSERVER_MALFORMED, index_present=None,
+            evaluated_count=None, absence_admissible=absence_admissible,
+            mapping_gate_pass=False, decisions=[]))
+        raise ValueError(
+            f"{gate_label}: the mapping response could not be evaluated as an "
+            "index->mapping object, so index presence is UNKNOWN, not absent")
+
+    # EMPTY: the observer SUCCEEDED and correctly observed that no concrete
+    # index matched. Whether that is acceptable is the separate admissibility
+    # axis -- for the Rule gate it is (lazily created index); for the
+    # Collector and R-OBS-05 gates it is a frozen fail-close and stays one.
     if not response:
-        raise ValueError("mapping response contains no indices")
+        write(output_path, mapping_observation(
+            gate_label, observer_status=OBSERVER_SUCCEEDED, index_present=False,
+            evaluated_count=0, absence_admissible=absence_admissible,
+            mapping_gate_pass=absence_admissible, decisions=[]))
+        if absence_admissible:
+            return
+        raise ValueError(
+            f"{gate_label}: mapping response contains no indices. The observer "
+            "succeeded and this absence is real, but no frozen source permits it "
+            "for this gate")
+
     decisions = []
     for index_name, index_value in response.items():
         properties = get_path(index_value, "mappings.properties")
@@ -141,19 +256,24 @@ def mapping_gate(mapping_path: str, output_path: str, fields: dict, gate_label: 
                   (not needs_keyword or get_path(node, "fields.keyword.type") == "keyword"))
             decisions.append({"index": index_name, "field": field, "expected_type": expected_type,
                               "keyword_required": needs_keyword, "pass": ok})
-    result = {"gate": gate_label, "mapping_gate_pass": bool(decisions) and all(x["pass"] for x in decisions),
-              "index_present": True, "decisions": decisions}
+    result = mapping_observation(
+        gate_label, observer_status=OBSERVER_SUCCEEDED, index_present=True,
+        evaluated_count=len(decisions), absence_admissible=absence_admissible,
+        mapping_gate_pass=bool(decisions) and all(x["pass"] for x in decisions),
+        decisions=decisions)
     write(output_path, result)
     if not result["mapping_gate_pass"]:
         raise ValueError(f"{gate_label}: mapping field/type drift detected")
 
 
 def mapping(args):
-    mapping_gate(args.mapping, args.output, FIELDS, "R-OBS-05 exact mapping field/type gate")
+    mapping_gate(args.mapping, args.output, FIELDS, "R-OBS-05 exact mapping field/type gate",
+                 absence_admissible=R_OBS_05_MAPPING_ABSENCE_ADMISSIBLE)
 
 
 def collector_mapping(args):
-    mapping_gate(args.mapping, args.output, FIELDS, "Collector selector exact-match mapping gate (ot-logs-dnp3-*)")
+    mapping_gate(args.mapping, args.output, FIELDS, "Collector selector exact-match mapping gate (ot-logs-dnp3-*)",
+                 absence_admissible=COLLECTOR_MAPPING_ABSENCE_ADMISSIBLE)
 
 
 def rule_mapping(args):
@@ -191,17 +311,19 @@ def rule_mapping(args):
     distinguishable states (`index_present: false` vs. `true`) precisely
     so a later reader never conflates them into one undifferentiated
     "No alert" without knowing which one actually occurred.
+
+    C-5 note: this gate's legitimate-absence case is no longer a separate
+    code path with its own hand-written record. It is the SAME
+    mapping_gate() as the Collector and R-OBS-05 gates, differing only by
+    the `absence_admissible` constant above -- so the difference between
+    the three observers is visible as frozen policy DATA rather than as
+    divergent control flow that could drift apart. An index that DOES
+    exist with a field/type drift still fails closed here exactly as
+    before.
     """
-    response = load(args.mapping)
-    if not response:
-        write(args.output, {
-            "gate": "Rule selector exact-match mapping gate (signal/src_ip/dst_ip/source_dnp3_doc_id)",
-            "mapping_gate_pass": True,
-            "index_present": False,
-            "decisions": [],
-        })
-        return
-    mapping_gate(args.mapping, args.output, RULE_FIELDS, "Rule selector exact-match mapping gate (signal/src_ip/dst_ip/source_dnp3_doc_id)")
+    mapping_gate(args.mapping, args.output, RULE_FIELDS,
+                 "Rule selector exact-match mapping gate (signal/src_ip/dst_ip/source_dnp3_doc_id)",
+                 absence_admissible=RULE_MAPPING_ABSENCE_ADMISSIBLE)
 
 
 DECIMAL = re.compile(r"^(?P<seconds>-?\d+)(?:\.(?P<fraction>\d{1,9}))?$")
@@ -239,10 +361,73 @@ def document_tuple(row):
     ])
 
 
+def robs_observation(*, observer_status, document_ids, decoded_frame_count,
+                     evaluated_count, correlation_applicable, gate_pass,
+                     contract_outcome, comparisons, matching_pairs):
+    """The C-5 observer record for R-OBS-05.
+
+    `r_obs_05_contract_outcome` carries ONLY the tokens the frozen contract
+    itself names for the two absence cases -- SS3 "A zero total ... is
+    `Unresolved`" and SS4 "If no document/frame pair meets all three rules,
+    R-OBS-05 is `Fail`". It is null on the passing path: deriving a `Pass`
+    would be this tooling authoring a scientific judgment, which it must not
+    do. It is also NOT a scoring field: `Unresolved` in particular has no
+    frozen scoring propagation (see k8_scoring_input_contract.py), so it is
+    retained here as an observation and resolved by the operator.
+    """
+    return {
+        "r_obs_05_mechanical_gate_pass": gate_pass,
+        "observer_status": observer_status,
+        "returned_document_ids": document_ids,
+        "decoded_frame_count": decoded_frame_count,
+        "evaluated_count": evaluated_count,
+        "correlation_applicable": correlation_applicable,
+        # Frozen: SS1 requires "nonempty applicable Collector evidence" and SS3
+        # makes a zero total `Unresolved`. Absence is never admissible here.
+        "absence_admissible": False,
+        "r_obs_05_contract_outcome": contract_outcome,
+        "comparisons": comparisons,
+        "matching_pairs": matching_pairs,
+    }
+
+
 def robs(args):
-    documents = hits(load(args.response), require_nonempty=True)
+    # Every fail-close below RETAINS the observation first. Previously a
+    # zero-hit response or an unevaluable frame set raised before anything was
+    # written, so the run stopped with no record of WHICH absence occurred --
+    # the diagnostic gap C-5 exists to close. The stops themselves are
+    # unchanged.
+    try:
+        documents = hits(load(args.response), require_nonempty=False)
+    except ValueError:
+        write(args.output, robs_observation(
+            observer_status=OBSERVER_MALFORMED, document_ids=None,
+            decoded_frame_count=None, evaluated_count=None,
+            correlation_applicable=None, gate_pass=False,
+            contract_outcome=None, comparisons=[], matching_pairs=[]))
+        raise
+    if not documents:
+        write(args.output, robs_observation(
+            observer_status=OBSERVER_SUCCEEDED, document_ids=[],
+            decoded_frame_count=None, evaluated_count=0,
+            correlation_applicable=False, gate_pass=False,
+            contract_outcome="Unresolved", comparisons=[], matching_pairs=[]))
+        raise ValueError("the fixed query returned zero hits")
+    document_ids = [row["_id"] for row in documents]
     frames = load(args.frames)
-    if not isinstance(frames, list) or not frames:
+    if not isinstance(frames, list):
+        write(args.output, robs_observation(
+            observer_status=OBSERVER_MALFORMED, document_ids=document_ids,
+            decoded_frame_count=None, evaluated_count=None,
+            correlation_applicable=None, gate_pass=False,
+            contract_outcome=None, comparisons=[], matching_pairs=[]))
+        raise ValueError("decoded unrelated-flow pcap rows are not an array")
+    if not frames:
+        write(args.output, robs_observation(
+            observer_status=OBSERVER_SUCCEEDED, document_ids=document_ids,
+            decoded_frame_count=0, evaluated_count=0,
+            correlation_applicable=False, gate_pass=False,
+            contract_outcome=None, comparisons=[], matching_pairs=[]))
         raise ValueError("decoded unrelated-flow pcap rows are empty")
     window_start_ns = iso_epoch_ns(args.window_start)
     window_end_ns = iso_epoch_ns(args.window_end)
@@ -268,11 +453,17 @@ def robs(args):
             pairs.append(record)
             if record["correlates"]:
                 matching_pairs.append(record)
-    result = {"r_obs_05_mechanical_gate_pass": bool(matching_pairs),
-              "returned_document_ids": [row["_id"] for row in documents],
-              "decoded_frame_count": len(frames), "comparisons": pairs, "matching_pairs": matching_pairs}
+    gate_pass = bool(matching_pairs)
+    result = robs_observation(
+        observer_status=OBSERVER_SUCCEEDED, document_ids=document_ids,
+        decoded_frame_count=len(frames), evaluated_count=len(pairs),
+        correlation_applicable=bool(pairs), gate_pass=gate_pass,
+        # SS4: "If no document/frame pair meets all three rules, R-OBS-05 is
+        # `Fail`." Null on the passing path -- the tooling does not author a Pass.
+        contract_outcome=(None if gate_pass else "Fail"),
+        comparisons=pairs, matching_pairs=matching_pairs)
     write(args.output, result)
-    if not result["r_obs_05_mechanical_gate_pass"]:
+    if not gate_pass:
         raise ValueError("no unrelated-flow pcap/document pair met exact fields and <=1,000,000 ns")
 
 

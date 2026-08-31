@@ -819,6 +819,9 @@ function Start-K8ShakedownRun {
         LockedHead  = [string]$sequence['locked_head']
         RepoRoot    = $identity.RepoRoot
         Stage       = 'run-initialization'
+        # Set by Set-K8ShakedownRunEvidence once the tree exists; until then
+        # the C-6 stage-boundary gate has nothing to check against.
+        RunEvidence = $null
     }
     Write-K8ShakedownLog -Level STEP -Message "run $runId reserved in sequence $([string]$sequence['sequence_id']); provenance retained before any scientific/runtime step."
     return $script:K8CurrentRun
@@ -827,11 +830,32 @@ function Start-K8ShakedownRun {
 function Set-K8ShakedownRunStage {
     <# Call this IMMEDIATELY BEFORE the first fallible operation of the stage.
        Setting it afterwards would attribute that operation's failure to the
-       previous stage. #>
+       previous stage.
+
+       C-6: leaving a stage is also where that stage's own artifacts are
+       checked. Doing it HERE rather than at each call site means the check
+       cannot be forgotten when a new stage is added, and the throw happens
+       while Stage still names the stage that owed the artifact -- so the
+       termination record attributes it correctly. It is armed only once
+       Set-K8ShakedownRunEvidence has been called; stages that precede the
+       evidence tree have nothing to check. #>
     param([Parameter(Mandatory)][string] $Stage)
     if ($null -eq $script:K8CurrentRun) { throw "Set-K8ShakedownRunStage -Stage '$Stage' was called with no active run context." }
+    $previous = $script:K8CurrentRun.Stage
+    if ($script:K8CurrentRun.RunEvidence -and $previous -and $previous -ne $Stage) {
+        Assert-K8StageArtifacts -Range $script:K8CurrentRun.Range -Stage $previous -RunEvidence $script:K8CurrentRun.RunEvidence
+    }
     $script:K8CurrentRun.Stage = $Stage
     Write-K8ShakedownLog -Message "stage -> $Stage"
+}
+
+function Set-K8ShakedownRunEvidence {
+    <# Arms the C-6 stage-boundary gate by telling the run context where its
+       evidence tree is. Called as soon as that tree exists. #>
+    param([Parameter(Mandatory)][string] $Path)
+    if ($null -eq $script:K8CurrentRun) { throw "Set-K8ShakedownRunEvidence was called with no active run context." }
+    $script:K8CurrentRun.RunEvidence = $Path
+    return $script:K8CurrentRun
 }
 
 function Set-K8ShakedownRunContext {
@@ -850,6 +874,7 @@ function Set-K8ShakedownRunContext {
         LockedHead  = [string]$prov['sequence_locked_head']
         RepoRoot    = (Resolve-Path -LiteralPath $RepoRoot).Path
         Stage       = 'run-context-restore'
+        RunEvidence = $null
     }
     return $script:K8CurrentRun
 }
@@ -901,6 +926,583 @@ function Copy-K8RunProvenanceIntoEvidence {
     $src = Get-K8RunProvenancePath -RunId $Run.RunId
     if (-not (Test-Path -LiteralPath $src)) { throw "run-provenance record missing at $src; refusing to continue without it." }
     Copy-Item -LiteralPath $src -Destination (Join-Path $RunEvidence 'run-provenance.json') -Force
+}
+
+# ===========================================================================
+# C-4  observation retention
+# C-5  legitimate-absence axes (the observer side lives in
+#      k8_shakedown_evidence.py; this file only consumes its records)
+# C-6  stage-boundary artifact completeness
+# C-7  narrative <-> artifact reference integrity
+#
+# WHY THIS EXISTS (K8-SHAKEDOWN-RETROSPECTIVE.md SS5 C-3..C-7): these are one
+# group, not five fixes. Their shared subject is the evidence LIFECYCLE --
+# preserve what was observed, without adding meaning, without dropping
+# meaning, and early enough that a later stage cannot quietly paper over a
+# gap:
+#
+#     observation -> existence state -> stage completeness -> narrative
+#        C-4             C-5                 C-6                C-7
+#
+# and, at the far end, the human judgment boundary C-3 protects.
+#
+# NOTHING HERE SCORES ANYTHING. Every function below either retains what a
+# command/observer produced, or checks that something the tooling itself
+# promised to retain is actually present. None of them derive Pass/Fail,
+# Alert/No alert, or any scored verdict, and none of them read expected/.
+# ===========================================================================
+
+$script:K8CommandObservationSchema = 'k8shakedown-command-observation/1'
+$script:K8FinalizeIdentitySchema   = 'k8shakedown-finalize-identity/1'
+$script:K8ObservationSuffix        = '.observation.json'
+
+# C-7: the ONLY repository prefixes a machine-generated narrative may cite as
+# a frozen protocol document. Left as "somewhere in the repo" this would be an
+# implementer's judgment call, and a narrative writer could justify pointing at
+# any file at all as a "frozen protocol reference". Measured against every
+# frozen document the four narrative writers actually cite -- README SS5.x/SS6.x
+# plus c2-dnp3-capture-procedure.md, c2-dnp3-image-inventory.md,
+# c2-dnp3-range-derivation.md, evidence-schema.md, freeze-decision-table.md and
+# c2-dnp3-step4-range-b-fault-pilot.md, all of which live under the protocol
+# directory -- these two prefixes are closed. Widening them is a Plan revision,
+# never a quiet code change.
+$script:K8FrozenProtocolDocPrefixes = @(
+    'Study01/README.md',
+    'Study01/studies/study-01-negative-result/protocol/'
+)
+
+# ---------------------------------------------------------------------------
+# C-4: observation envelope
+#
+# Capture METHOD is not forced into one shape -- the producers genuinely
+# differ (separated native capture, a merged transcript, cmd.exe writing two
+# files directly). What is forced is the RECORD: argv, exit code, timestamp,
+# and an explicit statement of which capture semantics produced the streams.
+#
+# `combined` deliberately reports stdout/stderr as null rather than inventing
+# per-stream emptiness flags. Once `2>&1` has merged them, per-stream
+# emptiness is UNRECOVERABLE, and manufacturing it would be exactly the
+# fabricated stream semantics Batch 1 already refused to write.
+# ---------------------------------------------------------------------------
+
+function Get-K8TextStreamDescriptor {
+    <# bytes/sha256 over the UTF-8 encoding of the retained transcript text.
+       `path` is null when the stream is retained inside a shared artifact
+       rather than as its own file -- stating a path that does not hold
+       exactly these bytes would be worse than stating none. #>
+    param([AllowNull()][AllowEmptyString()][string] $Text)
+    $body = $(if ($null -eq $Text) { '' } else { $Text })
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $digest = ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '' }
+    finally { $sha.Dispose() }
+    return [ordered]@{
+        path   = $null
+        bytes  = $bytes.Length
+        sha256 = $digest
+        empty  = ($bytes.Length -eq 0)
+    }
+}
+
+function Get-K8FileStreamDescriptor {
+    <# For a stream the producer wrote straight to a file: hash the FILE's raw
+       bytes, never a re-encoded copy of them. Range C's validator redirects
+       through cmd.exe precisely so no re-encoding happens, and this must not
+       undo that. A zero-byte file is described, never treated as absent. #>
+    param(
+        [Parameter(Mandatory)][string] $RunEvidence,
+        [Parameter(Mandatory)][string] $RelativePath
+    )
+    $full = Join-Path $RunEvidence $RelativePath
+    if (-not (Test-Path -LiteralPath $full)) {
+        throw "C-4 observation cannot describe '$RelativePath': the retained stream file does not exist under $RunEvidence. An empty stream must still be a file."
+    }
+    $length = (Get-Item -LiteralPath $full).Length
+    return [ordered]@{
+        path   = ($RelativePath -replace '\\', '/')
+        bytes  = $length
+        sha256 = (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash.ToLowerInvariant()
+        empty  = ($length -eq 0)
+    }
+}
+
+function New-K8SeparatedCommandObservation {
+    <# One command whose streams really were captured separately. #>
+    param(
+        [Parameter(Mandatory)][string] $Label,
+        [Parameter(Mandatory)][string[]] $Argv,
+        [Parameter(Mandatory)][int] $ExitCode,
+        [Parameter(Mandatory)][string] $TimestampUtc,
+        [AllowNull()][AllowEmptyString()][string] $Stdout,
+        [AllowNull()][AllowEmptyString()][string] $Stderr,
+        [AllowNull()][string] $ContainingArtifact
+    )
+    return [ordered]@{
+        label               = $Label
+        argv                = @($Argv)
+        exit_code           = $ExitCode
+        timestamp_utc       = $TimestampUtc
+        capture_semantics   = 'separated'
+        containing_artifact = $(if ($ContainingArtifact) { $ContainingArtifact -replace '\\', '/' } else { $null })
+        stdout              = (Get-K8TextStreamDescriptor -Text $Stdout)
+        stderr              = (Get-K8TextStreamDescriptor -Text $Stderr)
+        combined_output     = $null
+        artifacts           = $null
+        capture_note        = $script:K8CaptureNote
+    }
+}
+
+function New-K8FileBackedCommandObservation {
+    <# One command whose stdout and stderr the producer redirected straight to
+       their own retained files. `artifacts` enumerates them with their role
+       and channel; it is BUILT FROM the same two descriptors, so the
+       enumeration and the addressed view cannot drift apart. #>
+    param(
+        [Parameter(Mandatory)][string] $Label,
+        [Parameter(Mandatory)][string[]] $Argv,
+        [Parameter(Mandatory)][int] $ExitCode,
+        [Parameter(Mandatory)][string] $TimestampUtc,
+        [Parameter(Mandatory)][string] $RunEvidence,
+        [Parameter(Mandatory)][string] $StdoutRelativePath,
+        [Parameter(Mandatory)][string] $StderrRelativePath
+    )
+    $stdout = Get-K8FileStreamDescriptor -RunEvidence $RunEvidence -RelativePath $StdoutRelativePath
+    $stderr = Get-K8FileStreamDescriptor -RunEvidence $RunEvidence -RelativePath $StderrRelativePath
+    return [ordered]@{
+        label               = $Label
+        argv                = @($Argv)
+        exit_code           = $ExitCode
+        timestamp_utc       = $TimestampUtc
+        capture_semantics   = 'file-backed'
+        containing_artifact = $null
+        stdout              = $stdout
+        stderr              = $stderr
+        combined_output     = $null
+        artifacts           = @(
+            [ordered]@{ role = 'stdout'; channel = 'stdout'; path = $stdout['path']; bytes = $stdout['bytes']; sha256 = $stdout['sha256']; empty = $stdout['empty'] }
+            [ordered]@{ role = 'stderr'; channel = 'stderr'; path = $stderr['path']; bytes = $stderr['bytes']; sha256 = $stderr['sha256']; empty = $stderr['empty'] }
+        )
+        capture_note        = 'bytes/sha256 describe the retained files as the producer wrote them; no re-encoding was performed between the process and the file.'
+    }
+}
+
+function New-K8CombinedCommandObservation {
+    <# One command captured through `2>&1` / `*>`. stdout and stderr are null
+       BY CONSTRUCTION: the merge destroyed the distinction, and this record
+       will not invent it back. #>
+    param(
+        [Parameter(Mandatory)][string] $Label,
+        [Parameter(Mandatory)][string[]] $Argv,
+        [Parameter(Mandatory)][int] $ExitCode,
+        [Parameter(Mandatory)][string] $TimestampUtc,
+        [AllowNull()][AllowEmptyString()][string] $CombinedOutput,
+        [AllowNull()][string] $ContainingArtifact
+    )
+    return [ordered]@{
+        label               = $Label
+        argv                = @($Argv)
+        exit_code           = $ExitCode
+        timestamp_utc       = $TimestampUtc
+        capture_semantics   = 'combined'
+        containing_artifact = $(if ($ContainingArtifact) { $ContainingArtifact -replace '\\', '/' } else { $null })
+        stdout              = $null
+        stderr              = $null
+        combined_output     = (Get-K8TextStreamDescriptor -Text $CombinedOutput)
+        artifacts           = $null
+        capture_note        = $script:K8CaptureNote
+    }
+}
+
+function Get-K8CommandObservationPath {
+    <# The structured sidecar for a retained command-observation artifact.
+       A `.observation.json` beside the existing `.txt`: the frozen-required
+       and already-established text artifacts are untouched, and NO new `.txt`
+       is introduced. #>
+    param([Parameter(Mandatory)][string] $ArtifactRelativePath)
+    return ([System.IO.Path]::ChangeExtension($ArtifactRelativePath, $null).TrimEnd('.') + $script:K8ObservationSuffix)
+}
+
+function Write-K8CommandObservation {
+    <#
+        Writes the structured half of a retained command observation.
+
+        Both halves come from ONE capture instance: this never re-parses the
+        `.txt` to reconstruct what happened, and nothing downstream derives
+        scientific meaning from this file. If either half cannot be written
+        the stage fails -- a run must not proceed with half an observation.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RunEvidence,
+        [Parameter(Mandatory)][string] $ArtifactRelativePath,
+        [Parameter(Mandatory)][string] $Producer,
+        [Parameter(Mandatory)][string] $Stage,
+        [Parameter(Mandatory)][string] $Range,
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][object[]] $Observations,
+        # Only for a producer whose single command owns SEVERAL retained
+        # artifacts (Range C's validator writes stdout and stderr as two
+        # files): one observation record covers the invocation, so its name is
+        # given explicitly rather than derived from one of the two artifacts.
+        [string] $ObservationRelativePath
+    )
+    $record = [ordered]@{
+        schema             = $script:K8CommandObservationSchema
+        run_id             = $RunId
+        range              = $Range
+        producer           = $Producer
+        stage              = $Stage
+        artifact           = ($ArtifactRelativePath -replace '\\', '/')
+        observation_count  = @($Observations).Count
+        observations       = @($Observations)
+    }
+    $relative = $(if ($ObservationRelativePath) { $ObservationRelativePath } else { Get-K8CommandObservationPath -ArtifactRelativePath $ArtifactRelativePath })
+    $target = Join-Path $RunEvidence $relative
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+    ($record | ConvertTo-Json -Depth 12) + "`n" | Set-Content -LiteralPath $target -Encoding utf8NoBOM
+    return $record
+}
+
+# ---------------------------------------------------------------------------
+# C-6: ONE required-artifact contract
+#
+# `Test-K8ScoringInputArtifactCompleteness` used to carry the only list, and
+# it ran once, at the very end. Two consequences: a missing artifact was
+# reported far from the stage that should have produced it, and any stage-
+# level check would have had to restate the list -- two lists that drift.
+#
+# So the contract is a single data structure with the producer stage on each
+# row. The per-stage gate SELECTS from it; the final gate reads ALL of it.
+# There is no second list anywhere.
+#
+# `required` is presence-only. A file being present is never asserted to make
+# its CONTENT correct -- that is what the frozen validators and, ultimately,
+# the operator's own transcription are for. Legitimate absence is never
+# expressed by leaving an artifact out: it is recorded IN the artifact via
+# C-5's `absence_admissible`, so "we observed nothing, admissibly" and "we
+# retained nothing" stay distinguishable.
+# ---------------------------------------------------------------------------
+
+$script:K8ArtifactContract = @(
+    # -- run identity, all three ranges -------------------------------------
+    # A/B mirror provenance immediately after the frozen evidence_tree.create();
+    # Range C has no create() call, so it gets its own explicit evidence-init
+    # stage that does the same thing at the same point in its own lifecycle.
+    # Two rows rather than one row with a per-range exception: each row then
+    # states a real writer timing.
+    @{ artifact = 'run-provenance.json'; ranges = 'ab'; stage = 'evidence-tree'; required = $true }
+    @{ artifact = 'run-provenance.json'; ranges = 'c';  stage = 'evidence-init'; required = $true }
+
+    # -- Range A/B primary artifacts (README SS5/SS6.2) ---------------------
+    @{ artifact = 'environment\image-inventory.json'; ranges = 'ab'; stage = 'image-inventory'; required = $true }
+    @{ artifact = 'contract-output\gateway-interface-resolution.txt'; ranges = 'ab'; stage = 'gateway-resolution'; required = $true }
+    @{ artifact = 'contract-output\runtime-contract-record.md'; ranges = 'ab'; stage = 'runtime-contract-record'; required = $true }
+    @{ artifact = 'ground-truth\independent-capture\capture-context.json'; ranges = 'ab'; stage = 'capture-start'; required = $true }
+    @{ artifact = 'sensor-input\mirror-capture\capture-context.json'; ranges = 'ab'; stage = 'capture-start'; required = $true }
+    @{ artifact = 'ground-truth\sender-record.txt'; ranges = 'ab'; stage = 'sender-trigger'; required = $true }
+    @{ artifact = 'ground-truth\procedure-conformance.json'; ranges = 'ab'; stage = 'sender-trigger'; required = $true }
+    @{ artifact = 'metadata-t0.txt'; ranges = 'ab'; stage = 'sender-trigger'; required = $true }
+    @{ artifact = 'ground-truth\independent-capture\c2-original-path.pcap'; ranges = 'ab'; stage = 'capture-stop-export'; required = $true }
+    @{ artifact = 'ground-truth\independent-capture\capture-lifecycle.json'; ranges = 'ab'; stage = 'capture-stop-export'; required = $true }
+    @{ artifact = 'sensor-input\mirror-capture\c2-mirror-sensor.pcap'; ranges = 'ab'; stage = 'capture-stop-export'; required = $true }
+    @{ artifact = 'sensor-input\mirror-capture\capture-lifecycle.json'; ranges = 'ab'; stage = 'capture-stop-export'; required = $true }
+    @{ artifact = 'ground-truth\independent-capture\decoded-verification.json'; ranges = 'ab'; stage = 'target-decode'; required = $true }
+    @{ artifact = 'sensor-input\mirror-capture\decoded-verification.json'; ranges = 'ab'; stage = 'target-decode'; required = $true }
+    @{ artifact = 'environment\collector-query.json'; ranges = 'ab'; stage = 'queries'; required = $true }
+    @{ artifact = 'environment\rule-query.json'; ranges = 'ab'; stage = 'queries'; required = $true }
+    @{ artifact = 'collector-output\collector-response.json'; ranges = 'ab'; stage = 'queries'; required = $true }
+    @{ artifact = 'collector-output\collector-index-mapping.json'; ranges = 'ab'; stage = 'queries'; required = $true }
+    @{ artifact = 'collector-output\collector-selector-mapping-gate.json'; ranges = 'ab'; stage = 'queries'; required = $true }
+    @{ artifact = 'collector-output\accepted-collector-hit-ids.json'; ranges = 'ab'; stage = 'queries'; required = $true }
+    @{ artifact = 'rule-output\rule-response.json'; ranges = 'ab'; stage = 'queries'; required = $true }
+    @{ artifact = 'rule-output\rule-index-mapping.json'; ranges = 'ab'; stage = 'queries'; required = $true }
+    @{ artifact = 'rule-output\rule-selector-mapping-gate.json'; ranges = 'ab'; stage = 'queries'; required = $true }
+    @{ artifact = 'rule-output\collector-rule-correlation.json'; ranges = 'ab'; stage = 'queries'; required = $true }
+    @{ artifact = 'metadata.md'; ranges = 'ab'; stage = 'run-metadata'; required = $true }
+    @{ artifact = 'deviations.md'; ranges = 'ab'; stage = 'run-metadata'; required = $true }
+
+    # -- Range B: the frozen fault boundary (c2-dnp3-range-derivation.md SS3)
+    # Each observation artifact now carries a C-4 structured sidecar produced
+    # from the same capture instance.
+    @{ artifact = 'contract-output\qdisc-pre-fault.txt'; ranges = 'b'; stage = 'fault-injection'; required = $true }
+    @{ artifact = 'contract-output\qdisc-pre-fault.observation.json'; ranges = 'b'; stage = 'fault-injection'; required = $true }
+    @{ artifact = 'contract-output\fault-injection-command.txt'; ranges = 'b'; stage = 'fault-injection'; required = $true }
+    @{ artifact = 'contract-output\fault-injection-command.observation.json'; ranges = 'b'; stage = 'fault-injection'; required = $true }
+    @{ artifact = 'contract-output\qdisc-post-fault.txt'; ranges = 'b'; stage = 'fault-injection'; required = $true }
+    @{ artifact = 'contract-output\qdisc-post-fault.observation.json'; ranges = 'b'; stage = 'fault-injection'; required = $true }
+    @{ artifact = 'contract-output\unrelated-mirror-filters.txt'; ranges = 'b'; stage = 'fault-injection'; required = $true }
+    @{ artifact = 'contract-output\unrelated-mirror-filters.observation.json'; ranges = 'b'; stage = 'fault-injection'; required = $true }
+
+    # -- Range B: R-OBS-05 (k6-r-obs-05-collector-query-contract.md SS4/SS5) --
+    @{ artifact = 'contract-output\r-obs-05-liveness.pcap'; ranges = 'b'; stage = 'capture-stop-export'; required = $true }
+    @{ artifact = 'contract-output\r-obs-05-capture-lifecycle.json'; ranges = 'b'; stage = 'capture-stop-export'; required = $true }
+    @{ artifact = 'environment\r-obs-05-query.json'; ranges = 'b'; stage = 'queries'; required = $true }
+    @{ artifact = 'contract-output\r-obs-05-mapping-response.json'; ranges = 'b'; stage = 'queries'; required = $true }
+    @{ artifact = 'contract-output\r-obs-05-mapping-gate.json'; ranges = 'b'; stage = 'queries'; required = $true }
+    @{ artifact = 'contract-output\r-obs-05-response.json'; ranges = 'b'; stage = 'queries'; required = $true }
+    @{ artifact = 'contract-output\r-obs-05-contract-reference.txt'; ranges = 'b'; stage = 'queries'; required = $true }
+    @{ artifact = 'contract-output\r-obs-05-pcap-rows.json'; ranges = 'b'; stage = 'queries'; required = $true }
+    @{ artifact = 'contract-output\r-obs-05-liveness-decode.txt'; ranges = 'b'; stage = 'queries'; required = $true }
+    @{ artifact = 'contract-output\r-obs-05-correlation.json'; ranges = 'b'; stage = 'queries'; required = $true }
+
+    # -- Range C: Shakedown SS5.3 execution-retention completeness ONLY -------
+    # This is NOT a claim that the run satisfies the frozen evidence-schema.md
+    # static-validation package shape (`static-validations/`); it does not, and
+    # nothing here asserts otherwise.
+    #
+    # The retain STAGES follow the real execution order. The negative manifest
+    # only becomes negative when `git apply` succeeds in patch-apply -- at the
+    # end of manifest-derivation the file is still a byte copy of the BASE
+    # manifest, so retaining it there would preserve bytes the validator never
+    # read.
+    @{ artifact = 'range-c-derived.patch'; ranges = 'c'; stage = 'manifest-derivation'; required = $true }
+    @{ artifact = 'power-grid-reference.range-c-negative.yaml'; ranges = 'c'; stage = 'patch-apply'; required = $true }
+    @{ artifact = 'validate.stdout.txt'; ranges = 'c'; stage = 'validator-run'; required = $true }
+    @{ artifact = 'validate.stderr.txt'; ranges = 'c'; stage = 'validator-run'; required = $true }
+    @{ artifact = 'validate.observation.json'; ranges = 'c'; stage = 'validator-run'; required = $true }
+    @{ artifact = 'metadata.md'; ranges = 'c'; stage = 'retention'; required = $true }
+)
+
+function Get-K8ArtifactContract { $script:K8ArtifactContract }
+
+function Get-K8ContractArtifacts {
+    <# The ONE selector. Both the per-stage gate and the final gate go through
+       it, so neither can be checking a different list from the other. #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('a', 'b', 'c')][string] $Range,
+        [string] $Stage
+    )
+    return @($script:K8ArtifactContract | Where-Object {
+        $_.ranges.Contains($Range) -and $_.required -and
+        ($null -eq $Stage -or '' -eq $Stage -or $_.stage -eq $Stage)
+    })
+}
+
+function Assert-K8StageArtifacts {
+    <#
+        The stage-boundary gate: everything this stage promised to produce
+        must exist NOW, before the next stage begins. Fails closed at the
+        stage that owns the artifact, not several stages later where the
+        diagnostic no longer names a producer.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('a', 'b', 'c')][string] $Range,
+        [Parameter(Mandatory)][string] $Stage,
+        [Parameter(Mandatory)][string] $RunEvidence
+    )
+    $rows = Get-K8ContractArtifacts -Range $Range -Stage $Stage
+    if ($rows.Count -eq 0) { return }
+    $missing = @($rows | Where-Object { -not (Test-Path -LiteralPath (Join-Path $RunEvidence $_.artifact)) } | ForEach-Object { $_.artifact })
+    if ($missing.Count -gt 0) {
+        throw "Stage completeness gate FAILED at stage '$Stage' (Range $($Range.ToUpper())): $($missing.Count) artifact(s) this stage is responsible for do not exist: $($missing -join ', '). The run stops here rather than at a later stage that did not produce them."
+    }
+    Write-K8ShakedownLog -Message "stage '$Stage' completeness: $($rows.Count) contracted artifact(s) present."
+}
+
+function Assert-K8RunArtifactCompleteness {
+    <#
+        The final gate. Defense in depth over the per-stage gates, reading the
+        SAME contract: if it ever reports something the stage gates let past,
+        that is a regression defect in the stage gates, not a new requirement
+        discovered late.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('a', 'b', 'c')][string] $Range,
+        [Parameter(Mandatory)][string] $RunEvidence
+    )
+    $rows = Get-K8ContractArtifacts -Range $Range
+    $missing = @($rows | Where-Object { -not (Test-Path -LiteralPath (Join-Path $RunEvidence $_.artifact)) })
+    if ($missing.Count -gt 0) {
+        $detail = ($missing | ForEach-Object { "$($_.artifact) (owed by stage '$($_.stage)')" }) -join ', '
+        throw "Run artifact completeness gate FAILED for Range $($Range.ToUpper()) -- missing $($missing.Count) required artifact(s): $detail. Any artifact listed here whose producer stage already completed means that stage's own gate did not hold; treat it as a regression defect in the stage gate, not as a late discovery."
+    }
+    Write-K8ShakedownLog -Message "Run artifact completeness gate PASS: all $($rows.Count) contracted artifact(s) present for Range $($Range.ToUpper())."
+}
+
+# ---------------------------------------------------------------------------
+# C-7: typed narrative references
+#
+# The defect class: a machine-generated narrative names an artifact, and
+# nothing ever checks that the artifact is there. The fix is NOT to scan
+# prose for path-shaped substrings -- that produced four false positives on a
+# healthy run when measured -- but to require every reference to arrive as a
+# TYPED value that says what kind of thing it points at.
+#
+# Only `run-local` and `frozen-protocol-doc` are existence-checked. An
+# in-container path and a host path are not resolvable from here and are
+# recorded as-is; an unknown kind fails closed rather than being waved
+# through.
+#
+# The evidence tree's own eight schema DIRECTORIES are deliberately outside
+# this: they are created by the frozen evidence_tree.create() and their
+# presence is already required by the frozen validate-evidence, so a
+# navigational sentence naming them is not an unverified artifact reference.
+# ---------------------------------------------------------------------------
+
+function New-K8ArtifactReference {
+    param(
+        [Parameter(Mandatory)][ValidateSet('run-local', 'frozen-protocol-doc', 'in-container', 'host-path')][string] $Kind,
+        [Parameter(Mandatory)][string] $Path
+    )
+    return [pscustomobject]@{ Kind = $Kind; Path = $Path }
+}
+
+function Resolve-K8NarrativeReference {
+    <#
+        Validates one typed reference and returns the text the narrative may
+        insert. Fails closed; never repairs a bad path and never searches for
+        a near match.
+    #>
+    param(
+        [Parameter(Mandatory)] $Reference,
+        [Parameter(Mandatory)][string] $RunEvidence,
+        [string] $RepoRoot
+    )
+    $kind = [string]$Reference.Kind
+    $path = [string]$Reference.Path
+    switch ($kind) {
+        'run-local' {
+            $normalized = ($path -replace '\\', '/').Trim()
+            if ($normalized.StartsWith('/') -or ($normalized.Length -gt 1 -and $normalized[1] -eq ':')) {
+                throw "C-7 narrative reference: run-local path '$path' must be run-relative, not absolute."
+            }
+            if (@($normalized.Split('/')) -contains '..') {
+                throw "C-7 narrative reference: run-local path '$path' escapes the run evidence root."
+            }
+            $full = Join-Path $RunEvidence ($normalized -replace '/', '\')
+            if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+                throw "C-7 narrative reference: run-local artifact '$normalized' does not exist under $RunEvidence. A generated narrative must not cite an artifact that is not there."
+            }
+            return $normalized
+        }
+        'frozen-protocol-doc' {
+            if (-not $RepoRoot) { throw "C-7 narrative reference: a frozen-protocol-doc reference needs -RepoRoot to resolve '$path'." }
+            $normalized = ($path -replace '\\', '/').Trim()
+            $allowed = @($script:K8FrozenProtocolDocPrefixes | Where-Object { $normalized -eq $_ -or $normalized.StartsWith($_) })
+            if ($allowed.Count -eq 0) {
+                throw "C-7 narrative reference: '$normalized' is not inside the frozen-protocol-doc allowlist ($($script:K8FrozenProtocolDocPrefixes -join ', ')). Widening the allowlist is a Plan revision, not a code change."
+            }
+            $full = Join-Path $RepoRoot ($normalized -replace '/', '\')
+            if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+                throw "C-7 narrative reference: frozen protocol document '$normalized' does not exist under $RepoRoot."
+            }
+            return $normalized
+        }
+        # Not resolvable from the host running this: a container filesystem
+        # path, or a path outside the evidence tree. Recorded verbatim.
+        'in-container' { return $path }
+        'host-path'    { return $path }
+        default { throw "C-7 narrative reference: unknown reference kind '$kind'." }
+    }
+}
+
+function Get-K8NarrativeReferenceText {
+    <# Convenience for narrative writers: resolve several references at once
+       and get back the display strings, in order. #>
+    param(
+        [Parameter(Mandatory)][object[]] $References,
+        [Parameter(Mandatory)][string] $RunEvidence,
+        [string] $RepoRoot
+    )
+    return @($References | ForEach-Object { Resolve-K8NarrativeReference -Reference $_ -RunEvidence $RunEvidence -RepoRoot $RepoRoot })
+}
+
+function Get-K8RunIdentityFacts {
+    <#
+        C7-R4: run identity is drawn from the authoritative structured source
+        -- the Batch 1 run-provenance record -- not retyped into prose from a
+        local variable. Different fact classes have different authoritative
+        sources (command facts come from the C-4 observation, observer facts
+        from the C-5 record, pinned constants from the canonical constants);
+        the shared rule is that no mechanical value is written freehand.
+    #>
+    param([Parameter(Mandatory)][string] $RunId)
+    $path = Get-K8RunProvenancePath -RunId $RunId
+    if (-not (Test-Path -LiteralPath $path)) { throw "run identity facts unavailable: no run-provenance record at $path." }
+    $prov = (Get-Content -LiteralPath $path -Raw) | ConvertFrom-Json -AsHashtable
+    return [pscustomobject]@{
+        RunId       = [string]$prov['run_id']
+        Range       = [string]$prov['range']
+        SequenceId  = [string]$prov['sequence_id']
+        ToolingHead = [string]$prov['tooling_head']
+        LockedHead  = [string]$prov['sequence_locked_head']
+        StartedUtc  = [string]$prov['started_utc']
+    }
+}
+
+function Get-K8FinalizeIdentityPath {
+    param([Parameter(Mandatory)][string] $RunId)
+    Join-Path (Get-K8RunRecordDir -RunId $RunId) 'finalize-identity.json'
+}
+
+function Write-K8FinalizeIdentitySnapshot {
+    <#
+        Pins WHICH integrity manifest actually passed verify-integrity.
+
+        Why this is needed at all: the frozen finalize-evidence regenerates
+        hashes.sha256 from whatever the tree currently holds. So "this artifact
+        is listed in hashes.sha256" cannot, on its own, distinguish evidence
+        that was retained during the run from a file added afterwards and then
+        re-manifested. Snapshotting the finalized manifest's own digest into
+        the control plane closes that: C-3 can then check "was in the FINALIZED
+        manifest", not merely "is in today's manifest".
+
+        ORDERING IS THE POINT. This is written only after final-verify has
+        SUCCEEDED, and before the sequence is advanced:
+
+            evidence finalization -> integrity verification
+                                  -> identity freeze -> run completion
+
+        A manifest that finalize produced but verify-integrity rejected must
+        never be snapshotted as a verified one.
+
+        Control plane only. Nothing is written into the evidence tree here: a
+        file added after finalize-evidence would leave that tree permanently
+        inconsistent with its own manifest.
+    #>
+    param(
+        [Parameter(Mandatory)] $Run,
+        [Parameter(Mandatory)][string] $RunEvidence
+    )
+    $manifest = Join-Path $RunEvidence 'hashes.sha256'
+    if (-not (Test-Path -LiteralPath $manifest)) {
+        throw "finalize identity snapshot: hashes.sha256 not found at $manifest after final-verify reported success."
+    }
+    $record = [ordered]@{
+        schema               = $script:K8FinalizeIdentitySchema
+        run_id               = $Run.RunId
+        sequence_id          = $Run.SequenceId
+        tooling_head         = $Run.ToolingHead
+        finalized_utc        = (Get-K8UtcNow)
+        run_evidence         = $RunEvidence
+        hashes_sha256_digest = (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash.ToLowerInvariant()
+        verified             = 'final-verify (study01_collect.py verify-integrity) succeeded before this snapshot was written'
+    }
+    Write-K8AtomicFile -Path (Get-K8FinalizeIdentityPath -RunId $Run.RunId) -Content (($record | ConvertTo-Json -Depth 8) + "`n")
+    Write-K8ShakedownLog -Message "finalize identity snapshot retained for $($Run.RunId): hashes.sha256 = $($record['hashes_sha256_digest'])."
+    return $record
+}
+
+function Write-K8ScoringInputTemplate {
+    <#
+        Emits the C-3 template into the CONTROL PLANE (never the evidence
+        tree: it is written after finalize-evidence, and a new file in the
+        tree would break verify-integrity for the rest of the run's life).
+
+        The template is intentionally not scorable and intentionally not
+        valid: every judgment slot holds a placeholder, so the tooling cannot
+        be read as having chosen a default. Filling it in is the operator's
+        work, and README SS6.2 still reserves the judgment.
+    #>
+    param(
+        [Parameter(Mandatory)] $Run,
+        [Parameter(Mandatory)][ValidateSet('a', 'b')][string] $Range
+    )
+    $target = Join-Path (Get-K8RunRecordDir -RunId $Run.RunId) 'scoring-input.template.json'
+    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @(
+        (Join-Path $PSScriptRoot 'k8_scoring_input_contract.py'), 'emit-template',
+        '--range', $Range, '--output', $target
+    ) -Description 'emit the C-3 scoring-input template (intentionally incomplete)' | Out-Null
+    return $target
 }
 
 function New-K8CommandFailure {
@@ -2213,12 +2815,24 @@ function Write-K8FaultObservationArtifact {
         The final `-join` is load-bearing, not cosmetic: a joined string is
         a single pipeline item, so Set-Content always produces a file, which
         a bare (possibly $null / empty-array) command result does not.
+
+        C-4: the same capture instance also produces a structured sidecar,
+        `<artifact>.observation.json`. Both halves are written from these
+        same in-memory observation objects -- the JSON is never re-parsed out
+        of the text, and no scientific meaning is derived from either. If
+        either write fails, the stage fails: a run must not continue with
+        half an observation retained.
     #>
     param(
         [Parameter(Mandatory)][object[]] $Observations,
-        [Parameter(Mandatory)][string] $Path,
-        [Parameter(Mandatory)][string] $Title
+        [Parameter(Mandatory)][string] $RunEvidence,
+        [Parameter(Mandatory)][string] $ArtifactRelativePath,
+        [Parameter(Mandatory)][string] $Title,
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)][string] $Range,
+        [Parameter(Mandatory)][string] $Stage
     )
+    $Path = Join-Path $RunEvidence $ArtifactRelativePath
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add("# $Title")
     $lines.Add('# Frozen basis: c2-dnp3-range-derivation.md SS3 -- "Preserve pre/post command output and the resolved interface in contract-output/".')
@@ -2240,6 +2854,14 @@ function Write-K8FaultObservationArtifact {
         $lines.Add($o.Stderr.TrimEnd())
     }
     ($lines.ToArray() -join "`n") | Set-Content -Path $Path -Encoding utf8NoBOM
+
+    Write-K8CommandObservation -RunEvidence $RunEvidence -ArtifactRelativePath $ArtifactRelativePath `
+        -Producer 'Write-K8FaultObservationArtifact' -Stage $Stage -Range $Range -RunId $RunId `
+        -Observations @($Observations | ForEach-Object {
+            New-K8SeparatedCommandObservation -Label $_.Label -Argv $_.ArgvList -ExitCode $_.ExitCode `
+                -TimestampUtc $_.TimestampUtc -Stdout $_.Stdout -Stderr $_.Stderr `
+                -ContainingArtifact $ArtifactRelativePath
+        }) | Out-Null
 }
 
 function Assert-K8FaultObservationsSucceeded {
@@ -2268,11 +2890,29 @@ function Assert-K8UnrelatedMirrorFilter {
         Resolve-K8GatewayInterface this round, but STDOUT/STDERR are now
         also captured separately (same audit) so a stray stderr line can
         never be mistaken for a real interface-listing line.
+
+        C-4: this scan runs one enumeration command plus one `tc filter show`
+        per interface, and the retained text kept only the per-interface
+        stdout -- no argv, no exit code, no stderr, and no record of how many
+        commands ran. All of that is now retained in the structured sidecar.
+
+        Retaining an exit code is NOT the same as gating on it, and this does
+        not start gating on it: the pass condition remains exactly "at least
+        one unrelated interface retains a mirred egress mirror filter". A
+        `tc filter show` that exits nonzero on some interface is now visible
+        in the record instead of invisible, which is the whole point.
     #>
-    param([Parameter(Mandatory)] $Gateway, [Parameter(Mandatory)][string] $RunEvidence)
+    param([Parameter(Mandatory)] $Gateway, [Parameter(Mandatory)][string] $RunEvidence,
+          [string] $RunId = '', [string] $Range = 'b', [string] $Stage = 'fault-injection')
     $contractDir = Join-Path $RunEvidence 'contract-output'
+    $observations = New-Object System.Collections.Generic.List[object]
     $linkArgv = @('docker', 'exec', $Gateway.Router, 'ip', '-o', 'link', 'show')
+    $linkStartedUtc = Get-K8UtcNow
     $linksCapture = Invoke-K8SeparatedNativeCapture -FilePath $linkArgv[0] -ArgumentList @($linkArgv[1..($linkArgv.Count - 1)])
+    $observations.Add((New-K8SeparatedCommandObservation -Label 'interface enumeration: ip -o link show' `
+        -Argv $linkArgv -ExitCode $linksCapture.ExitCode -TimestampUtc $linkStartedUtc `
+        -Stdout ((@($linksCapture.Stdout) | ForEach-Object { "$_" }) -join "`n") -Stderr $linksCapture.Stderr `
+        -ContainingArtifact 'contract-output\unrelated-mirror-filters.txt'))
     if ($linksCapture.ExitCode -ne 0) {
         throw (New-K8CommandFailure `
             -Argv $linkArgv -ExitCode $linksCapture.ExitCode -StreamsSeparated `
@@ -2286,12 +2926,24 @@ function Assert-K8UnrelatedMirrorFilter {
         if ($line -notmatch '^\d+:\s+([^:@]+)') { continue }
         $interface = $Matches[1]
         if ($interface -eq 'lo' -or $interface -eq $Gateway.Interface) { continue }
-        $filterCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $Gateway.Router, 'tc', 'filter', 'show', 'dev', $interface, 'parent', 'ffff:')
+        $filterArgv = @('docker', 'exec', $Gateway.Router, 'tc', 'filter', 'show', 'dev', $interface, 'parent', 'ffff:')
+        $filterStartedUtc = Get-K8UtcNow
+        $filterCapture = Invoke-K8SeparatedNativeCapture -FilePath $filterArgv[0] -ArgumentList @($filterArgv[1..($filterArgv.Count - 1)])
         $filter = ($filterCapture.Stdout | Out-String)
+        $observations.Add((New-K8SeparatedCommandObservation -Label "unrelated interface probe: $interface" `
+            -Argv $filterArgv -ExitCode $filterCapture.ExitCode -TimestampUtc $filterStartedUtc `
+            -Stdout $filter -Stderr $filterCapture.Stderr `
+            -ContainingArtifact 'contract-output\unrelated-mirror-filters.txt'))
         $records += "### $interface`n$filter"
         if ($filter -match 'mirred\s+.*egress\s+mirror') { $found = $true }
     }
     $records -join "`n" | Set-Content -Path (Join-Path $contractDir 'unrelated-mirror-filters.txt') -Encoding utf8NoBOM
+    # Written BEFORE the gate throws, so a failing scan still leaves the full
+    # argv/exit/stderr record of every probe behind.
+    Write-K8CommandObservation -RunEvidence $RunEvidence -ArtifactRelativePath 'contract-output\unrelated-mirror-filters.txt' `
+        -Producer 'Assert-K8UnrelatedMirrorFilter' -Stage $Stage -Range $Range `
+        -RunId $(if ($RunId) { $RunId } else { Split-Path -Leaf $RunEvidence }) `
+        -Observations $observations.ToArray() | Out-Null
     if (-not $found) { throw 'Range B R-OBS-05 gate failed: no unrelated gateway interface retained a mirred egress mirror filter' }
 }
 
@@ -3180,88 +3832,34 @@ function Test-K8ScoringInputArtifactCompleteness {
         and the capture-lifecycle/procedure-conformance records are
         internally consistent -- all of which were already true.
 
-        This checks, by file path, every primary artifact README SS5/SS6.2
-        actually requires before scoring-input can be started, for BOTH
-        Range A and Range B from one shared list, plus Range B's own
-        R-OBS-05-specific set. It is intentionally a Shakedown-only
-        convenience check, not a frozen-protocol validator: it never scores
-        anything, never decides Pass/Fail for any stage, and a file's mere
-        presence is not asserted to prove its content correct (that is what
-        the frozen validators, and ultimately the operator's own scoring-
-        input transcription, are for). It exists solely so a missing
-        primary artifact is caught here, before "runtime evidence PASS" is
-        ever printed, rather than only much later when an operator reaches
-        scoring-input on an already-closed, already-torn-down run.
+        C-6 CHANGED THE SHAPE OF THIS CHECK, NOT ITS PURPOSE. The list of
+        required artifacts used to live here, inline, and this was the only
+        place it was ever checked -- so a missing artifact surfaced far from
+        the stage that owed it, and any per-stage check would have had to
+        restate the list. The requirement now lives in ONE place,
+        $script:K8ArtifactContract, with a producer stage on every row;
+        Assert-K8StageArtifacts selects the current stage's rows during the
+        run, and this function reads ALL of them at the end. There is no
+        second list.
+
+        It stays a Shakedown-side check, not a frozen-protocol validator: it
+        never scores anything, never decides Pass/Fail for any stage, and a
+        file's mere presence is not asserted to prove its content correct
+        (that is what the frozen validators, and ultimately the operator's own
+        scoring-input transcription, are for). It exists so a missing primary
+        artifact is caught before "runtime evidence PASS" is ever printed,
+        rather than much later when an operator reaches scoring-input on an
+        already-closed, already-torn-down run.
+
+        Because the stage gates now run first, anything this reports is by
+        construction something a stage gate should already have caught: treat
+        it as a regression defect in the stage gate, not as a late discovery.
     #>
     param(
         [Parameter(Mandatory)][ValidateSet('a', 'b')][string] $Range,
         [Parameter(Mandatory)][string] $RunEvidence
     )
-    $required = @(
-        'ground-truth\independent-capture\c2-original-path.pcap'
-        'ground-truth\independent-capture\capture-lifecycle.json'
-        'ground-truth\independent-capture\capture-context.json'
-        'ground-truth\independent-capture\decoded-verification.json'
-        'ground-truth\sender-record.txt'
-        'ground-truth\procedure-conformance.json'
-        'sensor-input\mirror-capture\c2-mirror-sensor.pcap'
-        'sensor-input\mirror-capture\capture-lifecycle.json'
-        'sensor-input\mirror-capture\capture-context.json'
-        'sensor-input\mirror-capture\decoded-verification.json'
-        'collector-output\collector-response.json'
-        'collector-output\collector-index-mapping.json'
-        'collector-output\collector-selector-mapping-gate.json'
-        'collector-output\accepted-collector-hit-ids.json'
-        'rule-output\rule-response.json'
-        'rule-output\rule-index-mapping.json'
-        'rule-output\rule-selector-mapping-gate.json'
-        'rule-output\collector-rule-correlation.json'
-        'contract-output\gateway-interface-resolution.txt'
-        'contract-output\runtime-contract-record.md'
-        'environment\image-inventory.json'
-        'environment\collector-query.json'
-        'environment\rule-query.json'
-        'metadata-t0.txt'
-        'metadata.md'
-        'deviations.md'
-    )
-    if ($Range -eq 'b') {
-        $required += @(
-            # c2-dnp3-range-derivation.md SS3: "Preserve pre/post command
-            # output and the resolved interface in contract-output/."
-            'contract-output\qdisc-pre-fault.txt'
-            'contract-output\fault-injection-command.txt'
-            'contract-output\qdisc-post-fault.txt'
-            'contract-output\unrelated-mirror-filters.txt'
-            # Derived from the frozen k6-r-obs-05-collector-query-contract.md
-            # SS4/SS5 required-artifact list -- NOT from expected/range-b/
-            # hashes.sha256 (a historical run's own integrity manifest, whose
-            # artifact bytes are unrecoverable and which is not a target for a
-            # fresh run to reproduce).
-            #   SS5: mapping response + mapping-gate decision
-            'contract-output\r-obs-05-mapping-response.json'
-            'contract-output\r-obs-05-mapping-gate.json'
-            #   SS5: instantiated request JSON + full response JSON
-            'environment\r-obs-05-query.json'
-            'contract-output\r-obs-05-response.json'
-            #   SS4: the separate tap_observer:eth0 liveness pcap correlation
-            #        is performed against, plus its acquisition provenance
-            'contract-output\r-obs-05-liveness.pcap'
-            'contract-output\r-obs-05-capture-lifecycle.json'
-            #   SS5: decoded unrelated-flow pcap rows (machine + human form)
-            'contract-output\r-obs-05-pcap-rows.json'
-            'contract-output\r-obs-05-liveness-decode.txt'
-            #   SS5: correlation record
-            'contract-output\r-obs-05-correlation.json'
-            #   SS5: contract SHA-256/reference identifying the exact file
-            'contract-output\r-obs-05-contract-reference.txt'
-        )
-    }
-    $missing = @($required | Where-Object { -not (Test-Path (Join-Path $RunEvidence $_)) })
-    if ($missing.Count -gt 0) {
-        throw "Scoring-input artifact completeness gate failed -- missing $($missing.Count) required file(s), before this run is ever reported as runtime-PASS or handed to Complete: $($missing -join ', ')"
-    }
-    Write-K8ShakedownLog -Message "Scoring-input artifact completeness gate PASS: all $($required.Count) required primary artifact(s) present for Range $($Range.ToUpper())."
+    Assert-K8RunArtifactCompleteness -Range $Range -RunEvidence $RunEvidence
 }
 
 function Invoke-K8ShakedownRangeAB {
@@ -3326,6 +3924,10 @@ function Invoke-K8ShakedownRangeABBody {
     # the eight schema directories to be empty, and finalize-evidence hashes the
     # root, so this file is covered by the manifest and never rewritten after.
     Copy-K8RunProvenanceIntoEvidence -Run $Run -RunEvidence $RunEvidence
+    # C-6: the tree exists, so the stage-boundary gate can be armed. From here
+    # on, leaving a stage checks that stage's contracted artifacts. Armed after
+    # the provenance mirror so the evidence-tree stage's own row is satisfiable.
+    Set-K8ShakedownRunEvidence -Path $RunEvidence | Out-Null
 
     # 2. Generate the Compose file fresh for this run (never reuse a stale one).
     Set-K8ShakedownRunStage -Stage 'compose-generate'
@@ -3424,7 +4026,9 @@ function Invoke-K8ShakedownRangeABBody {
             (Invoke-K8FaultObservationCommand -Label 'pre-fault: tc qdisc show' -Argv @('docker', 'exec', $gw.Router, 'tc', 'qdisc', 'show', 'dev', $gw.Interface))
             (Invoke-K8FaultObservationCommand -Label 'pre-fault: tc filter show parent ffff:' -Argv @('docker', 'exec', $gw.Router, 'tc', 'filter', 'show', 'dev', $gw.Interface, 'parent', 'ffff:'))
         )
-        Write-K8FaultObservationArtifact -Observations $preObservations -Path (Join-Path $contractDir 'qdisc-pre-fault.txt') -Title 'Range B pre-fault observation (target gateway interface)'
+        Write-K8FaultObservationArtifact -Observations $preObservations -RunEvidence $RunEvidence `
+            -ArtifactRelativePath 'contract-output\qdisc-pre-fault.txt' -Title 'Range B pre-fault observation (target gateway interface)' `
+            -RunId $RunId -Range $Range -Stage 'fault-injection'
         Assert-K8FaultObservationsSucceeded -Observations $preObservations -Stage 'pre-fault observation'
 
         # The sole permitted fault. Its own argv/exit/stdout/stderr are now
@@ -3433,7 +4037,9 @@ function Invoke-K8ShakedownRangeABBody {
         $faultObservations = @(
             (Invoke-K8FaultObservationCommand -Label 'fault: tc qdisc del ingress (the sole permitted fault)' -Argv @('docker', 'exec', $gw.Router, 'tc', 'qdisc', 'del', 'dev', $gw.Interface, 'ingress'))
         )
-        Write-K8FaultObservationArtifact -Observations $faultObservations -Path (Join-Path $contractDir 'fault-injection-command.txt') -Title 'Range B fault injection command'
+        Write-K8FaultObservationArtifact -Observations $faultObservations -RunEvidence $RunEvidence `
+            -ArtifactRelativePath 'contract-output\fault-injection-command.txt' -Title 'Range B fault injection command' `
+            -RunId $RunId -Range $Range -Stage 'fault-injection'
         Assert-K8FaultObservationsSucceeded -Observations $faultObservations -Stage 'fault injection'
 
         # Post-fault. An empty stdout here is the frozen SS4 check-2 success
@@ -3442,13 +4048,15 @@ function Invoke-K8ShakedownRangeABBody {
         $postObservations = @(
             (Invoke-K8FaultObservationCommand -Label 'post-fault: tc filter show parent ffff:' -Argv @('docker', 'exec', $gw.Router, 'tc', 'filter', 'show', 'dev', $gw.Interface, 'parent', 'ffff:'))
         )
-        Write-K8FaultObservationArtifact -Observations $postObservations -Path (Join-Path $contractDir 'qdisc-post-fault.txt') -Title 'Range B post-fault observation (target gateway interface)'
+        Write-K8FaultObservationArtifact -Observations $postObservations -RunEvidence $RunEvidence `
+            -ArtifactRelativePath 'contract-output\qdisc-post-fault.txt' -Title 'Range B post-fault observation (target gateway interface)' `
+            -RunId $RunId -Range $Range -Stage 'fault-injection'
         Assert-K8FaultObservationsSucceeded -Observations $postObservations -Stage 'post-fault observation'
         if ($postObservations[0].StdoutEmpty) {
             Write-K8ShakedownLog -Message 'Range B post-fault: tc filter show returned exit 0 with no remaining filter on the target interface. Retained as an observation (stdout_empty=true); the scored Runtime Contract judgment remains the operator''s at scoring-input.'
         }
 
-        Assert-K8UnrelatedMirrorFilter -Gateway $gw -RunEvidence $RunEvidence
+        Assert-K8UnrelatedMirrorFilter -Gateway $gw -RunEvidence $RunEvidence -RunId $RunId -Range $Range -Stage 'fault-injection'
     }
 
     # 6a. Runtime contract observational record (evidence-schema.md SS3: "Range
@@ -3552,10 +4160,14 @@ function Invoke-K8ShakedownRangeABBody {
     Set-K8ShakedownRunStage -Stage 'capture-lifecycle-check'
     Test-K8CaptureLifecycleEarly -ScriptsDir $ScriptsDir -RunId $RunId -RunEvidence $RunEvidence
 
-    # 10. Instantiate the fixed queries from retained T0. The exact requests,
-    # raw responses and mechanical correlations are executed below without
-    # retries, selector changes, field substitution, or result-driven widening.
-    Set-K8ShakedownRunStage -Stage 'queries'
+    # 10. Resolve the frozen event window from retained T0. Its own stage: it
+    # writes nothing, and the stage that follows must own what IT writes.
+    # (Previously this was marked 'queries', then 'target-decode', then
+    # 're-marked' back to 'queries' -- with the query artifacts actually being
+    # written during the decode stage. C-6 needs a stage to own its artifacts,
+    # so the sequence is now window-resolve -> target-decode -> queries with no
+    # re-marking and no artifact written outside its owning stage.)
+    Set-K8ShakedownRunStage -Stage 'window-resolve'
     $t0Path = Join-Path $RunEvidence 'metadata-t0.txt'
     if (-not (Test-Path $t0Path)) {
         throw "T0 record not found at $t0Path after stop-export; cannot window the Collector/Rule queries. This is a STOP condition -- do not proceed to teardown without it."
@@ -3572,6 +4184,8 @@ function Invoke-K8ShakedownRangeABBody {
     Write-K8TargetCaptureDecode -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence -Stage 'ground-truth' -WindowStartIso $windowStart -WindowEndIso $windowEnd
     Write-K8TargetCaptureDecode -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence -Stage 'sensor' -WindowStartIso $windowStart -WindowEndIso $windowEnd
 
+    # 10a. The query stage owns every request/response/gate artifact it writes.
+    Set-K8ShakedownRunStage -Stage 'queries'
     $collectorQuery = (Get-Content (Join-Path $PSScriptRoot 'collector-query.template.json') -Raw).Replace('<WINDOW_START>', $windowStart).Replace('<WINDOW_END>', $windowEnd)
     $collectorQuery | Set-Content -Path (Join-Path $envDir 'collector-query.json') -Encoding utf8NoBOM
     # The Rule request is NOT finalized/written here: freeze-decision-
@@ -3590,11 +4204,16 @@ function Invoke-K8ShakedownRangeABBody {
         Write-K8ShakedownLog -Message 'Fixed R-OBS-05 request retained; mapping/query/correlation gates will execute mechanically.'
     }
 
-    # Back to the query stage: step 9b's decode sat between the T0/window read
-    # and the requests themselves, so re-mark it rather than let a query
-    # failure be attributed to the decode.
-    Set-K8ShakedownRunStage -Stage 'queries'
     Invoke-K8AutomatedQueries -Range $Range -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence -WindowStart $windowStart -WindowEnd $windowEnd
+
+    # 10b. Range B check 4's artifacts did not exist when the runtime contract
+    # record was written, so that record could only point forward at names.
+    # C-7 forbids a generated narrative citing an artifact that is not there,
+    # so the pointers are appended now, resolved as typed run-local references
+    # against files that now exist.
+    if ($Range -eq 'b') {
+        Complete-K8RuntimeContractRecord -RunEvidence $RunEvidence
+    }
 
     # 11. metadata.md / deviations.md -- required by study01_collect.py validate-evidence.
     # Templated from facts this runner already retained; free-text additions are still
@@ -3602,13 +4221,20 @@ function Invoke-K8ShakedownRangeABBody {
     # machine-readable records already say. Cleanup is NOT YET performed (see below),
     # so this is updated again by Complete-K8ShakedownRangeAB once it is.
     Set-K8ShakedownRunStage -Stage 'run-metadata'
+    # C7-R4: run identity comes from the authoritative structured source (the
+    # Batch 1 provenance record), not retyped from a local variable; the pinned
+    # Amenonuboco commit comes from the canonical constants; the remaining
+    # mechanical values are the ones this run observed directly.
+    $identity = Get-K8RunIdentityFacts -RunId $RunId
     @"
 # Run metadata -- $RunId (Shakedown, NOT a formal K8-3 attempt, NOT Gate K8 evidence)
 
 | Field | Value |
 | --- | --- |
 | Range | $($Range.ToUpper()) |
-| Compose project / run ID | $RunId |
+| Compose project / run ID | $($identity.RunId) |
+| Qualification sequence | $($identity.SequenceId) |
+| Tooling HEAD (locked for this sequence) | $($identity.LockedHead) |
 | Compose file | $ComposePath |
 | Generated compose SHA-256 (within-run only) | $composeHash |
 | Amenonuboco worktree | $WorktreeDir (pinned $($C.RangeGenCommit)) |
@@ -3618,11 +4244,18 @@ function Invoke-K8ShakedownRangeABBody {
 | tcpdump helper image | $($state.tcpdump_image_ref) |
 | Cleanup | NOT YET PERFORMED -- all runtime evidence has been exported; pre-teardown validation/hash remains before destruction. |
 
-See environment/, ground-truth/, sensor-input/, contract-output/ for the machine-recorded per-step argv/exit-code/timestamp evidence this table summarizes.
+See environment/, ground-truth/, sensor-input/, contract-output/ for the machine-recorded per-step argv/exit-code/timestamp evidence this table summarizes. (Those are the frozen evidence-tree schema directories created by evidence_tree.create() and required by the frozen validate-evidence, not artifact references.)
 "@ | Set-Content -Path (Join-Path $RunEvidence 'metadata.md') -Encoding utf8NoBOM
 
     $deviationsBody = if ($Range -eq 'b') {
-        "# Deviations -- $RunId`n`nNo unplanned deviations recorded by this runner. The ingress-qdisc deletion on the resolved gateway interface is the frozen Range B experimental condition, not a deviation -- see contract-output/qdisc-pre-fault.txt / qdisc-post-fault.txt.`n"
+        # C7-R1/R2: the two artifacts named below arrive as TYPED run-local
+        # references and are existence-checked before the sentence that cites
+        # them is written. Nothing scans this prose for path-shaped text.
+        $faultRefs = Get-K8NarrativeReferenceText -RunEvidence $RunEvidence -References @(
+            (New-K8ArtifactReference -Kind 'run-local' -Path 'contract-output/qdisc-pre-fault.txt')
+            (New-K8ArtifactReference -Kind 'run-local' -Path 'contract-output/qdisc-post-fault.txt')
+        )
+        "# Deviations -- $RunId`n`nNo unplanned deviations recorded by this runner. The ingress-qdisc deletion on the resolved gateway interface is the frozen Range B experimental condition, not a deviation -- see $($faultRefs[0]) / $($faultRefs[1]).`n"
     } else {
         "# Deviations -- $RunId`n`nNo unplanned deviations recorded by this runner.`n"
     }
@@ -4067,8 +4700,14 @@ function Write-K8RuntimeContractRecord {
         filter" is mechanized via Assert-K8UnrelatedMirrorFilter (called by
         the caller before this function). Check 4's sensor-capture
         unrelated-frame content is mechanized after capture export via
-        Write-K8UnrelatedPcapRows; this function only points at where that
-        result lands, since the pcap does not exist yet at this call site.
+        Write-K8UnrelatedPcapRows.
+
+        C-7: check 4's artifacts do not exist yet at this call site, and this
+        record used to name them anyway -- a generated narrative citing files
+        that were not there. It no longer does. The check-4 line is appended
+        by Complete-K8RuntimeContractRecord once those artifacts exist, where
+        each one is resolved as a typed run-local reference and fails closed
+        if it is missing. Same content, stated only when it is true.
     #>
     param(
         [Parameter(Mandatory)][ValidateSet('a', 'b')][string] $Range,
@@ -4109,14 +4748,62 @@ function Write-K8RuntimeContractRecord {
         if (-not $readinessCheck.Ready) {
             throw "Range B service-state gate failed -- missing: $($readinessCheck.Missing -join ', '); not running: $($readinessCheck.NotRunning -join ', '); unhealthy: $($readinessCheck.NotHealthy -join ', ')"
         }
+        # Typed run-local references, existence-checked before they are named.
+        # All four artifacts below already exist at this point in the run.
+        $refs = Get-K8NarrativeReferenceText -RunEvidence $RunEvidence -References @(
+            (New-K8ArtifactReference -Kind 'run-local' -Path 'contract-output/qdisc-pre-fault.txt')
+            (New-K8ArtifactReference -Kind 'run-local' -Path 'contract-output/qdisc-post-fault.txt')
+            (New-K8ArtifactReference -Kind 'run-local' -Path 'contract-output/unrelated-mirror-filters.txt')
+            (New-K8ArtifactReference -Kind 'run-local' -Path 'environment/elasticsearch-readiness.json')
+        )
         $lines += "1. Required services present/running in structured \`compose ps\`: PASS (all of $($requiredServices -join ', ') found)"
-        $lines += "2. Target-interface ($($Gateway.Interface)) mirror filter removed: see qdisc-pre-fault.txt / qdisc-post-fault.txt. Unrelated mirror-filter gate: see unrelated-mirror-filters.txt (runner stops unless another interface retains mirred egress mirror)."
-        $lines += '3. Elasticsearch endpoint readiness: see environment/elasticsearch-readiness.json (shared Wait-K8ElasticsearchReady gate, already PASS before this record was written -- not re-queried here). zone_detector service state: PASS (checked structurally above, not by text-matching `compose ps` display output).'
-        $lines += '4. Sensor unrelated-flow frame and Collector correlation are checked after capture export; see r-obs-05-pcap-rows.json and r-obs-05-correlation.json (runner stops unless the gate passes).'
+        $lines += "2. Target-interface ($($Gateway.Interface)) mirror filter removed: see $($refs[0]) / $($refs[1]). Unrelated mirror-filter gate: see $($refs[2]) (runner stops unless another interface retains mirred egress mirror)."
+        $lines += "3. Elasticsearch endpoint readiness: see $($refs[3]) (shared Wait-K8ElasticsearchReady gate, already PASS before this record was written -- not re-queried here). zone_detector service state: PASS (checked structurally above, not by text-matching \`compose ps\` display output)."
+        $lines += '4. Sensor unrelated-flow frame and Collector correlation are checked after capture export. The artifacts do not exist yet at this point in the run, so they are NOT named here; the pointers are appended once they exist.'
     }
 
     $lines -join "`n" | Set-Content -Path (Join-Path $contractDir 'runtime-contract-record.md') -Encoding utf8NoBOM
     Write-K8ShakedownLog -Message 'Runtime contract observational record written to contract-output/runtime-contract-record.md.'
+}
+
+function Complete-K8RuntimeContractRecord {
+    <#
+        Appends the Range B check-4 pointers, after the artifacts they name
+        actually exist.
+
+        The old record named `r-obs-05-pcap-rows.json` and
+        `r-obs-05-correlation.json` at a point in the run where neither file
+        had been written -- exactly the C-7 defect class: a machine-generated
+        narrative asserting an artifact reference nobody ever checked. They are
+        resolved here as typed run-local references and fail closed if absent.
+
+        C7-R4: the observer FACT (whether the correlation gate passed, and how
+        many pairs it evaluated) is read back from the C-5 observer record --
+        the authoritative structured source for that fact class -- rather than
+        restated from a local variable or from prose. This record still states
+        the observation only; the scored Runtime Contract verdict remains the
+        operator's at scoring-input time.
+    #>
+    param([Parameter(Mandatory)][string] $RunEvidence)
+    $record = Join-Path $RunEvidence 'contract-output\runtime-contract-record.md'
+    if (-not (Test-Path -LiteralPath $record)) { throw "runtime contract record not found at $record; cannot append the R-OBS-05 pointers." }
+    $refs = Get-K8NarrativeReferenceText -RunEvidence $RunEvidence -References @(
+        (New-K8ArtifactReference -Kind 'run-local' -Path 'contract-output/r-obs-05-pcap-rows.json')
+        (New-K8ArtifactReference -Kind 'run-local' -Path 'contract-output/r-obs-05-correlation.json')
+    )
+    $correlation = Get-Content -LiteralPath (Join-Path $RunEvidence 'contract-output\r-obs-05-correlation.json') -Raw | ConvertFrom-Json
+    $gatePass = Get-K8ObjectPropertyValue -Object $correlation -Name 'r_obs_05_mechanical_gate_pass'
+    $evaluated = Get-K8ObjectPropertyValue -Object $correlation -Name 'evaluated_count'
+    $lines = @(
+        ''
+        '### check 4 -- retained artifacts (appended once they existed)'
+        ''
+        "Decoded unrelated-flow rows: $($refs[0])."
+        "Pcap/document correlation record: $($refs[1])."
+        "Mechanical gate result as retained by the observer: r_obs_05_mechanical_gate_pass=$($gatePass.ToString().ToLowerInvariant()) over $evaluated evaluated pcap/document comparison(s). This is the observer's retained result, not a scored Runtime Contract verdict."
+    )
+    Add-Content -LiteralPath $record -Value ($lines -join "`n") -Encoding utf8NoBOM
+    Write-K8ShakedownLog -Message 'Runtime contract record: R-OBS-05 check-4 pointers appended against artifacts that now exist.'
 }
 
 function Complete-K8ShakedownRangeAB {
@@ -4164,6 +4851,7 @@ function Complete-K8ShakedownRangeABBody {
     $ComposePath = $state."range_$($Range)_compose"
     $Study01 = Join-Path $state.repo_root 'Study01'
     $ScriptsDir = Join-Path $Study01 'studies\study-01-negative-result\scripts'
+    Set-K8ShakedownRunEvidence -Path $RunEvidence | Out-Null
 
     Write-K8ShakedownLog -Level STEP -Message "=== Completing Shakedown Range $($Range.ToUpper()): $RunId ==="
 
@@ -4200,9 +4888,13 @@ function Complete-K8ShakedownRangeABBody {
     $finalPs | Add-Content -Path (Join-Path $RunEvidence 'environment\compose-ps.txt') -Encoding utf8NoBOM
 
     Set-K8ShakedownRunStage -Stage 'cleanup-record'
+    # C7-R2: the artifact this row points at is resolved as a typed run-local
+    # reference and existence-checked before the row is written.
+    $psRef = Resolve-K8NarrativeReference -RunEvidence $RunEvidence -Reference (
+        New-K8ArtifactReference -Kind 'run-local' -Path 'environment/compose-ps.txt')
     (Get-Content (Join-Path $RunEvidence 'metadata.md') -Raw) -replace `
         '\| Cleanup \| NOT YET PERFORMED.*\|', `
-        "| Cleanup | destroyed via 'docker compose down -v --remove-orphans' at $((Get-Date).ToUniversalTime().ToString('o')); final ps: see environment/compose-ps.txt |" |
+        "| Cleanup | destroyed via 'docker compose down -v --remove-orphans' at $((Get-Date).ToUniversalTime().ToString('o')); final ps: see $psRef |" |
         Set-Content -Path (Join-Path $RunEvidence 'metadata.md') -Encoding utf8NoBOM
 
     "cleanup_utc=$((Get-Date).ToUniversalTime().ToString('o'))`ncommand=docker compose -p $RunId -f $ComposePath down -v --remove-orphans`nresult=PASS" |
@@ -4212,6 +4904,19 @@ function Complete-K8ShakedownRangeABBody {
     Set-K8ShakedownRunStage -Stage 'final-verify'
     Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'verify-integrity', $RunEvidence) -Description 'final verify-integrity'
 
+    # C-3 (4). Ordering, and only this ordering:
+    #     final-finalize -> final-verify -> identity freeze -> run completion.
+    # The snapshot must pin a manifest that actually PASSED verify-integrity,
+    # not merely one that finalize produced, so it is written after the line
+    # above and before the sequence advances below.
+    Set-K8ShakedownRunStage -Stage 'finalize-identity-snapshot'
+    Write-K8FinalizeIdentitySnapshot -Run $Run -RunEvidence $RunEvidence | Out-Null
+
+    # The C-3 template, into the control plane -- never into the evidence tree,
+    # which is now finalized and hashed. It is intentionally incomplete and
+    # intentionally not scorable; filling it in is the operator's work.
+    $template = Write-K8ScoringInputTemplate -Run $Run -Range $Range
+
     # Only now does the sequence advance. A run that terminated anywhere above
     # never reaches this line, so next_range never moves past a failure.
     Complete-K8ShakedownRunInSequence -Run $Run | Out-Null
@@ -4220,7 +4925,11 @@ function Complete-K8ShakedownRangeABBody {
     Write-K8ShakedownLog -Level STEP -Message "=== Shakedown Range $($Range.ToUpper()) complete: $RunId ==="
     Write-Host ''
     Write-Host "Range $($Range.ToUpper()) run '$RunId' finalized/verified. Remaining manual step (by protocol design, not automated):"
-    Write-Host "  README SS6.2: derive scoring-input.json by hand from $RunEvidence BEFORE opening expected/, then:"
+    Write-Host "  README SS6.2: derive scoring-input.json by hand from $RunEvidence BEFORE opening expected/."
+    Write-Host "  A structural template (intentionally incomplete, deliberately not scorable) is at:"
+    Write-Host "    $template"
+    Write-Host "  Fill every <FILL-IN> and record in `"derivation`" which artifact each value came from, then:"
+    Write-Host "  python `"$(Join-Path $PSScriptRoot 'k8_scoring_input_contract.py')`" validate --range $Range --input <your-scoring-input.json> --run-evidence `"$RunEvidence`" --finalize-snapshot `"$(Get-K8FinalizeIdentityPath -RunId $RunId)`""
     Write-Host "  python `"$(Join-Path $ScriptsDir 'study01_score.py')`" <path-to-scoring-input.json> --run-evidence `"$RunEvidence`" --output `"$RunEvidence\score.json`""
     return $RunEvidence
 }
