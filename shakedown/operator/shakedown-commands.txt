@@ -108,3 +108,39 @@ Where the records live (under the workspace root, default C:\K8\shakedown)
 run-records\ is control-plane record and is never mixed into the evidence tree.
 The one thing that crosses over is run-provenance.json, mirrored into the
 evidence tree right after it is created.
+
+    run-records\<run_id>\tool-versions.json    host tool versions, retained
+                                               and NEVER used as a gate
+
+New STOP conditions introduced by the external command contract
+---------------------------------------------------------------
+Every external command now names a contract row, and the run stops if:
+
+  * the argv does not match the shape that row declares
+    -- reported BEFORE the command runs, so nothing has happened yet. The
+       record says what was expected and what was about to be run, and
+       deliberately carries no argv/exit_code of its own: the command did
+       not execute, so it has no command semantics to record.
+
+  * a frozen document that governs a Class F step has changed
+    -- this is NOT a claim that the implementation is wrong. It says the
+       basis the contract was written against has moved, and a human must
+       re-derive the contract before that step runs again. Any edit to the
+       document triggers it, including an unrelated typo fix. That is
+       deliberate: the check is file-level, and it errs toward asking.
+
+  * a command exits outside the acceptance domain ITS OWN row declares
+    -- not "non-zero". Range C's validator accepts 0 and 1; the Setup
+       `git rev-parse HEAD` probes accept 0 and 128; readiness probes
+       inside a wait loop accept anything, because their gate is the loop
+       deadline. What stops the run is an exit no one declared acceptable.
+
+  * a required prerequisite tool is missing OR produces no version output
+    -- previously a tool that ran but printed nothing was reported as
+       "not found on PATH", which sent you after the wrong problem. It now
+       says the binary is present but the installation is broken. A tool
+       that runs and prints a version is never gated on WHICH version.
+
+None of these change what any command does. They change where a failure
+becomes visible: at the command that caused it, rather than several steps
+later at something that merely depended on it.

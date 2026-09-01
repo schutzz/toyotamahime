@@ -178,6 +178,79 @@ A zero-byte stream is retained and described, never skipped: Range C's empty
 `validate.stdout.txt` is the frozen *expected* observation, so it must exist as
 a file with a stated byte count and hash.
 
+## External command contract
+
+Every call site that starts an external process has one row in a single
+declarative table, `$script:K8CommandContract`. A row names the site
+(`source_file`, `producer_scope`, `callee`, `call_ordinal`), the argv shape it
+is allowed to run, the streams it captures, and the exit codes it accepts.
+
+Rows fall into three classes, decided by **what the call site is responsible
+for** -- not by whether the command is internal or external:
+
+| class | when | what it carries |
+| --- | --- | --- |
+| `F` frozen-governed | a specific frozen document governs the command's scientific or artifact-acquisition semantics | `governing_sources`: an array of frozen paths, each with a pinned SHA-256 and a human-readable clause |
+| `C` control-plane | readiness, discovery, orchestration, internal tool CLIs | an observation contract only -- **no** `governing_sources`, because declaring a frozen basis that does not exist would fabricate authority |
+| `I` informational | version and environment provenance that never gates anything | `accepted_exit_codes = $null`, meaning explicitly *not gated* |
+
+### Two facts, never inferred from each other
+
+`source_identity_match` asks whether the frozen document this contract was
+written against is still the same bytes. `contract_conformance` asks whether
+the implementation still matches its **own** declared contract. Both being true
+means only this:
+
+> the implementation matches a contract that was authored against a document
+> which has not changed.
+
+Whether that contract *transcribes the document correctly* is a human
+judgment. It is recorded, never derived. Treating `source_identity_match` as
+evidence of frozen conformance would reproduce SD-11 -- using a different
+procedure's command while believing oneself compliant -- with machine
+authority behind it.
+
+The frozen prose is never parsed at runtime. Only the file's SHA-256 is
+compared, because a prose parser would itself become a new semantic
+interpreter, which is the thing being removed.
+
+### Exit codes have no default
+
+There is no module-wide acceptance domain, and `Invoke-K8ShakedownCommand` no
+longer takes `-AllowExitCodes`. A default of `@(0)` would hand every call site
+the receipt condition "non-zero is failure", which no frozen source states and
+which is wrong in **both** directions here:
+
+| site | domain | why |
+| --- | --- | --- |
+| `F-35` Range C validator | `@(0, 1)` | exit 1 is the frozen *expected* rejection; exit 0 is the scientific observation that the apparatus did **not** reject the negative manifest. Neither is a tooling error -- only `>=2` is. |
+| `C-54` / `C-55` `git rev-parse HEAD` | `@(0, 128)` | 128 means an unborn HEAD from an interrupted checkout, and the `else` branch answers it correctly with a fresh clone. |
+| readiness probes | `poll-any` | inside a deadline-bounded loop a non-zero exit is the ordinary "not ready yet"; the gate is the loop deadline, which still fails closed on timeout. |
+
+What `accepted_exit_codes` bounds is *"the command ran and returned a
+CLI-meaningful result"* -- never *"the science passed"*.
+
+### Version values are retained, availability is gated
+
+No frozen source pins a tool version, so no version is ever an acceptance
+condition. Five host probes (`C-56`..`C-60`) additionally gate on the tool
+being **executable**, which is a different fact and one the tooling already
+enforced. `wsl` (`I-05`) is optional and continues on failure.
+
+Container-internal tools split by how they are supplied: `curl` and `tcpdump`
+come from pinned images and are fixed by image identity, while `tshark` and
+`ip`/`tc` are installed by `apt-get` at container startup and are **not** --
+so they are observed per run (`I-07`, `I-08`) and recorded as provenance only.
+
+### Caller roles
+
+One process site can serve several scientific roles. `Invoke-K8TsharkFieldDecode`
+produces a byte-identical argv for both of its callers, and in the code both
+hold their pcap in a variable called `$pcap`; only the **provenance** of that
+value differs. So caller-role rows bind to the assignment's origin
+(`artifact_provenance_anchor`), not to a name and not to a blacklist of the
+wrong artifact. That is the layer SD-13 lives in.
+
 ## Narrative artifact references
 
 Where a generated narrative (`metadata.md`, `deviations.md`,

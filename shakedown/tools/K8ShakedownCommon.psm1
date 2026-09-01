@@ -593,11 +593,11 @@ function Get-K8ToolingIdentity {
     #>
     param([Parameter(Mandatory)][string] $RepoRoot)
     $resolved = (Resolve-Path -LiteralPath $RepoRoot).Path
-    $headCapture = Invoke-K8SeparatedNativeCapture -FilePath 'git' -ArgumentList @('-C', $resolved, 'rev-parse', 'HEAD')
+    $headCapture = Invoke-K8SeparatedNativeCapture -StepId 'C-01' -FilePath 'git' -ArgumentList @('-C', $resolved, 'rev-parse', 'HEAD')
     if ($headCapture.ExitCode -ne 0) { throw "git rev-parse HEAD failed in $resolved (exit $($headCapture.ExitCode)): $($headCapture.Stderr.Trim())" }
     $head = ((@($headCapture.Stdout) -join '') -replace '\s', '')
     if ($head -notmatch '^[0-9a-f]{40}$') { throw "git rev-parse HEAD in $resolved did not return a 40-hex commit: '$head'" }
-    $statusCapture = Invoke-K8SeparatedNativeCapture -FilePath 'git' -ArgumentList @('-C', $resolved, 'status', '--porcelain')
+    $statusCapture = Invoke-K8SeparatedNativeCapture -StepId 'C-02' -FilePath 'git' -ArgumentList @('-C', $resolved, 'status', '--porcelain')
     if ($statusCapture.ExitCode -ne 0) { throw "git status --porcelain failed in $resolved (exit $($statusCapture.ExitCode)): $($statusCapture.Stderr.Trim())" }
     $dirty = @(@($statusCapture.Stdout) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { "$_".TrimEnd() })
     return [pscustomobject]@{
@@ -823,6 +823,25 @@ function Start-K8ShakedownRun {
         # the C-6 stage-boundary gate has nothing to check against.
         RunEvidence = $null
     }
+    # Host tool versions are COPIED here from the Setup-time observations, not
+    # re-observed: re-probing would add process sites the contract does not
+    # have. capture_phase records that the values are older than the run, so a
+    # reader cannot mistake them for run-time readings.
+    #
+    # Absence is tolerated at every step. A run started without a Setup-time
+    # state file (as the sequence tests do) simply has no version observations
+    # to copy, and that must not stop it: these values are provenance, and
+    # gating on them would be the acceptance condition this batch refused to
+    # invent.
+    $setupVersions = @()
+    try {
+        $state = Get-K8ShakedownState
+        if ($state -and $state.PSObject.Properties.Name -contains 'tool_versions') { $setupVersions = @($state.tool_versions) }
+    }
+    catch { $setupVersions = @() }
+    try { [void](Write-K8ToolVersionRecord -RunId $runId -Records $setupVersions -CapturePhase 'setup') }
+    catch { Write-K8ShakedownLog -Level WARN -Message "tool-version record could not be written ($($_.Exception.Message)); this is provenance, never a gate, so the run continues." }
+
     Write-K8ShakedownLog -Level STEP -Message "run $runId reserved in sequence $([string]$sequence['sequence_id']); provenance retained before any scientific/runtime step."
     return $script:K8CurrentRun
 }
@@ -1569,7 +1588,7 @@ function Write-K8ScoringInputTemplate {
         [Parameter(Mandatory)][ValidateSet('a', 'b')][string] $Range
     )
     $target = Join-Path (Get-K8RunRecordDir -RunId $Run.RunId) 'scoring-input.template.json'
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @(
+    Invoke-K8ShakedownCommand -StepId 'C-44' -FilePath 'python' -ArgumentList @(
         (Join-Path $PSScriptRoot 'k8_scoring_input_contract.py'), 'emit-template',
         '--range', $Range, '--output', $target
     ) -Description 'emit the C-3 scoring-input template (intentionally incomplete)' | Out-Null
@@ -1825,24 +1844,1262 @@ function Invoke-K8ShakedownRunBoundary {
 }
 
 # ---------------------------------------------------------------------------
+# C-8: ONE external-command contract (Batch 3A)
+#
+# Three SDs share one reasoning error -- "treated a similar thing as the same
+# thing" -- and none of them is a typo:
+#   SD-09  passed `-E separator=\t`; tshark's CLI syntax is `/t`.
+#   SD-11  read `ip -br addr`; the governing frozen step is `ip -o -4 addr show`.
+#   SD-13  correlated the Sensor pcap; the contract requires the separate
+#          R-OBS-05 liveness pcap.
+# The existing regression tests catch those three literals by blacklist. A
+# blacklist cannot catch the next unknown instance of the same error, and it
+# leaves the expected contract unbound to the frozen document it claims to
+# come from.
+#
+# So the contract is declarative data with, on every row, the frozen source
+# that governs it AND that source's immutable identity. Two facts are kept
+# separate and NEITHER is inferred from the other:
+#
+#   source_identity_match  the frozen document is still the one this contract
+#                          was authored against
+#   contract_conformance   the implementation still matches its OWN declared
+#                          contract
+#
+# Both true means only: the implementation matches a contract authored against
+# a document that has not changed. Whether that contract transcribes the
+# document CORRECTLY is a human judgment, recorded and never derived. C-8
+# closes "the transcription drifted away from its source", not "the
+# transcription is right".
+#
+# The frozen prose is never parsed at runtime (scope decision D-3): a prose
+# parser would itself become a new semantic interpreter, which is the thing
+# being removed. Only the file's SHA-256 is compared.
+#
+# Rows come in two kinds because one process site can carry several scientific
+# roles:
+#   process-site row  one call site that actually starts a process (100)
+#   caller-role row   one caller of a generic executor (8)
+# SD-13 lives in the second kind: the tshark argv is identical for both
+# callers, and only the ROLE of the pcap passed in differs.
+# ---------------------------------------------------------------------------
+
+$script:K8CommandContractSchema = 'k8shakedown-command-contract/1'
+
+# Frozen sources, hashed once here so a row cites a path and this table owns
+# the identity. Paths are Study01-relative; the resolver joins them to the
+# packaged Study01 root, never to an absolute path (C-9 lesson, kept here too).
+$script:K8FrozenSourceIdentity = @{
+    'README.md'                                                              = '6ae837628ec3bae80813d19efe6af35529a52ec1a494cac7f73da13eee061a00'
+    'studies/study-01-negative-result/protocol/freeze-decision-table.md'     = 'f90e687275dc0098e4de11377fe7f2ce46eadb494bcc1e1e913a8daf0977801d'
+    'studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md'  = 'ded5e1ea4019e800567b7de3b13215be9f80be5e15e83da83cc6715be24a8fe2'
+    'studies/study-01-negative-result/protocol/c2-dnp3-step4-range-b-fault-pilot.md' = '563e664ddde408a2136019b8dffe0ca911f5f144e2407aa1dbc15188a4e70d0c'
+    'studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md' = 'ea657a995535414167ecb16c62d6f1897147f1f77745a13d1b52b137fd17a84b'
+    'studies/study-01-negative-result/protocol/c2-dnp3-capture-procedure.md' = '54cf70c6329e71356b394ac4829818eaa8b5c44db49c5c852cb386326c69b80e'
+    'studies/study-01-negative-result/protocol/c2-dnp3-image-inventory.md'   = '9a306601c326f15f8b6d7e80ba2d7933037be322eedb125c546ecb7ef6a35b98'
+    'studies/study-01-negative-result/protocol/evidence-schema.md'           = 'b0c670734f9bab9d925e1591173f1fbe7f85209f84d315e08d5bcd2250f51137'
+    'studies/study-01-negative-result/protocol/c2-dnp3-sender-procedure.md'  = '35b47f7d31973f84273a0283209def0b071614799ba362ee6b3fd105c0799683'
+}
+
+function New-K8GoverningSource {
+    <# One element of a row's governing_sources ARRAY. An array, not a single
+       field: several rows really are governed by two frozen documents at once
+       (the tshark decode by freeze-decision-table SS3, the R-OBS-05 helper by
+       both the contract SS4 and the capture procedure SS5). With a single
+       field the author picks one, and a change in the unpicked one leaves
+       source_identity_match true -- exactly the drift this closes. #>
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Clause
+    )
+    if (-not $script:K8FrozenSourceIdentity.ContainsKey($Path)) {
+        throw "C-8 contract defect: '$Path' has no pinned identity in `$script:K8FrozenSourceIdentity. A governing source without an identity cannot be checked for drift; add its SHA-256 rather than citing it unpinned."
+    }
+    return [ordered]@{ path = $Path; sha256 = $script:K8FrozenSourceIdentity[$Path]; clause = $Clause }
+}
+
+# `accepted_exit_codes` has NO default anywhere in this module. Making @(0) a
+# default would hand every call site the receipt condition "non-zero is
+# failure", which no frozen source states and which is demonstrably wrong in
+# both directions here:
+#   F-35  Range C's validator: exit 1 is the EXPECTED outcome (README SS5.3/
+#         SS6.1) and exit 0 is a scientific observation ("the apparatus did
+#         not reject the negative manifest"), not a tooling failure. Neither
+#         may STOP the run; only >=2 is an execution failure.
+#   C-54  `git rev-parse HEAD` against a repo whose HEAD is unborn (an
+#         interrupted `git init`+fetch) exits 128 while printing "HEAD"; the
+#         `else` branch's fresh checkout is the correct response.
+# What accepted_exit_codes bounds is "the command ran and returned a
+# CLI-meaningful result", never "the science passed".
+$script:K8ExitPollAny = 'poll-any'
+
+$script:K8CommandContract = @(
+
+    # === Class F -- frozen-governed ========================================
+    # A specific frozen source governs this command's scientific or artifact-
+    # acquisition semantics. Every F row carries governing_sources.
+
+    @{ step_id = 'F-01'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8TsharkFieldDecode'; callee = "'docker'"; call_ordinal = 2
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/freeze-decision-table.md' -Clause 'SS3 field set'))
+       argv_shape = @('docker','exec','<container>','tshark','-r','<remote-pcap>','-Y','<display-filter>','-T','fields','-E','separator=/t','-e','frame.number','-e','frame.time_epoch','-e','ip.src','-e','ip.dst','-e','tcp.srcport','-e','tcp.dstport','-e','dnp3.al.func','-e','dnp3.src','-e','dnp3.dst')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'SD-09 origin. separator=/t is tshark CLI syntax, not a host-language escape; the literal is fixed here so a rewrite is a contract mismatch rather than a blacklist hit.' }
+
+    @{ step_id = 'F-02'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Resolve-K8GatewayInterface'; callee = "'docker'"; call_ordinal = 4
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md' -Clause 'SS3 gateway interface resolution'))
+       argv_shape = @('docker','exec','<router>','ip','-o','-4','addr','show')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'SD-11 origin. The governing step is `ip -o -4 addr show`; `ip -br addr` belongs to a different procedure.' }
+
+    @{ step_id = 'F-03'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Resolve-K8GatewayInterface'; callee = "'docker'"; call_ordinal = 5
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md' -Clause 'SS3 independent re-verification'))
+       argv_shape = @('docker','exec','<router>','ip','-o','-4','addr','show','dev','<interface>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Independent re-verification of the interface resolved by F-02.' }
+
+    @{ step_id = 'F-04'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Assert-K8UnrelatedMirrorFilter'; callee = '$filterArgv[0]'; call_ordinal = 1
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-step4-range-b-fault-pilot.md' -Clause 'SS3 check 2'))
+       argv_shape = @('docker','exec','<router>','tc','filter','show','dev','<interface>','parent','ffff:')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'The unrelated-segment mirror filter must still be present; its absence is a scientific finding recorded by the caller, not an exit-code condition.' }
+
+    @{ step_id = 'F-05'; class = 'F'; ranges = 'b'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = 'Invoke-K8FaultObservationCommand'; call_ordinal = 1
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md' -Clause 'SS3 pre/post command order'))
+       argv_shape = @('docker','exec','<router>','tc','qdisc','show','dev','<interface>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Pre-fault observation.' }
+
+    @{ step_id = 'F-06'; class = 'F'; ranges = 'b'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = 'Invoke-K8FaultObservationCommand'; call_ordinal = 2
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md' -Clause 'SS3 pre/post command order'))
+       argv_shape = @('docker','exec','<router>','tc','filter','show','dev','<interface>','parent','ffff:')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Pre-fault observation.' }
+
+    @{ step_id = 'F-07'; class = 'F'; ranges = 'b'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = 'Invoke-K8FaultObservationCommand'; call_ordinal = 3
+       governing_sources = @(
+           (New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md' -Clause 'SS3 the sole permitted fault')
+           (New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-step4-range-b-fault-pilot.md' -Clause 'SS4'))
+       argv_shape = @('docker','exec','<router>','tc','qdisc','del','dev','<interface>','ingress')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'The sole permitted fault. Two governing sources: the derivation fixes the command, the pilot fixes the check shape around it.' }
+
+    @{ step_id = 'F-08'; class = 'F'; ranges = 'b'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = 'Invoke-K8FaultObservationCommand'; call_ordinal = 4
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-step4-range-b-fault-pilot.md' -Clause 'SS4 check 2'))
+       argv_shape = @('docker','exec','<router>','tc','filter','show','dev','<interface>','parent','ffff:')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Post-fault. An EMPTY stdout is the frozen success shape, which is why emptiness is retained rather than treated as a missing artifact.' }
+
+    @{ step_id = 'F-09'; class = 'F'; ranges = 'b'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Start-K8Robs05LivenessCapture'; callee = 'Invoke-K8Robs05LifecycleStep'; call_ordinal = 1
+       governing_sources = @(
+           (New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md' -Clause 'SS4 separate liveness capture')
+           (New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-capture-procedure.md' -Clause 'SS5 helper argv shape'))
+       argv_shape = @('docker','run','-d','--name','<helper>','--network','<container-ns>','--cap-add','NET_RAW','<helper-image>','-i','<interface>','-nn','-s','0','-w','<container-pcap>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'SD-13 origin family. No capture-time BPF filter by design: the frozen SS3 selector is the sole arbiter, applied after capture.' }
+
+    @{ step_id = 'F-10'; class = 'F'; ranges = 'b'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Start-K8Robs05LivenessCapture'; callee = 'Invoke-K8Robs05LifecycleStep'; call_ordinal = 2
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-capture-procedure.md' -Clause 'SS5 listening confirmation'))
+       argv_shape = @('docker','logs','<helper>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Listening confirmation must precede the window start.' }
+
+    @{ step_id = 'F-11'; class = 'F'; ranges = 'b'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Complete-K8Robs05LivenessCapture'; callee = 'Invoke-K8Robs05LifecycleStep'; call_ordinal = 1
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md' -Clause 'SS5.1 window coverage'))
+       argv_shape = @('docker','inspect','--format','{{.State.Running}}','<helper>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Window-end liveness check; must run at or after the frozen window end.' }
+
+    @{ step_id = 'F-12'; class = 'F'; ranges = 'b'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Complete-K8Robs05LivenessCapture'; callee = 'Invoke-K8Robs05LifecycleStep'; call_ordinal = 2
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-capture-procedure.md' -Clause 'SS5 stop'))
+       argv_shape = @('docker','stop','<helper>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Stop precedes export; the ordering is what the frozen lifecycle fixes.' }
+
+    @{ step_id = 'F-13'; class = 'F'; ranges = 'b'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Complete-K8Robs05LivenessCapture'; callee = 'Invoke-K8Robs05LifecycleStep'; call_ordinal = 3
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-capture-procedure.md' -Clause 'SS5 export'))
+       argv_shape = @('docker','cp','<helper-container-pcap>','<host-artifact>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'The exported pcap is the artifact CR-01 later decodes; the two are bound by role, not by variable name.' }
+
+    @{ step_id = 'F-14'; class = 'F'; ranges = 'b'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Complete-K8Robs05LivenessCapture'; callee = 'Invoke-K8Robs05LifecycleStep'; call_ordinal = 4
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-capture-procedure.md' -Clause 'SS5 remove'))
+       argv_shape = @('docker','container','rm','<helper>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Removal happens after the export has been hashed.' }
+
+    @{ step_id = 'F-15'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ElasticsearchRequest'; callee = "'docker'"; call_ordinal = 2
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md' -Clause 'SS3 fixed request, no retry'))
+       argv_shape = @('docker','exec','<container>','curl','-sS','-o','<body-file>','-w','%{http_code}','-X','<method>','<url>','<*>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Generic executor, and the one row that needs a variadic tail: a GET mapping request ends at the URL while a POST search adds -H and --data-binary. The invariant prefix -- including the fixed -sS (no retry, errors surfaced) and the -w %{http_code} marker -- is pinned here; WHICH request this is (Collector, Rule or R-OBS-05) is fixed by caller-role rows CR-03..CR-08, never by this argv.' }
+
+    @{ step_id = 'F-16'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Write-K8ImageInventory'; callee = "'docker'"; call_ordinal = 1
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-image-inventory.md' -Clause 'SS4 collection command'))
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','images','--format','json')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Resolves the effective image reference per service.' }
+
+    @{ step_id = 'F-17'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Write-K8ImageInventory'; callee = "'docker'"; call_ordinal = 3
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-image-inventory.md' -Clause 'SS1 immutable image identity'))
+       argv_shape = @('docker','image','inspect','<image-ref>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Retains image_id plus RepoDigests. A local build legitimately has NO registry digest; repo_digests_status records absent-local-build rather than treating that as a missing identity. This identity does NOT fix apt-installed tool bytes -- see I-07/I-08.' }
+
+    @{ step_id = 'F-18'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'python'"; call_ordinal = 1
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/evidence-schema.md' -Clause 'SS1 evidence tree shape'))
+       argv_shape = @('python','-c','<evidence-tree-create-script>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Frozen evidence_tree.create(); Shakedown never builds the tree itself.' }
+
+    @{ step_id = 'F-19'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'python'"; call_ordinal = 2
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md' -Clause 'SS2 provisioning'))
+       argv_shape = @('python','platform/cli.py','provision','manifests/power-grid-reference.yaml','-o','<generated-compose>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'The base manifest path is a frozen literal.' }
+
+    @{ step_id = 'F-20'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'python'"; call_ordinal = 3
+       governing_sources = @((New-K8GoverningSource -Path 'README.md' -Clause 'SS5.1 preflight'))
+       argv_shape = @('python','<study01-preflight>','--run-id','<run-id>','--worktree','<worktree>','--compose','<compose>','--run-evidence','<run-evidence>','--project-name','<run-id>','--teardown-target','<run-id>','--shell-probe','<shell-version>','--path-probe','/study/traffic/send_direct_operate.py','/data/c2-original-path.pcap','/data/c2-mirror-sensor.pcap')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'The three --path-probe values are frozen IN-CONTAINER paths, not host paths.' }
+
+    @{ step_id = 'F-21'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'docker'"; call_ordinal = 1
+       governing_sources = @((New-K8GoverningSource -Path 'README.md' -Clause 'SS5.1 bring-up'))
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','up','-d','--build')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Bring-up. Application readiness is a separate gate (C-06/C-10/C-12..C-16), deliberately not folded into this exit code.' }
+
+    @{ step_id = 'F-22'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'docker'"; call_ordinal = 5
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-sender-procedure.md' -Clause 'SS1 asset placement'))
+       argv_shape = @('docker','cp','<sender-asset-host>','<container-frozen-path>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'The in-container destination is a frozen literal.' }
+
+    @{ step_id = 'F-23'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'docker'"; call_ordinal = 6
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-sender-procedure.md' -Clause 'SS3.2 asset SHA-256 verification'))
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','exec','-T','sub_a_ied_02','sh','-lc','<sha256sum-frozen-path>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'C-8 target: this is the step that VERIFIES the frozen SENDER_ASSET_SHA256, and before this batch neither its argv nor its exit code was retained.' }
+
+    @{ step_id = 'F-24'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'python'"; call_ordinal = 6
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-sender-procedure.md' -Clause 'SS3.2 trigger'))
+       argv_shape = @('python','<study01-sender>','--run-id','<run-id>','--run-evidence','<run-evidence>','--','docker','compose','-p','<run-id>','-f','<compose>','exec','-T','sub_a_ied_02','python3','<container-frozen-path>','--target-ip','10.1.10.10','--target-port','20000','--function-code','5','--repeat','1')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'The frozen trigger. Target IP, port, function code and repeat are frozen literals -- changing any of them changes the scientific event itself.' }
+
+    @{ step_id = 'F-25'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'python'"; call_ordinal = 4
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-capture-procedure.md' -Clause 'SS5 resolve'))
+       argv_shape = @('python','<study01-capture>','resolve','--run-id','<run-id>','--run-evidence','<run-evidence>','--stage','<stage>','--compose','<compose>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Capture lifecycle: resolve.' }
+
+    @{ step_id = 'F-26'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'python'"; call_ordinal = 5
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-capture-procedure.md' -Clause 'SS5 start'))
+       argv_shape = @('python','<study01-capture>','start','--run-id','<run-id>','--run-evidence','<run-evidence>','--stage','<stage>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Capture lifecycle: start.' }
+
+    @{ step_id = 'F-27'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'python'"; call_ordinal = 7
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-capture-procedure.md' -Clause 'SS5 stop-export'))
+       argv_shape = @('python','<study01-capture>','stop-export','--run-id','<run-id>','--run-evidence','<run-evidence>','--stage','<stage>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Capture lifecycle: stop-export.' }
+
+    @{ step_id = 'F-28'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Complete-K8ShakedownRangeABBody'; callee = "'python'"; call_ordinal = 1
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/evidence-schema.md' -Clause 'SS1 validate before finalize'))
+       argv_shape = @('python','<study01-collect>','validate-evidence','<run-evidence>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Frozen collector; Shakedown never reimplements its checks.' }
+
+    @{ step_id = 'F-29'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Complete-K8ShakedownRangeABBody'; callee = "'python'"; call_ordinal = 2
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/evidence-schema.md' -Clause 'SS1 finalize'))
+       argv_shape = @('python','<study01-collect>','finalize-evidence','<run-evidence>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Pre-teardown finalize.' }
+
+    @{ step_id = 'F-30'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Complete-K8ShakedownRangeABBody'; callee = "'docker'"; call_ordinal = 1
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/evidence-schema.md' -Clause 'SS1 cleanup ordering'))
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','down','-v','--remove-orphans')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Teardown happens BETWEEN the two finalizes; the ordering is the frozen part.' }
+
+    @{ step_id = 'F-31'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Complete-K8ShakedownRangeABBody'; callee = "'python'"; call_ordinal = 3
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/evidence-schema.md' -Clause 'SS1 final finalize'))
+       argv_shape = @('python','<study01-collect>','finalize-evidence','<run-evidence>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Final finalize, after teardown.' }
+
+    @{ step_id = 'F-32'; class = 'F'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Complete-K8ShakedownRangeABBody'; callee = "'python'"; call_ordinal = 4
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/evidence-schema.md' -Clause 'SS1 integrity verification'))
+       argv_shape = @('python','<study01-collect>','verify-integrity','<run-evidence>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Must pass before the Batch 2 finalize-identity snapshot is frozen.' }
+
+    @{ step_id = 'F-33'; class = 'F'; ranges = 'c'
+       source_file = 'Run-K8ShakedownRangeC.ps1'; producer_scope = '<script-toplevel>'; callee = "'git'"; call_ordinal = 2
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md' -Clause 'SS4 negative derivation'))
+       argv_shape = @('git','apply','--ignore-space-change','--check','<derived-patch>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Non-zero means the derived patch does not apply, which breaks the Range C derivation itself -- an apparatus failure, not a finding.' }
+
+    @{ step_id = 'F-34'; class = 'F'; ranges = 'c'
+       source_file = 'Run-K8ShakedownRangeC.ps1'; producer_scope = '<script-toplevel>'; callee = "'git'"; call_ordinal = 3
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md' -Clause 'SS4 negative derivation'))
+       argv_shape = @('git','apply','--ignore-space-change','<derived-patch>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'The negative manifest is retained immediately after this succeeds -- the same bytes the validator then reads.' }
+
+    @{ step_id = 'F-35'; class = 'F'; ranges = 'c'
+       source_file = 'Run-K8ShakedownRangeC.ps1'; producer_scope = '<script-toplevel>'; callee = 'cmd.exe'; call_ordinal = 1
+       governing_sources = @((New-K8GoverningSource -Path 'README.md' -Clause 'SS5.3 / SS6.1 exactly one command'))
+       argv_shape = @('cmd.exe','/c','python','platform\cli.py','validate','manifests\power-grid-reference.range-c-negative.yaml')
+       stream_expectation = 'file-backed'; accepted_exit_codes = @(0, 1)
+       exit_note = 'exit 1 = the frozen EXPECTED outcome (the negative manifest was rejected). exit 0 = a SCIENTIFIC observation that the apparatus did not reject it -- recorded, never converted into a tooling STOP. exit >=2 = argparse/interpreter execution failure. This row is why accepted_exit_codes has no default: @(0) would STOP every correct Range C run, and would also convert the exit-0 finding into a tooling error.' }
+
+    @{ step_id = 'F-36'; class = 'F'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'docker'"; call_ordinal = 3
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-image-inventory.md' -Clause 'SS1 pinned digest'))
+       argv_shape = @('docker','pull','<pinned-digest-ref>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Pulls by digest, never by mutable tag.' }
+
+    @{ step_id = 'F-37'; class = 'F'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'docker'"; call_ordinal = 4
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-image-inventory.md' -Clause 'SS1 pinned digest'))
+       argv_shape = @('docker','inspect','--format','{{index .RepoDigests 0}}','<image-ref>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'C-8 target: this is the step that VERIFIES the pinned digest, and before this batch the verification itself was unobserved.' }
+
+    # === Class C -- control-plane ==========================================
+    # Readiness, discovery, orchestration, internal tool invocation. NOT the
+    # object of a scientific judgment -- so these rows carry NO
+    # governing_sources: declaring a frozen basis that does not exist would
+    # fabricate normative authority (scope decision D-2).
+    #
+    # "Not frozen-governed" does not mean "sloppy". Having no SCIENTIFIC
+    # semantics is different from having no CLI semantics, and this class is
+    # where that distinction does the most work:
+    #   C-05..C-33  readiness probes inside poll loops, where a non-zero exit
+    #               is a legitimate "not ready yet" and the gate is the
+    #               deadline, not the exit code -> accepted_exit_codes is
+    #               'poll-any'
+    #   C-54/C-55   `git rev-parse HEAD` used as an EXPLORATION, where exit
+    #               128 (unborn HEAD) is a legitimate answer -> @(0, 128)
+    #   C-56..C-60  version probes that are also prerequisite gates ->
+    #               availability_policy 'required'
+    #
+    # The internal Python tools (k8_shakedown_evidence.py,
+    # k8_scoring_input_contract.py) are Class C on purpose. The OBSERVATION
+    # SEMANTICS they implement are frozen-governed, but C-3/C-5 already close
+    # that. What is at stake here is the CLI contract between the psm1 and the
+    # .py, which Shakedown itself defined. Blurring that would hand a
+    # Shakedown-authored interface the authority of a frozen document.
+
+    @{ step_id = 'C-01'; class = 'C'; ranges = 'abc'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Get-K8ToolingIdentity'; callee = "'git'"; call_ordinal = 1
+       argv_shape = @('git','-C','<worktree>','rev-parse','HEAD')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Tooling identity for the run record. A repository is guaranteed present here, unlike C-54/C-55.' }
+
+    @{ step_id = 'C-02'; class = 'C'; ranges = 'abc'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Get-K8ToolingIdentity'; callee = "'git'"; call_ordinal = 2
+       argv_shape = @('git','-C','<worktree>','status','--porcelain')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Empty stdout means a clean tree -- a legitimate observation, not a missing result.' }
+
+    @{ step_id = 'C-03'; class = 'C'; ranges = 'abc'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Assert-K8PinnedCommit'; callee = "'git'"; call_ordinal = 1
+       argv_shape = @('git','-C','<worktree>','rev-parse','HEAD')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Asserts a pin that is already supposed to be checked out; unlike C-54/C-55 there is no exploratory branch, so non-zero is a real failure.' }
+
+    @{ step_id = 'C-04'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Get-K8ExpectedServices'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','config','--services')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Service discovery from the generated compose file.' }
+
+    @{ step_id = 'C-05'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Wait-K8ElasticsearchReady'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps','-q','elasticsearch')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Resolved ONCE before the poll loop, so this is not a poll-any site. Empty stdout is handled by the caller as an unresolved container, which is why the exit code must be observed rather than collapsed into that emptiness.' }
+
+    @{ step_id = 'C-06'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Wait-K8ElasticsearchReady'; callee = "'docker'"; call_ordinal = 2
+       argv_shape = @('docker','exec','<container>','curl','-sS','--max-time','5','-w','<marker-format>','http://localhost:9200/_cluster/health')
+       stream_expectation = 'separated'; accepted_exit_codes = 'poll-any'
+       poll_loop = $true; deadline_param = 'TimeoutSeconds'; timeout_behavior = 'throw'
+       exit_note = 'Inside the readiness poll loop. curl exit 7 (connection refused) while Elasticsearch is still starting is the ORDINARY case; the gate is the deadline plus the HTTP-2xx/status predicate, and the loop throws on timeout.' }
+
+    @{ step_id = 'C-07'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Get-K8Dnp3OperationalCanaryHits'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps','-q','elasticsearch')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Container resolution for the operational canary.' }
+
+    @{ step_id = 'C-08'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Get-K8Dnp3OperationalCanaryHits'; callee = "'docker'"; call_ordinal = 2
+       argv_shape = @('docker','exec','<container>','curl','-sS','--max-time','5','-X','POST','http://localhost:9200/ot-logs-dnp3-*/_search','-H','Content-Type: application/json','--data-binary','<canary-query>','-w','<marker-format>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'NOT poll-any: the caller already treats a non-zero curl exit as a transport failure and throws. The canary selector is disjoint from the target attack flow by construction.' }
+
+    @{ step_id = 'C-09'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Wait-K8LogStructurerReady'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps','-q','log_structurer')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Resolved once, before the poll loop.' }
+
+    @{ step_id = 'C-10'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Wait-K8LogStructurerReady'; callee = "'docker'"; call_ordinal = 2
+       argv_shape = @('docker','exec','<container>','sh','-lc','<cmdline-probe>')
+       stream_expectation = 'combined'; accepted_exit_codes = 'poll-any'
+       poll_loop = $true; deadline_param = 'TimeoutSeconds'; timeout_behavior = 'throw'
+       exit_note = 'Inside the poll loop that gates the generated apt-get install of tshark/python3. A non-zero exit while that install is still running is the ordinary case.' }
+
+    @{ step_id = 'C-11'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Wait-K8ZoneDetectorReady'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps','-q','zone_detector')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Resolved once, before the poll loop.' }
+
+    @{ step_id = 'C-12'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Wait-K8ZoneDetectorReady'; callee = "'docker'"; call_ordinal = 2
+       argv_shape = @('docker','exec','<container>','sh','-lc','<cmdline-probe>')
+       stream_expectation = 'combined'; accepted_exit_codes = 'poll-any'
+       poll_loop = $true; deadline_param = 'TimeoutSeconds'; timeout_behavior = 'throw'
+       exit_note = 'Inside the poll loop that gates the generated pip install.' }
+
+    @{ step_id = 'C-13'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Wait-K8ZoneDetectorReady'; callee = "'docker'"; call_ordinal = 3
+       argv_shape = @('docker','exec','<container>','sh','-lc','<es-url-probe>')
+       stream_expectation = 'combined'; accepted_exit_codes = 'poll-any'
+       poll_loop = $true; deadline_param = 'TimeoutSeconds'; timeout_behavior = 'throw'
+       exit_note = 'Resolves the container OWN configured ES_URL from inside it, rather than assuming the host view.' }
+
+    @{ step_id = 'C-14'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Wait-K8ZoneDetectorReady'; callee = "'docker'"; call_ordinal = 4
+       argv_shape = @('docker','exec','<container>','python3','-c','<connectivity-script>')
+       stream_expectation = 'separated'; accepted_exit_codes = 'poll-any'
+       poll_loop = $true; deadline_param = 'TimeoutSeconds'; timeout_behavior = 'throw'
+       exit_note = 'The caller already reads this exit code as a readiness signal (connectivityOk requires exit 0); poll-any records that fact instead of contradicting it.' }
+
+    @{ step_id = 'C-15'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Wait-K8ZoneDetectorReady'; callee = "'docker'"; call_ordinal = 5
+       argv_shape = @('docker','exec','<container>','python3','-c','<search-script>')
+       stream_expectation = 'separated'; accepted_exit_codes = 'poll-any'
+       poll_loop = $true; deadline_param = 'TimeoutSeconds'; timeout_behavior = 'throw'
+       exit_note = 'The plugin own literal search, from inside its own container, against its own dependency.' }
+
+    @{ step_id = 'C-16'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Wait-K8ZoneDetectorReady'; callee = "'docker'"; call_ordinal = 6
+       argv_shape = @('docker','logs','--tail','20','<container>')
+       stream_expectation = 'combined'; accepted_exit_codes = 'poll-any'
+       poll_loop = $true; deadline_param = 'TimeoutSeconds'; timeout_behavior = 'throw'
+       exit_note = 'Recorded for review, explicitly not gated on: a transient old error line must not by itself fail the readiness gate.' }
+
+    @{ step_id = 'C-17'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ElasticsearchRequest'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps','-q','elasticsearch')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Container resolution for the fixed, never-retried frozen request.' }
+
+    @{ step_id = 'C-18'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ElasticsearchRequest'; callee = "'docker'"; call_ordinal = 3
+       argv_shape = @('docker','exec','<container>','cat','<remote-body>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Retrieves the response body curl wrote inside the container.' }
+
+    @{ step_id = 'C-19'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ElasticsearchRequest'; callee = "'docker'"; call_ordinal = 4
+       argv_shape = @('docker','exec','<container>','rm','-f','<remote-body>')
+       stream_expectation = 'combined'; accepted_exit_codes = @(0)
+       exit_note = 'Cleanup whose result was previously discarded to Out-Null; the exit code is now observed.' }
+
+    @{ step_id = 'C-20'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Assert-K8UnrelatedMirrorFilter'; callee = '$linkArgv[0]'; call_ordinal = 1
+       argv_shape = @('docker','exec','<router>','ip','-o','link','show')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Interface enumeration supporting the F-04 check. Enumeration is control-plane; the check itself is frozen-governed.' }
+
+    @{ step_id = 'C-21'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8TsharkFieldDecode'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','cp','<local-pcap>','<container-remote-pcap>')
+       stream_expectation = 'combined'; accepted_exit_codes = @(0)
+       exit_note = 'Previously discarded to Out-Null. Which pcap this carries is fixed by CR-01/CR-02, not here.' }
+
+    @{ step_id = 'C-22'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8TsharkFieldDecode'; callee = "'docker'"; call_ordinal = 3
+       argv_shape = @('docker','exec','<container>','rm','-f','<remote-pcap>')
+       stream_expectation = 'combined'; accepted_exit_codes = @(0)
+       exit_note = 'Previously discarded to Out-Null.' }
+
+    @{ step_id = 'C-23'; class = 'C'; ranges = 'b'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Start-K8Robs05LivenessCapture'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps','-q','<namespace-service>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Resolves the namespace container the helper attaches to.' }
+
+    @{ step_id = 'C-24'; class = 'C'; ranges = 'b'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Write-K8UnrelatedPcapRows'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps','-q','log_structurer')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Container resolution for the CR-01 decode.' }
+
+    @{ step_id = 'C-25'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Write-K8TargetCaptureDecode'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps','-q','log_structurer')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Container resolution for the CR-02 decode.' }
+
+    @{ step_id = 'C-26'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Resolve-K8GatewayInterface'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps','-q','wan_router')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Container resolution preceding the frozen F-02/F-03 commands.' }
+
+    @{ step_id = 'C-27'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Resolve-K8GatewayInterface'; callee = "'docker'"; call_ordinal = 2
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps','-q','tap_observer')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Container resolution for the tap observer.' }
+
+    @{ step_id = 'C-28'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'docker'"; call_ordinal = 3
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps','-q','sub_a_ied_02')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Sender container resolution.' }
+
+    @{ step_id = 'C-29'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'docker'"; call_ordinal = 4
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','exec','-T','sub_a_ied_02','sh','-lc','mkdir -p /study/traffic')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Prepares the frozen in-container destination directory for F-22.' }
+
+    @{ step_id = 'C-30'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Get-K8ComposeDeclaredSubnets'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','config','--format','json')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Network preflight: declared subnets.' }
+
+    @{ step_id = 'C-31'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Get-K8LeftoverShakedownNetworks'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','network','ls','--format','json')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Network preflight: enumeration.' }
+
+    @{ step_id = 'C-32'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Get-K8LeftoverShakedownNetworks'; callee = "'docker'"; call_ordinal = 2
+       argv_shape = @('docker','network','inspect','<network-name>','--format','json')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Network preflight: inspection.' }
+
+    @{ step_id = 'C-33'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Wait-K8ComposeReady'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps','--all','--format','json')
+       stream_expectation = 'separated'; accepted_exit_codes = 'poll-any'
+       poll_loop = $true; deadline_param = 'TimeoutSeconds'; timeout_behavior = 'throw'
+       exit_note = 'Inside the compose readiness poll loop.' }
+
+    @{ step_id = 'C-34'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Write-K8ImageInventory'; callee = "'docker'"; call_ordinal = 2
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Human-readable service listing beside the machine-readable F-16/F-17 identity.' }
+
+    @{ step_id = 'C-35'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Write-K8RuntimeContractRecord'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps')
+       stream_expectation = 'combined'; accepted_exit_codes = @(0)
+       exit_note = 'Text transcript for the narrative; merged streams are correct for a human-read transcript.' }
+
+    @{ step_id = 'C-36'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Write-K8RuntimeContractRecord'; callee = "'docker'"; call_ordinal = 2
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps','--all','--format','json')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Machine-readable service state for the runtime contract record.' }
+
+    @{ step_id = 'C-37'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Complete-K8ShakedownRangeABBody'; callee = "'docker'"; call_ordinal = 2
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','ps')
+       stream_expectation = 'combined'; accepted_exit_codes = @(0)
+       exit_note = 'Final post-teardown listing, retained as a human-read transcript.' }
+
+    @{ step_id = 'C-38'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Test-K8CaptureLifecycleEarly'; callee = "'python'"; call_ordinal = 1
+       argv_shape = @('python','<temp-probe-script>','<run-evidence>','<run-id>','<scripts-dir>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Shakedown-authored early probe of the frozen capture lifecycle; the CLI shape is Shakedown own.' }
+
+    @{ step_id = 'C-39'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8AutomatedQueries'; callee = "'python'"; call_ordinal = 1
+       argv_shape = @('python','<k8-shakedown-evidence>','collector-mapping-gate','--mapping','<collector-mapping>','--output','<gate-output>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Internal tool CLI. The absence admissibility it enforces is frozen-governed and already closed by C-5; this row governs only the psm1-to-py interface.' }
+
+    @{ step_id = 'C-40'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8AutomatedQueries'; callee = "'python'"; call_ordinal = 2
+       argv_shape = @('python','<k8-shakedown-evidence>','rule-mapping-gate','--mapping','<rule-mapping>','--output','<gate-output>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Internal tool CLI.' }
+
+    @{ step_id = 'C-41'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8AutomatedQueries'; callee = "'python'"; call_ordinal = 3
+       argv_shape = @('python','<k8-shakedown-evidence>','target-correlation','--collector','<collector-response>','--rule','<rule-response>','--output','<correlation-output>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Internal tool CLI.' }
+
+    @{ step_id = 'C-42'; class = 'C'; ranges = 'b'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8AutomatedQueries'; callee = "'python'"; call_ordinal = 4
+       argv_shape = @('python','<k8-shakedown-evidence>','mapping-gate','--mapping','<r-obs-05-mapping>','--output','<gate-output>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Internal tool CLI.' }
+
+    @{ step_id = 'C-43'; class = 'C'; ranges = 'b'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8AutomatedQueries'; callee = "'python'"; call_ordinal = 5
+       argv_shape = @('python','<k8-shakedown-evidence>','r-obs-05','--response','<r-obs-05-response>','--frames','<frames>','--window-start','<window-start>','--window-end','<window-end>','--output','<correlation-output>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Internal tool CLI. The Unresolved/Fail outcome vocabulary is C-5 territory, not this row.' }
+
+    @{ step_id = 'C-44'; class = 'C'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Write-K8ScoringInputTemplate'; callee = "'python'"; call_ordinal = 1
+       argv_shape = @('python','<k8-scoring-input-contract>','emit-template','--range','<range>','--output','<template-path>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Internal tool CLI. The template is intentionally incomplete and must not pass the frozen scorer -- that is C-3, not this row.' }
+
+    @{ step_id = 'C-45'; class = 'C'; ranges = 'c'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Install-K8RangeCDependencies'; callee = "'python'"; call_ordinal = 1
+       argv_shape = @('python','-m','pip','install','-r','<requirements>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Range C validator dependencies.' }
+
+    @{ step_id = 'C-46'; class = 'C'; ranges = 'c'
+       source_file = 'Run-K8ShakedownRangeC.ps1'; producer_scope = '<script-toplevel>'; callee = "'git'"; call_ordinal = 1
+       argv_shape = @('git','-C','<range-c-source>','status','--porcelain')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Cleanliness of the pinned validator worktree.' }
+
+    @{ step_id = 'C-47'; class = 'C'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'python'"; call_ordinal = 2
+       argv_shape = @('python','-m','pip','install','pytest')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Apparatus-test dependency.' }
+
+    @{ step_id = 'C-48'; class = 'C'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'python'"; call_ordinal = 3
+       argv_shape = @('python','-m','pytest','studies/study-01-negative-result/scripts/tests','-q')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'The frozen apparatus integrity test. Non-zero means the packaged apparatus itself is broken, so the run must not start.' }
+
+    @{ step_id = 'C-49'; class = 'C'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'git'"; call_ordinal = 3
+       argv_shape = @('git','init','<range-gen-dir>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Creates .git BEFORE fetch/checkout -- which is exactly how the unborn-HEAD state observed by C-54 arises.' }
+
+    @{ step_id = 'C-50'; class = 'C'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'git'"; call_ordinal = 4
+       argv_shape = @('git','-C','<range-gen-dir>','remote','add','origin','<amenonuboco-url>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Emits nothing on success; the empty output is not an error.' }
+
+    @{ step_id = 'C-51'; class = 'C'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'git'"; call_ordinal = 5
+       argv_shape = @('git','-C','<range-gen-dir>','fetch','--depth=1','origin','<pinned-commit>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Fetch by pinned commit, never by branch name.' }
+
+    @{ step_id = 'C-52'; class = 'C'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'git'"; call_ordinal = 6
+       argv_shape = @('git','-C','<range-gen-dir>','checkout','FETCH_HEAD')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Completes the state C-54 explores for.' }
+
+    @{ step_id = 'C-53'; class = 'C'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'git'"; call_ordinal = 8
+       argv_shape = @('git','clone','--branch','<range-c-tag>','--depth=1','<amenonuboco-url>','<range-c-dir>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Pinned-tag clone for the Range C validator.' }
+
+    @{ step_id = 'C-54'; class = 'C'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'git'"; call_ordinal = 2
+       argv_shape = @('git','-C','<range-gen-dir>','rev-parse','HEAD')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0, 128)
+       exit_note = 'EXPLORATION, not assertion. Reached only when .git exists (the -and short-circuits otherwise), so the reachable non-zero state is an unborn HEAD left by an interrupted C-49 init plus C-51 fetch: git exits 128 while printing "HEAD" on stdout, the comparison against the pinned SHA fails, and the else branch does a clean re-checkout. A blanket non-zero STOP would break Setup. Observing the exit also records that the current correctness rests on git printing a non-SHA string, rather than on the exit code.' }
+
+    @{ step_id = 'C-55'; class = 'C'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'git'"; call_ordinal = 7
+       argv_shape = @('git','-C','<range-c-dir>','rev-parse','HEAD')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0, 128)
+       exit_note = 'Same exploration as C-54, for the Range C validator worktree.' }
+
+    # -- C-56..C-60: version probes that are ALSO prerequisite gates --------
+    # These were classified Informational in an earlier draft of the Plan.
+    # That was wrong and would have DELETED an existing fail-close: the
+    # current code throws "<tool> not found on PATH." from these very
+    # invocations. Class is decided by call-site responsibility, and a site
+    # that stops Setup is not informational.
+    #
+    # The two facts are separated rather than merged:
+    #   the VERSION VALUE is retained and never gated (no frozen source pins
+    #   a version, so gating one would invent a receipt condition)
+    #   the tool being EXECUTABLE is gated, because that is what the existing
+    #   code already gates
+    #
+    # Measured behaviour of the current pattern, on PowerShell 7.6.5 where
+    # $PSNativeCommandUseErrorActionPreference defaults to False:
+    #   command absent            -> CommandNotFoundException -> STOP (correct)
+    #   non-zero, stdout non-empty-> continues silently, exit discarded
+    #   stdout empty              -> STOPs, but only as a side effect of
+    #                                .Trim() on $null, reporting the WRONG
+    #                                reason ("not found on PATH")
+    # So this batch adds a STOP for the second case and fixes the reason for
+    # the third. That is a real, intended widening -- recorded as such.
+
+    @{ step_id = 'C-56'; class = 'C'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'git'"; call_ordinal = 1
+       argv_shape = @('git','--version')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       availability_policy = 'required'; informational_value = $true
+       exit_note = 'Prerequisite gate plus retained version value.' }
+
+    @{ step_id = 'C-57'; class = 'C'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'python'"; call_ordinal = 1
+       argv_shape = @('python','--version')
+       stream_expectation = 'combined'; accepted_exit_codes = @(0)
+       availability_policy = 'required'; informational_value = $true
+       exit_note = 'Prerequisite gate plus retained version value. Captured with 2>&1 because older CPython prints its version to stderr.' }
+
+    @{ step_id = 'C-58'; class = 'C'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'docker'"; call_ordinal = 1
+       argv_shape = @('docker','--version')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       availability_policy = 'required'; informational_value = $true
+       exit_note = 'Prerequisite gate plus retained version value. Client-side only; it does not require the daemon.' }
+
+    @{ step_id = 'C-59'; class = 'C'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'docker'"; call_ordinal = 2
+       argv_shape = @('docker','compose','version')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       availability_policy = 'required'; informational_value = $true
+       exit_note = 'Prerequisite gate: Compose v2 subcommand shape, not the v1 docker-compose binary.' }
+
+    @{ step_id = 'C-60'; class = 'C'; ranges = 'c'
+       source_file = 'Run-K8ShakedownRangeC.ps1'; producer_scope = '<script-toplevel>'; callee = "'python'"; call_ordinal = 1
+       argv_shape = @('python','--version')
+       stream_expectation = 'combined'; accepted_exit_codes = @(0)
+       availability_policy = 'required'; informational_value = $true
+       exit_note = 'Prerequisite gate: Python must be runnable before the single permitted F-35 validator command.' }
+
+    # === Class I -- informational ==========================================
+    # Retained, NEVER gated. Exactly one baseline member: the site that is
+    # already optional in the current code. The five former I rows are now
+    # C-56..C-60 because they gate. I-01..I-04 and I-06 are DELIBERATELY left
+    # as gaps -- renumbering would make the same id mean a different site
+    # across the review history and the implementation.
+
+    @{ step_id = 'I-05'; class = 'I'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = 'Get-K8WslField'; call_ordinal = 1
+       argv_shape = @('wsl.exe','--version')
+       stream_expectation = 'combined'; accepted_exit_codes = $null
+       availability_policy = 'optional'; informational_value = $true
+       observation_fidelity = 'frozen-producer-collapsed'
+       cross_boundary = $true
+       exit_note = 'The ONLY cross-boundary process site: Start-K8Shakedown calls the frozen Study01/tools/K8AttemptCommon.psm1 export Get-K8WslField, which reaches System.Diagnostics.Process.Start via Invoke-Utf16LEProcessCapture. Both the AST and lexical oracles missed this because both matched on known native names and known Shakedown wrapper names; the reachability oracle finds it because it asks a different question. The frozen producer returns "unavailable: exit N : ..." as a STRING, so exit_code and stderr are unrecoverable at the call site -- they are recorded as null rather than reconstructed, the same discipline C-4 applies to combined streams. Study01/ is not modified to fix this.' }
+
+    # -- I-07 / I-08: runtime-installed tool identity ----------------------
+    # Added by this batch. An earlier draft claimed container image identity
+    # fixed the bytes of container-internal tools; frozen
+    # c2-dnp3-image-inventory.md SS1 records that log_structurer INSTALLS
+    # tshark at startup, and SS2 states outright that a bit-identical local
+    # image is not claimed because of "the package-repository state consulted
+    # by apt-get". The same SS1 warns against presenting a runtime package
+    # installation "as a separately pinned package image".
+    #
+    # In-image tools (curl in the pinned Elasticsearch image, tcpdump in the
+    # pinned corfr/tcpdump digest) ARE fixed by image identity. The two tools
+    # whose CLI contract governs a Class F literal -- tshark for SD-09, ip/tc
+    # for SD-11 -- are not, so their identity is observed per run.
+    #
+    # Adding call sites does not break the closed world; only a site MISSING
+    # from the contract does. The contract is 100 rows because of these two.
+
+    @{ step_id = 'I-07'; class = 'I'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'docker'"; call_ordinal = 2
+       argv_shape = @('docker','exec','<log-structurer>','tshark','--version')
+       stream_expectation = 'separated'; accepted_exit_codes = $null
+       availability_policy = 'optional'; informational_value = $true
+       exit_note = 'Identity of the apt-installed tshark that F-01 depends on (SD-09). Taken after Wait-K8LogStructurerReady has already gated the install race. Never gated: no frozen source pins a tshark version, so requiring one would invent a receipt condition. Provenance only -- it does not make the bytes reproducible, which frozen SS2 explicitly does not claim.' }
+
+    @{ step_id = 'I-08'; class = 'I'; ranges = 'ab'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Resolve-K8GatewayInterface'; callee = "'docker'"; call_ordinal = 3
+       argv_shape = @('docker','exec','<router>','ip','-V')
+       stream_expectation = 'separated'; accepted_exit_codes = $null
+       availability_policy = 'optional'; informational_value = $true
+       exit_note = 'Identity of the apt-installed iproute2 that F-02/F-03/F-04 and F-05..F-08 depend on (SD-11). Never gated, for the same reason as I-07.' }
+)
+
+# ---------------------------------------------------------------------------
+# Caller-role rows: which ROLE a generic executor is being used for.
+#
+# SD-13 lives here and nowhere else. Both callers of Invoke-K8TsharkFieldDecode
+# produce an IDENTICAL argv, and -- as the code actually stands -- both hold
+# the pcap in a local variable named `$pcap`. So neither the argv nor the
+# variable NAME distinguishes them, and binding to either would be binding to
+# nothing. What SD-13 actually changed was where `$pcap` came FROM: the
+# function used to read sensor-input/mirror-capture/c2-mirror-sensor.pcap and
+# now reads the auxiliary liveness pcap.
+#
+# So the binding is a PROVENANCE ANCHOR on the assignment, checked through the
+# AST. It is a positive statement ("must derive from the liveness spec"), not
+# a blacklist of the wrong pcap: a blacklist only catches the instance already
+# known.
+# ---------------------------------------------------------------------------
+
+$script:K8CallerRoleContract = @(
+    @{ caller_id = 'CR-01'; process_step_id = 'F-01'; ranges = 'b'
+       producer_scope = 'Write-K8UnrelatedPcapRows'; callee = 'Invoke-K8TsharkFieldDecode'; call_ordinal = 1
+       artifact_role = 'r-obs-05-liveness-pcap'
+       artifact_provenance_anchor = @{ kind = 'derived-from-function'; anchor = 'Get-K8Robs05LivenessSpec' }
+       discriminator = @{ remote_name_hint = '<run-id>-r-obs-05'; display_filter_role = 'unrelated-flow' }
+       governing_sources = @(
+           (New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md' -Clause 'SS4 correlate against the separate liveness pcap')
+           (New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-capture-procedure.md' -Clause 'SS5'))
+       role_note = 'The Sensor pcap can NEVER satisfy this role: its frozen capture filter structurally excludes the unrelated flow, so reading it was both a contract non-conformance and an unsatisfiable gate.' }
+
+    @{ caller_id = 'CR-02'; process_step_id = 'F-01'; ranges = 'ab'
+       producer_scope = 'Write-K8TargetCaptureDecode'; callee = 'Invoke-K8TsharkFieldDecode'; call_ordinal = 1
+       artifact_role = 'target-capture-pcap'
+       artifact_provenance_anchor = @{ kind = 'literal-path-table'; anchor = 'stagePaths'
+           values = @('ground-truth\independent-capture\c2-original-path.pcap', 'sensor-input\mirror-capture\c2-mirror-sensor.pcap') }
+       discriminator = @{ remote_name_hint = '<run-id>-<stage>-decode'; display_filter_role = 'target-flow' }
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/freeze-decision-table.md' -Clause 'SS3 Ground Truth / Sensor row'))
+       role_note = 'Two frozen stage pcaps, selected by -Stage. The value SET is pinned, so adding or renaming a stage path is a contract mismatch.' }
+
+    @{ caller_id = 'CR-03'; process_step_id = 'F-15'; ranges = 'ab'
+       producer_scope = 'Invoke-K8AutomatedQueries'; callee = 'Invoke-K8ElasticsearchRequest'; call_ordinal = 1
+       endpoint_role = 'collector-mapping'
+       discriminator = @{ method = 'GET'; endpoint = 'ot-logs-dnp3-*/_mapping'; body_source = $null
+                          output_artifact = 'collector-output\collector-index-mapping.json' }
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md' -Clause 'SS2 mapping precondition'))
+       role_note = 'Method and endpoint alone do NOT identify this role: CR-07 issues the identical request. The output artifact and the range are what separate them.' }
+
+    @{ caller_id = 'CR-04'; process_step_id = 'F-15'; ranges = 'ab'
+       producer_scope = 'Invoke-K8AutomatedQueries'; callee = 'Invoke-K8ElasticsearchRequest'; call_ordinal = 2
+       endpoint_role = 'rule-mapping'
+       discriminator = @{ method = 'GET'; endpoint = 'ot-signals-zone-violation-*/_mapping'; body_source = $null
+                          output_artifact = 'rule-output\rule-index-mapping.json' }
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md' -Clause 'SS2 mapping precondition'))
+       role_note = 'Rule index absence is admissible here (lazy creation) -- that asymmetry is C-5 policy, not this row.' }
+
+    @{ caller_id = 'CR-05'; process_step_id = 'F-15'; ranges = 'ab'
+       producer_scope = 'Invoke-K8AutomatedQueries'; callee = 'Invoke-K8ElasticsearchRequest'; call_ordinal = 3
+       endpoint_role = 'collector-search'
+       discriminator = @{ method = 'POST'; endpoint = 'ot-logs-dnp3-*/_search'; body_source = 'environment\collector-query.json'
+                          output_artifact = 'collector-output\collector-response.json' }
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md' -Clause 'SS3 fixed request, no retry'))
+       role_note = 'The query body is read from the retained environment file, never rebuilt inline.' }
+
+    @{ caller_id = 'CR-06'; process_step_id = 'F-15'; ranges = 'ab'
+       producer_scope = 'Invoke-K8AutomatedQueries'; callee = 'Invoke-K8ElasticsearchRequest'; call_ordinal = 4
+       endpoint_role = 'rule-search'
+       discriminator = @{ method = 'POST'; endpoint = 'ot-signals-zone-violation-*/_search'; body_source = 'derived:collector-hit-ids'
+                          output_artifact = 'rule-output\rule-response.json' }
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md' -Clause 'SS3 fixed request, no retry'))
+       role_note = 'The only role whose body is DERIVED -- from the CR-05 hit ids. An empty id set is a legitimate observation, and C-5 keeps it from collapsing into a vacuous correlation.' }
+
+    @{ caller_id = 'CR-07'; process_step_id = 'F-15'; ranges = 'b'
+       producer_scope = 'Invoke-K8AutomatedQueries'; callee = 'Invoke-K8ElasticsearchRequest'; call_ordinal = 5
+       endpoint_role = 'r-obs-05-mapping'
+       discriminator = @{ method = 'GET'; endpoint = 'ot-logs-dnp3-*/_mapping'; body_source = $null
+                          output_artifact = 'contract-output\r-obs-05-mapping-response.json' }
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md' -Clause 'SS2 mapping precondition'))
+       role_note = 'Same method and endpoint as CR-03, different role. Mapping absence is NOT admissible here.' }
+
+    @{ caller_id = 'CR-08'; process_step_id = 'F-15'; ranges = 'b'
+       producer_scope = 'Invoke-K8AutomatedQueries'; callee = 'Invoke-K8ElasticsearchRequest'; call_ordinal = 6
+       endpoint_role = 'r-obs-05-search'
+       discriminator = @{ method = 'POST'; endpoint = 'ot-logs-dnp3-*/_search'; body_source = 'environment\r-obs-05-query.json'
+                          output_artifact = 'contract-output\r-obs-05-response.json' }
+       governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md' -Clause 'SS3 fixed request, no retry'))
+       role_note = 'Same method and endpoint as CR-05, different body source and different role.' }
+)
+
+function Get-K8CommandContract { $script:K8CommandContract }
+function Get-K8CallerRoleContract { $script:K8CallerRoleContract }
+
+function Get-K8CommandContractRow {
+    <# The ONE selector. Every gate goes through it, so no two gates can be
+       reading different rows for the same step. #>
+    param([Parameter(Mandatory)][string] $StepId)
+    $row = @($script:K8CommandContract | Where-Object { $_.step_id -eq $StepId })
+    if ($row.Count -ne 1) {
+        throw "C-8 contract defect: step_id '$StepId' matched $($row.Count) rows; every process site must have exactly one."
+    }
+    return $row[0]
+}
+
+function Get-K8CommandContractField {
+    <# Reads an OPTIONAL row field without letting StrictMode turn "the author
+       did not declare this" into a crash, and without letting it turn into a
+       silent default either -- the caller decides what absence means. #>
+    param(
+        [Parameter(Mandatory)] $Row,
+        [Parameter(Mandatory)][string] $Name
+    )
+    if ($Row -is [hashtable] -and $Row.ContainsKey($Name)) { return $Row[$Name] }
+    return $null
+}
+
+function Get-K8RowAcceptedExitCodes {
+    <#
+        Returns the row's declared acceptance domain, and refuses every shape
+        that would let a default creep back in.
+
+        Three declaration forms, all explicit:
+          @(...)      a non-empty integer set -- gate against it
+          'poll-any'  a probe inside a deadline-bounded poll loop: EVERY exit
+                      is a legitimate poll outcome and the gate lives in the
+                      loop, not here
+          $null       Class I -- not gated at all
+
+        `@()` is NOT a fourth form. An empty set means the author never
+        declared an acceptance domain, and that is a STOP: silently treating
+        it as @(0) is exactly the module-wide default this batch removed.
+    #>
+    param([Parameter(Mandatory)] $Row)
+    if (-not ($Row -is [hashtable]) -or -not $Row.ContainsKey('accepted_exit_codes')) {
+        throw "C-8 contract defect: row '$($Row.step_id)' has no accepted_exit_codes field. Every row must state its acceptance domain; there is no module default."
+    }
+    $value = $Row['accepted_exit_codes']
+    if ($null -eq $value) {
+        if ($Row['class'] -ne 'I') {
+            throw "C-8 contract defect: row '$($Row.step_id)' declares accepted_exit_codes = `$null, which means 'not gated' and is reserved for Class I. This row is Class $($Row['class'])."
+        }
+        return $null
+    }
+    if ($value -is [string]) {
+        if ($value -ne $script:K8ExitPollAny) {
+            throw "C-8 contract defect: row '$($Row.step_id)' declares accepted_exit_codes = '$value'; the only permitted string form is '$($script:K8ExitPollAny)'."
+        }
+        if ($Row['class'] -eq 'I') {
+            throw "C-8 contract defect: row '$($Row.step_id)' is Class I and cannot be '$($script:K8ExitPollAny)'; Class I is not gated at all, so it declares `$null."
+        }
+        if (-not (Get-K8CommandContractField -Row $Row -Name 'poll_loop')) {
+            throw "C-8 contract defect: row '$($Row.step_id)' declares '$($script:K8ExitPollAny)' without poll_loop = `$true. That form only exists for a probe whose gate is a loop deadline; without the loop it is just an unchecked exit."
+        }
+        return $script:K8ExitPollAny
+    }
+    $codes = @($value)
+    if ($codes.Count -eq 0) {
+        throw "C-8 contract defect: row '$($Row.step_id)' declares an EMPTY accepted_exit_codes. That is an undeclared acceptance domain, not 'accept nothing'. Declare the codes this call site accepts."
+    }
+    return $codes
+}
+
+function Test-K8ExitAccepted {
+    <# Evaluates one observed exit against one row's declared domain. Never
+       consults a default and never infers one from the class. #>
+    param(
+        [Parameter(Mandatory)] $Row,
+        [Parameter(Mandatory)][int] $ExitCode
+    )
+    $accepted = Get-K8RowAcceptedExitCodes -Row $Row
+    if ($null -eq $accepted) { return $true }                              # Class I: retained, not gated
+    if ($accepted -is [string]) { return $true }                           # poll-any: the loop deadline gates
+    return ($accepted -contains $ExitCode)
+}
+
+function Get-K8FrozenSourcePath {
+    <# Resolves a Study01-relative governing-source path against the packaged
+       Study01 root. Never an absolute path baked into the module: that was a
+       separate finding, and it breaks independent verification from a fresh
+       clone in a different directory. #>
+    param([Parameter(Mandatory)][string] $RelativePath)
+    $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    return (Join-Path (Join-Path $repoRoot 'Study01') ($RelativePath -replace '/', [System.IO.Path]::DirectorySeparatorChar))
+}
+
+function Test-K8SourceIdentityMatch {
+    <#
+        source_identity_match: is the frozen document still the one this
+        contract was authored against?
+
+        This is a SEPARATE FACT from contract_conformance and neither may be
+        inferred from the other. A true here means only "the basis has not
+        moved"; it says nothing about whether the contract transcribes the
+        basis correctly. Asserting otherwise would reproduce SD-11's error
+        (using a different procedure's command while believing oneself
+        frozen-conformant) with machine authority behind it.
+
+        File-level SHA-256, deliberately. Clause-level identity would need the
+        prose parsed, which scope decision D-3 forbids -- a prose parser is a
+        new semantic interpreter, the very thing being removed. The cost is a
+        false positive on an unrelated typo fix, and that direction is the
+        safe one: it asks a human to re-derive.
+    #>
+    param([Parameter(Mandatory)] $Row)
+    $sources = Get-K8CommandContractField -Row $Row -Name 'governing_sources'
+    if (-not $sources) { return $null }                                    # Class C/I: no basis is declared, so none is checked
+    foreach ($source in @($sources)) {
+        $full = Get-K8FrozenSourcePath -RelativePath $source['path']
+        if (-not (Test-Path -LiteralPath $full)) {
+            throw "C-8 source identity STOP for $($Row.step_id): governing source '$($source['path'])' does not exist at $full. The contract cites a basis that is not there; not proceeding."
+        }
+        $actual = (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne $source['sha256']) {
+            throw "C-8 source identity STOP for $($Row.step_id): governing source '$($source['path'])' has changed (expected $($source['sha256']), found $actual). The basis this contract was authored against has moved; a human must re-derive the contract before this step runs. This is NOT a statement that the implementation is wrong."
+        }
+    }
+    return $true
+}
+
+function Test-K8ArgvShapeConformance {
+    <#
+        contract_conformance for the argv: literal positions must match
+        exactly, placeholder positions must merely be present and non-empty.
+
+        The placeholder VALUES are out of scope here -- they are runtime
+        observations, and C-4/C-5/C-6 already own them. What this closes is
+        SD-09 (`separator=/t` rewritten to `separator=\t`) and SD-11
+        (`ip -o -4 addr show` replaced by a different command) as CONTRACT
+        MISMATCHES rather than as blacklist hits, so the next unknown
+        instance of the same error is caught too.
+
+        Returns the mismatching indices; an empty array means conformant.
+    #>
+    param(
+        [Parameter(Mandatory)][string[]] $Shape,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]] $Argv
+    )
+    $mismatches = New-Object System.Collections.Generic.List[int]
+
+    # A trailing '<*>' pins an invariant PREFIX and leaves the tail
+    # unconstrained. Exactly one row needs it: F-15's generic Elasticsearch
+    # executor, whose argv genuinely varies in length (a GET mapping request
+    # carries no -H / --data-binary, a POST search does). The alternative --
+    # padding the shape with optional slots -- would let a role substitution
+    # slide through as a "shorter but conformant" argv.
+    #
+    # It is not a way to stop checking: what the tail CONTAINS is pinned by
+    # the caller-role rows (CR-03..CR-08), which is where request role belongs
+    # anyway. A '<*>' anywhere but last is rejected, so it cannot be used to
+    # wildcard the middle of a command.
+    $variadic = $false
+    for ($i = 0; $i -lt $Shape.Count; $i++) {
+        if ($Shape[$i] -ne '<*>') { continue }
+        if ($i -ne ($Shape.Count - 1)) {
+            throw "C-8 contract defect: '<*>' may appear only as the LAST element of an argv_shape; found it at position $i."
+        }
+        $variadic = $true
+    }
+    if ($variadic) {
+        $prefix = @($Shape[0..($Shape.Count - 2)])
+        if ($Argv.Count -lt $prefix.Count) {
+            for ($i = $Argv.Count; $i -lt $prefix.Count; $i++) { $mismatches.Add($i) }
+        }
+        for ($i = 0; $i -lt [Math]::Min($prefix.Count, $Argv.Count); $i++) {
+            $expected = $prefix[$i]
+            if ($expected -match '^<.*>$') {
+                if ([string]::IsNullOrWhiteSpace($Argv[$i])) { $mismatches.Add($i) }
+            }
+            elseif ($Argv[$i] -cne $expected) { $mismatches.Add($i) }
+        }
+        return $mismatches.ToArray()
+    }
+
+    if ($Shape.Count -ne $Argv.Count) {
+        # A length difference is itself the finding; report every position
+        # beyond the shorter of the two rather than silently truncating.
+        for ($i = [Math]::Min($Shape.Count, $Argv.Count); $i -lt [Math]::Max($Shape.Count, $Argv.Count); $i++) {
+            $mismatches.Add($i)
+        }
+    }
+    for ($i = 0; $i -lt [Math]::Min($Shape.Count, $Argv.Count); $i++) {
+        $expected = $Shape[$i]
+        if ($expected -match '^<.*>$') {
+            if ([string]::IsNullOrWhiteSpace($Argv[$i])) { $mismatches.Add($i) }
+        }
+        elseif ($Argv[$i] -cne $expected) { $mismatches.Add($i) }
+    }
+    # Callers MUST wrap this in @(): an empty result unrolls to $null on the
+    # way out, and the conformant case is exactly the empty case. Wrapping it
+    # here as well (`return ,`) would nest the array one level deeper and
+    # break the [int[]] parameter that receives it.
+    return $mismatches.ToArray()
+}
+
+function New-K8PreExecutionConformanceFailure {
+    <#
+        The pre-execution violation record.
+
+        The command HAS NOT RUN. So `argv`, `exit_code`, `stdout` and `stderr`
+        -- the Batch 1 fields whose meaning is "an executed command's
+        semantics" -- are not merely null here, they are ABSENT. Putting the
+        planned argv into `argv` would record an unexecuted command as an
+        executed one, which is precisely the fabrication C-1 exists to
+        prevent.
+
+        The diagnostic therefore lives in its own `conformance` block, and the
+        planned argv is called `proposed_argv`, never `observed_argv`: nothing
+        was observed.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $StepId,
+        [Parameter(Mandatory)][string[]] $ExpectedArgv,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]] $ProposedArgv,
+        [Parameter(Mandatory)][AllowEmptyCollection()][int[]] $MismatchIndices,
+        [Parameter(Mandatory)][string] $Message
+    )
+    $failure = New-Object System.Management.Automation.ErrorRecord(
+        [System.Exception]::new($Message), 'K8CommandContractViolation',
+        [System.Management.Automation.ErrorCategory]::InvalidOperation, $null)
+    $failure.Exception.Data['k8_conformance'] = [ordered]@{
+        step_id          = $StepId
+        expected_argv    = @($ExpectedArgv)
+        proposed_argv    = @($ProposedArgv)
+        mismatch_indices = @($MismatchIndices)
+    }
+    return $failure.Exception
+}
+
+function Assert-K8CommandContract {
+    <#
+        The PRE-EXECUTION gate.
+
+        Everything decidable before the process starts is decided here, and a
+        violation stops the run BEFORE any side effect exists. Deciding later
+        would mean the command has already changed the range.
+
+        For Class F this includes source_identity_match: a scientific step
+        must not run while the frozen document that governs it has moved.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $StepId,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]] $Argv
+    )
+    $row = Get-K8CommandContractRow -StepId $StepId
+
+    # Fails closed if the row declares no acceptance domain at all, before the
+    # command has a chance to run unchecked.
+    [void](Get-K8RowAcceptedExitCodes -Row $row)
+
+    [void](Test-K8SourceIdentityMatch -Row $row)
+
+    # @() around the call: a PowerShell function returning an EMPTY array
+    # unrolls it to $null, and $null.Count throws under Set-StrictMode. The
+    # conformant case is exactly the empty case, so without this the gate
+    # fails on every well-formed command.
+    $mismatches = @(Test-K8ArgvShapeConformance -Shape @($row['argv_shape']) -Argv $Argv)
+    if ($mismatches.Count -gt 0) {
+        $detail = ($mismatches | ForEach-Object {
+            $e = if ($_ -lt $row['argv_shape'].Count) { $row['argv_shape'][$_] } else { '<absent>' }
+            $a = if ($_ -lt $Argv.Count) { $Argv[$_] } else { '<absent>' }
+            "[$_] expected '$e', proposed '$a'"
+        }) -join '; '
+        throw (New-K8PreExecutionConformanceFailure -StepId $StepId `
+            -ExpectedArgv @($row['argv_shape']) -ProposedArgv @($Argv) -MismatchIndices $mismatches `
+            -Message "C-8 pre-execution contract violation at $StepId : the command was NOT run. $detail")
+    }
+    return $row
+}
+
+function Assert-K8CommandObservation {
+    <#
+        The POST-OBSERVATION gate: only what cannot be known before the
+        process ran.
+
+        The acceptance domain is per call site and has no default. That is not
+        a stylistic choice -- a module-wide @(0) would hand every site the
+        receipt condition "non-zero is failure", which no frozen source states
+        and which is wrong in BOTH directions in this codebase (F-35 expects
+        exit 1; C-54 accepts 128). What is bounded here is "the command ran
+        and returned a CLI-meaningful result", never "the science passed".
+    #>
+    param(
+        [Parameter(Mandatory)][string] $StepId,
+        [Parameter(Mandatory)][int] $ExitCode,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]] $Argv,
+        [AllowNull()][AllowEmptyString()][string] $Diagnostic
+    )
+    $row = Get-K8CommandContractRow -StepId $StepId
+    if (Test-K8ExitAccepted -Row $row -ExitCode $ExitCode) { return $row }
+
+    $accepted = Get-K8RowAcceptedExitCodes -Row $row
+    $argvDisplay = ($Argv | ForEach-Object { if ($_ -match '\s') { "'$_'" } else { $_ } }) -join ' '
+    throw (New-K8CommandFailure -Argv @($Argv) -ExitCode $ExitCode `
+        -CombinedOutput $Diagnostic `
+        -Message ("C-8 exit-domain violation at {0}: exit {1} is outside this call site's declared acceptance domain ({2}). {3}{4}" -f `
+            $StepId, $ExitCode, ($accepted -join ','), $argvDisplay,
+            $(if ($row['exit_note']) { "  # $($row['exit_note'])" } else { '' })))
+}
+
+# ---------------------------------------------------------------------------
 # Fail-closed helpers -- these throw rather than "fixing" anything, per the
 # Shakedown rule: the runner records and stops, it does not repair.
 # ---------------------------------------------------------------------------
 
 function Invoke-K8ShakedownCommand {
     <#
-        Runs an external command, logs its argv/exit code, and throws on a
-        non-zero exit unless -AllowExitCodes lists it. Never retries and never
-        substitutes a different command on failure.
+        Runs an external command, logs its argv/exit code, and throws when the
+        exit falls outside the acceptance domain THIS CALL SITE declared in the
+        C-8 contract. Never retries and never substitutes a different command
+        on failure.
+
+        There is no -AllowExitCodes parameter and no default acceptance domain.
+        The removed `-AllowExitCodes = @(0)` handed every caller the receipt
+        condition "non-zero is failure", which no frozen source states and
+        which is wrong in both directions in this codebase: F-35 EXPECTS exit
+        1 (and treats exit 0 as a scientific observation, not a tooling
+        error), and C-54 accepts 128. The domain now comes from the row named
+        by -StepId, so it is per site, declared, and reviewable.
     #>
     param(
+        [Parameter(Mandatory)][string] $StepId,
         [Parameter(Mandatory)][string] $FilePath,
         [string[]] $ArgumentList = @(),
-        [int[]] $AllowExitCodes = @(0),
         [string] $Description = ''
     )
+    $argv = @($FilePath) + @($ArgumentList)
+    # PRE-EXECUTION: everything decidable before a side effect exists. For
+    # Class F this also verifies that the governing frozen document has not
+    # moved -- a scientific step must not run against a shifted basis.
+    [void](Assert-K8CommandContract -StepId $StepId -Argv $argv)
+
     $argvDisplay = ($ArgumentList | ForEach-Object { if ($_ -match '\s') { "'$_'" } else { $_ } }) -join ' '
-    Write-K8ShakedownLog -Level STEP -Message "RUN: $FilePath $argvDisplay $(if ($Description) { "  # $Description" })"
+    Write-K8ShakedownLog -Level STEP -Message "RUN[$StepId]: $FilePath $argvDisplay $(if ($Description) { "  # $Description" })"
     # Assign directly rather than Tee-Object -Variable: Tee-Object never
     # creates its target variable when the pipeline emits zero objects (a
     # silent command, e.g. `git remote add`), which under Set-StrictMode
@@ -1852,13 +3109,16 @@ function Invoke-K8ShakedownCommand {
     $exit = $LASTEXITCODE
     $output | ForEach-Object { Write-K8ShakedownLog -Message "  | $_" }
     Write-K8ShakedownLog -Message "EXIT: $exit"
-    if ($AllowExitCodes -notcontains $exit) {
+    $row = Get-K8CommandContractRow -StepId $StepId
+    if (-not (Test-K8ExitAccepted -Row $row -ExitCode $exit)) {
         # This capture is `2>&1`, so what it holds is a COMBINED transcript.
         # It is recorded as combined_output, never as stdout.
         throw (New-K8CommandFailure `
-            -Argv (@($FilePath) + @($ArgumentList)) -ExitCode $exit `
+            -Argv $argv -ExitCode $exit `
             -CombinedOutput ((@($output) | ForEach-Object { "$_" }) -join "`n") `
-            -Message "Command failed (exit $exit, expected one of $($AllowExitCodes -join ',')): $FilePath $argvDisplay")
+            -Message ("C-8 exit-domain violation at {0}: exit {1} is outside this call site's declared acceptance domain ({2}): {3} {4}{5}" -f `
+                $StepId, $exit, ((Get-K8RowAcceptedExitCodes -Row $row) -join ','), $FilePath, $argvDisplay,
+                $(if ($row['exit_note']) { "  # $($row['exit_note'])" } else { '' })))
     }
     return [pscustomobject]@{ ExitCode = $exit; Output = $output }
 }
@@ -1894,9 +3154,11 @@ function Invoke-K8SeparatedNativeCapture {
         diagnostic rather than discarding it.
     #>
     param(
+        [Parameter(Mandatory)][string] $StepId,
         [Parameter(Mandatory)][string] $FilePath,
         [string[]] $ArgumentList = @()
     )
+    [void](Assert-K8CommandContract -StepId $StepId -Argv (@($FilePath) + @($ArgumentList)))
     $stderrFile = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-stderr-" + [guid]::NewGuid().ToString('N') + '.txt')
     try {
         $stdout = @(& $FilePath @ArgumentList 2>$stderrFile)
@@ -1906,7 +3168,286 @@ function Invoke-K8SeparatedNativeCapture {
     finally {
         Remove-Item $stderrFile -ErrorAction SilentlyContinue
     }
-    return [pscustomobject]@{ Stdout = $stdout; Stderr = $(if ($stderr) { $stderr } else { '' }); ExitCode = $exitCode }
+    # The exit code is RETURNED, not gated here: several callers read it as a
+    # readiness signal inside a poll loop, where a non-zero is the ordinary
+    # "not ready yet". Those rows declare 'poll-any' and the loop's deadline
+    # is the real gate. Callers that do gate call Assert-K8CommandObservation.
+    return [pscustomobject]@{ Stdout = $stdout; Stderr = $(if ($stderr) { $stderr } else { '' }); ExitCode = $exitCode; StepId = $StepId }
+}
+
+function Invoke-K8ContractedNative {
+    <#
+        The conversion target for the 31 call sites that used to start a
+        process WITHOUT going through any helper -- a bare `docker compose ps
+        -q ...` inside a sub-expression, a `docker cp ... | Out-Null`, a
+        `git rev-parse HEAD 2>$null`.
+
+        What those sites had in common was not that they failed, but that
+        their failures were INVISIBLE. `docker compose ps -q` returns an empty
+        string when it cannot reach the daemon, and the caller then reports
+        "container could not be resolved" -- a diagnostic that names the wrong
+        cause. `docker cp ... | Out-Null` discarded the result completely.
+        `2>$null` threw stderr away along with the exit code.
+
+        This helper does not change WHAT those sites do. It makes the exit
+        code an observed value, evaluated against the acceptance domain the
+        row declares, so a failure stops where its cause is still legible.
+
+        Stream semantics come FROM the contract row, so a site cannot quietly
+        capture combined output while its row claims separated streams:
+          separated  stdout and stderr captured apart (the row's default,
+                     used wherever stdout is parsed as data)
+          combined   `2>&1`, which is correct for a transcript a human reads
+                     and is recorded as combined_output -- never as stdout,
+                     because the merge destroyed the distinction (C-4).
+    #>
+    param(
+        [Parameter(Mandatory)][string] $StepId,
+        [Parameter(Mandatory)][string] $FilePath,
+        [string[]] $ArgumentList = @()
+    )
+    $row = Assert-K8CommandContract -StepId $StepId -Argv (@($FilePath) + @($ArgumentList))
+    $timestamp = (Get-Date).ToUniversalTime().ToString('o')
+
+    if ($row['stream_expectation'] -eq 'combined') {
+        $PSNativeCommandUseErrorActionPreference = $false
+        $merged = @(& $FilePath @ArgumentList 2>&1)
+        $exit = $LASTEXITCODE
+        $result = [pscustomobject]@{
+            StepId = $StepId; ExitCode = $exit; TimestampUtc = $timestamp
+            Stdout = $null; Stderr = $null
+            Combined = (($merged | ForEach-Object { "$_" }) -join "`n")
+        }
+        $diagnostic = $result.Combined
+    }
+    else {
+        $capture = Invoke-K8SeparatedNativeCapture -StepId $StepId -FilePath $FilePath -ArgumentList $ArgumentList
+        $result = [pscustomobject]@{
+            StepId = $StepId; ExitCode = $capture.ExitCode; TimestampUtc = $timestamp
+            Stdout = (($capture.Stdout | Out-String)); Stderr = $capture.Stderr
+            Combined = $null
+        }
+        $diagnostic = "stdout: $($result.Stdout)`nstderr: $($result.Stderr)"
+    }
+
+    [void](Assert-K8CommandObservation -StepId $StepId -ExitCode $result.ExitCode `
+        -Argv (@($FilePath) + @($ArgumentList)) -Diagnostic $diagnostic)
+    return $result
+}
+
+function Get-K8ContractedNativeText {
+    <# The common shape at the converted sites: run under contract, then take
+       the trimmed text. Separate from Invoke-K8ContractedNative so the exit
+       observation cannot be skipped by a caller that only wants the text. #>
+    param(
+        [Parameter(Mandatory)][string] $StepId,
+        [Parameter(Mandatory)][string] $FilePath,
+        [string[]] $ArgumentList = @()
+    )
+    $r = Invoke-K8ContractedNative -StepId $StepId -FilePath $FilePath -ArgumentList $ArgumentList
+    $text = $(if ($null -ne $r.Combined) { $r.Combined } else { $r.Stdout })
+    return $(if ($null -eq $text) { '' } else { ([string]$text).Trim() })
+}
+
+function Get-K8RequiredToolVersion {
+    <#
+        A version probe that is ALSO a prerequisite gate (C-56..C-60).
+
+        These sites were nearly classified Informational, which would have
+        DELETED an existing fail-close: the current code throws
+        "<tool> not found on PATH." from these very invocations. Class follows
+        call-site responsibility, and a site that stops Setup is not
+        informational. So the two facts are separated instead of merged:
+
+          the VERSION VALUE is retained and never gated -- no frozen source
+          pins a tool version, and gating one would invent a receipt condition
+          the tool being EXECUTABLE is gated, because that is what the code
+          already gated
+
+        Measured behaviour of the pattern being replaced, on PowerShell 7.6.5
+        where $PSNativeCommandUseErrorActionPreference defaults to False:
+          command absent             -> CommandNotFoundException -> STOP (right)
+          non-zero, stdout non-empty -> CONTINUED silently, exit discarded
+          stdout empty               -> STOPped, but only because .Trim() hit
+                                        $null, reporting "not found on PATH"
+                                        which was the WRONG reason
+
+        This widens the gate for the second case and fixes the reason for the
+        third. That is a real, intended increase in STOP conditions, recorded
+        as such rather than described as merely "a better message".
+    #>
+    param(
+        [Parameter(Mandatory)][string] $StepId,
+        [Parameter(Mandatory)][string] $FilePath,
+        [string[]] $ArgumentList = @(),
+        [Parameter(Mandatory)][string] $Requirement
+    )
+    try { $result = Invoke-K8ContractedNative -StepId $StepId -FilePath $FilePath -ArgumentList $ArgumentList }
+    catch [System.Management.Automation.CommandNotFoundException] {
+        throw "$FilePath not found on PATH. $Requirement (C-8 $StepId, availability_policy=required)."
+    }
+    $value = $(if ($null -ne $result.Combined) { $result.Combined } else { $result.Stdout })
+    $value = $(if ($null -eq $value) { '' } else { ([string]$value).Trim() })
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        # Distinct from "not found": the binary IS on PATH and DID run. Saying
+        # "not found on PATH" here -- which the previous code did, as a side
+        # effect of .Trim() on $null -- sends the operator after the wrong
+        # problem.
+        throw "$FilePath is present and ran (exit $($result.ExitCode)) but produced NO version output. This is not a missing binary; it is a broken or unexpected installation. $Requirement (C-8 $StepId)."
+    }
+    return [ordered]@{
+        step_id = $StepId; status = 'succeeded'; value = $value
+        exit_code = $result.ExitCode; observation_fidelity = 'full'
+        availability_policy = 'required'
+    }
+}
+
+function Get-K8CollapsedToolObservation {
+    <#
+        The Class I probe for a site whose EXIT AND STDERR ARE UNRECOVERABLE.
+
+        Exactly one member: I-05. It reaches wsl.exe through the FROZEN
+        Study01 export Get-K8WslField, which returns "unavailable: exit N :
+        ..." as a STRING rather than throwing. The exit code and stderr are
+        folded into prose inside frozen code this batch must not modify, so
+        the call site genuinely cannot recover them. They are recorded as
+        null.
+
+        Reconstructing them would be inventing an observation that was never
+        made -- the same rule C-4 applies when `2>&1` destroys the stdout /
+        stderr distinction.
+
+        This is a SEPARATE function from Get-K8OptionalToolObservation on
+        purpose. Making the degraded fidelity a parameter of one shared
+        function is how I-07/I-08 came to declare `full` while silently
+        discarding their exit code: the caller chose a label, and nothing
+        checked that the record matched it. Here the shape follows from which
+        function was called.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $StepId,
+        [Parameter(Mandatory)][scriptblock] $Probe
+    )
+    $record = [ordered]@{
+        step_id = $StepId; status = 'not-found'; value = $null
+        exit_code = $null; stdout = $null; stderr = $null
+        observation_fidelity = 'frozen-producer-collapsed'
+        availability_policy = 'optional'
+    }
+    try {
+        $raw = & $Probe
+        if ($null -eq $raw -or [string]::IsNullOrWhiteSpace([string]$raw)) { return $record }
+        $text = ([string]$raw).Trim()
+        # The frozen producer signals failure IN BAND. Recording that as
+        # 'succeeded' would convert "could not observe" into "observed".
+        $record['status'] = $(if ($text -like 'unavailable:*') { 'unavailable' } else { 'succeeded' })
+        $record['value'] = $text
+    }
+    catch { $record['status'] = 'unavailable'; $record['value'] = $_.Exception.Message }
+    return $record
+}
+
+function Get-K8OptionalToolObservation {
+    <#
+        The Class I probe for a site whose exit code and streams ARE
+        observable -- I-07 (tshark inside log_structurer) and I-08 (iproute2
+        inside wan_router).
+
+        These run through the ordinary contracted path, so the real exit code
+        and both streams come back. Declaring `observation_fidelity: full`
+        while keeping only stdout would be the same defect C-4 forbids in the
+        other direction: claiming an observation richer than the one made.
+        Everything obtained is retained.
+
+        Never gates. A non-zero exit is recorded as `unavailable`, a missing
+        binary as `not-found`, and the run continues in both cases: no frozen
+        source pins these versions, so making one a stopping condition would
+        invent an acceptance condition. What it does NOT do is call a failure
+        a success -- `status` is derived from what was actually observed.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $StepId,
+        [Parameter(Mandatory)][string] $FilePath,
+        [string[]] $ArgumentList = @()
+    )
+    $record = [ordered]@{
+        step_id = $StepId; status = 'not-found'; value = $null
+        exit_code = $null; stdout = $null; stderr = $null
+        observation_fidelity = 'full'
+        availability_policy = 'optional'
+    }
+    try {
+        # Class I rows declare accepted_exit_codes = $null, so the contracted
+        # path observes the exit without gating on it. A non-zero therefore
+        # returns here rather than throwing.
+        $result = Invoke-K8ContractedNative -StepId $StepId -FilePath $FilePath -ArgumentList $ArgumentList
+    }
+    # "the binary is not there" and "the binary ran and failed" are different
+    # observations and must not collapse into one status.
+    catch [System.Management.Automation.CommandNotFoundException] { return $record }
+    catch {
+        $record['status'] = 'unavailable'; $record['value'] = $_.Exception.Message
+        return $record
+    }
+
+    $record['exit_code'] = $result.ExitCode
+    $stdout = $(if ($null -eq $result.Stdout) { $null } else { ([string]$result.Stdout).Trim() })
+    $stderr = $(if ($null -eq $result.Stderr) { $null } else { ([string]$result.Stderr).Trim() })
+    $record['stdout'] = $stdout
+    $record['stderr'] = $stderr
+    $record['value'] = $(if ($null -ne $result.Combined) { ([string]$result.Combined).Trim() } else { $stdout })
+
+    if ($result.ExitCode -ne 0) { $record['status'] = 'unavailable' }
+    elseif ([string]::IsNullOrWhiteSpace($record['value'])) {
+        # Ran cleanly and said nothing. That is not a version observation, and
+        # calling it 'succeeded' would put an empty string on record as one.
+        $record['status'] = 'unavailable'
+    }
+    else { $record['status'] = 'succeeded' }
+    return $record
+}
+
+function Write-K8ToolVersionRecord {
+    <#
+        Copies the setup-time tool observations into the run's control-plane
+        record. NOT into the evidence tree: a tool version is execution-
+        environment provenance, not a scientific observation, and Batch 1
+        fixed that separation.
+
+        No new process starts here. The values were observed during Setup and
+        are COPIED, so `capture_phase` says 'setup' -- omitting it would let a
+        reader take a setup-time reading for a run-time one.
+
+        Container-internal tools are deliberately absent from this record.
+        In-image tools (curl, tcpdump) are already fixed by the pinned image
+        identity. The two whose CLI contract governs a Class F literal --
+        tshark for SD-09, iproute2 for SD-11 -- are apt-installed at container
+        startup and are therefore NOT fixed by image identity; they are
+        observed per run by I-07 / I-08 instead. Frozen
+        c2-dnp3-image-inventory.md SS2 states outright that a bit-identical
+        local image is not claimed, precisely because of apt repository state.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RunId,
+        [Parameter(Mandatory)] $Records,
+        [string] $CapturePhase = 'setup'
+    )
+    $dir = Join-Path (Get-K8RunRecordsDir) $RunId
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    # One file per capture phase. Setup-time host versions and run-time
+    # container versions are observations of DIFFERENT moments, and writing
+    # both to one name would silently keep only the last.
+    $target = Join-Path $dir "tool-versions.$CapturePhase.json"
+    $record = [ordered]@{
+        schema        = 'k8shakedown-tool-versions/1'
+        run_id        = $RunId
+        capture_phase = $CapturePhase
+        gated         = $false
+        note          = 'Version VALUES are retained and never gated: no frozen source pins a tool version, so requiring one would invent an acceptance condition. Required tools are gated on being executable, which is a different fact.'
+        tools         = @($Records)
+    }
+    ($record | ConvertTo-Json -Depth 8) + "`n" | Set-Content -LiteralPath $target -Encoding utf8NoBOM
+    return $target
 }
 
 function ConvertTo-K8PythonExecOneLiner {
@@ -1946,23 +3487,25 @@ function Invoke-K8ShakedownLoggedCommand {
        to a per-run Shakedown runtime log outside the scientific evidence tree.
        Only failures echo a bounded tail to the console. #>
     param(
+        [Parameter(Mandatory)][string] $StepId,
         [Parameter(Mandatory)][string] $FilePath,
         [string[]] $ArgumentList = @(),
         [Parameter(Mandatory)][string] $LogPath,
         [string] $Description = '',
         [int] $FailureTailLines = 50
     )
+    $row = Assert-K8CommandContract -StepId $StepId -Argv (@($FilePath) + @($ArgumentList))
     $argvDisplay = ($ArgumentList | ForEach-Object { if ($_ -match '\s') { "'$_'" } else { $_ } }) -join ' '
     $parent = Split-Path -Parent $LogPath
     New-Item -ItemType Directory -Force -Path $parent | Out-Null
-    Write-K8ShakedownLog -Level STEP -Message "RUN: $FilePath $argvDisplay $(if ($Description) { "  # $Description" }) (full output: $LogPath)"
+    Write-K8ShakedownLog -Level STEP -Message "RUN[$StepId]: $FilePath $argvDisplay $(if ($Description) { "  # $Description" }) (full output: $LogPath)"
     # Inspect the native exit code ourselves so a host-level preference cannot
     # throw before the bounded failure-tail/reporting path runs.
     $PSNativeCommandUseErrorActionPreference = $false
     & $FilePath @ArgumentList *> $LogPath
     $exit = $LASTEXITCODE
     Write-K8ShakedownLog -Message "EXIT: $exit (full output: $LogPath)"
-    if ($exit -ne 0) {
+    if (-not (Test-K8ExitAccepted -Row $row -ExitCode $exit)) {
         Write-K8ShakedownLog -Level ERROR -Message "Command failed; last $FailureTailLines log lines follow:"
         Get-Content -LiteralPath $LogPath -Tail $FailureTailLines | ForEach-Object {
             Write-K8ShakedownLog -Level ERROR -Message "  | $_"
@@ -1974,7 +3517,8 @@ function Invoke-K8ShakedownLoggedCommand {
             -Argv (@($FilePath) + @($ArgumentList)) -ExitCode $exit `
             -CombinedOutput $(if (Test-Path -LiteralPath $LogPath) { Get-Content -LiteralPath $LogPath -Raw } else { '' }) `
             -LogPath $LogPath `
-            -Message "Command failed (exit $exit): $FilePath $argvDisplay. Full Shakedown runtime log: $LogPath")
+            -Message ("C-8 exit-domain violation at {0}: exit {1} is outside this call site's declared acceptance domain ({2}): {3} {4}. Full Shakedown runtime log: {5}" -f `
+                $StepId, $exit, ((Get-K8RowAcceptedExitCodes -Row $row) -join ','), $FilePath, $argvDisplay, $LogPath))
     }
     return [pscustomobject]@{ ExitCode=$exit; LogPath=$LogPath }
 }
@@ -1990,7 +3534,7 @@ function Assert-K8PinnedCommit {
         [Parameter(Mandatory)][string] $ExpectedCommit,
         [Parameter(Mandatory)][string] $Label
     )
-    $actual = (git -C $WorktreePath rev-parse HEAD).Trim()
+    $actual = Get-K8ContractedNativeText -StepId 'C-03' -FilePath 'git' -ArgumentList @('-C', $WorktreePath, 'rev-parse', 'HEAD')
     if ($actual -ne $ExpectedCommit) {
         throw "$Label`: expected pinned commit $ExpectedCommit, found $actual at $WorktreePath. Not proceeding -- this is a STOP condition, not something to auto-fix."
     }
@@ -2036,7 +3580,7 @@ function Install-K8RangeCDependencies {
     try {
         $env:PYTHONUTF8 = '1'
         Write-K8ShakedownLog -Message "Installing Range C dependencies with PYTHONUTF8=1 (cp932 decode fix) from $RequirementsPath"
-        Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @('-m', 'pip', 'install', '-r', $RequirementsPath) `
+        Invoke-K8ShakedownCommand -StepId 'C-45' -FilePath 'python' -ArgumentList @('-m', 'pip', 'install', '-r', $RequirementsPath) `
             -Description 'Range C validator dependencies (locale-safe decode)'
     }
     finally {
@@ -2130,7 +3674,7 @@ function Get-K8ExpectedServices {
         [Parameter(Mandatory)][string] $RunId,
         [Parameter(Mandatory)][string] $ComposePath
     )
-    $capture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'config', '--services')
+    $capture = Invoke-K8SeparatedNativeCapture -StepId 'C-04' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'config', '--services')
     if ($capture.ExitCode -ne 0) {
         throw "'docker compose config --services' failed for $ComposePath (exit $($capture.ExitCode)). stderr: $($capture.Stderr.Trim())"
     }
@@ -2404,7 +3948,7 @@ function Wait-K8ElasticsearchReady {
         [int] $PollSeconds = 3
     )
     $envDir = Join-Path $RunEvidence 'environment'
-    $container = (docker compose -p $RunId -f $ComposePath ps -q elasticsearch | Out-String).Trim()
+    $container = Get-K8ContractedNativeText -StepId 'C-05' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '-q', 'elasticsearch')
     if ([string]::IsNullOrWhiteSpace($container)) {
         throw 'Elasticsearch container could not be resolved for the application-readiness gate; not proceeding to capture/trigger.'
     }
@@ -2420,7 +3964,7 @@ function Wait-K8ElasticsearchReady {
         # -w's output), not a raw embedded newline byte in the argument --
         # curl documents this escape specifically so callers never have to
         # smuggle a literal control character through a shell/argv boundary.
-        $healthCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $container, 'curl', '-sS', '--max-time', '5', '-w', "\n${marker}:%{http_code}", 'http://localhost:9200/_cluster/health')
+        $healthCapture = Invoke-K8SeparatedNativeCapture -StepId 'C-06' -FilePath 'docker' -ArgumentList @('exec', $container, 'curl', '-sS', '--max-time', '5', '-w', "\n${marker}:%{http_code}", 'http://localhost:9200/_cluster/health')
         $raw = ($healthCapture.Stdout | Out-String)
         $curlExit = $healthCapture.ExitCode
         $record = [ordered]@{ attempt_utc=$attemptStart; curl_exit=$curlExit; curl_stderr=$healthCapture.Stderr.Trim(); http_status=$null; cluster_status=$null; body_parsed=$false }
@@ -2498,7 +4042,7 @@ function Get-K8Dnp3OperationalCanaryHits {
         [Parameter(Mandatory)][string] $RunId,
         [Parameter(Mandatory)][string] $ComposePath
     )
-    $container = (docker compose -p $RunId -f $ComposePath ps -q elasticsearch | Out-String).Trim()
+    $container = Get-K8ContractedNativeText -StepId 'C-07' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '-q', 'elasticsearch')
     if ([string]::IsNullOrWhiteSpace($container)) {
         throw 'elasticsearch container could not be resolved for the operational-canary readiness check'
     }
@@ -2512,7 +4056,7 @@ function Get-K8Dnp3OperationalCanaryHits {
     # merged into the body+marker text this regex parses. As above, `\n` is
     # curl's OWN -w escape (expanded by curl itself), not a raw embedded
     # newline byte in the argument.
-    $canaryCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $container, 'curl', '-sS', '--max-time', '5', '-X', 'POST', 'http://localhost:9200/ot-logs-dnp3-*/_search', '-H', 'Content-Type: application/json', '--data-binary', $query, '-w', "\n${marker}:%{http_code}")
+    $canaryCapture = Invoke-K8SeparatedNativeCapture -StepId 'C-08' -FilePath 'docker' -ArgumentList @('exec', $container, 'curl', '-sS', '--max-time', '5', '-X', 'POST', 'http://localhost:9200/ot-logs-dnp3-*/_search', '-H', 'Content-Type: application/json', '--data-binary', $query, '-w', "\n${marker}:%{http_code}")
     $raw = ($canaryCapture.Stdout | Out-String)
     $curlExit = $canaryCapture.ExitCode
     if ($curlExit -ne 0 -or $raw -notmatch "(?s)^(.*)\r?\n${marker}:(\d+)\s*$") {
@@ -2598,7 +4142,7 @@ function Wait-K8LogStructurerReady {
         [int] $PollSeconds = 3
     )
     $envDir = Join-Path $RunEvidence 'environment'
-    $container = (docker compose -p $RunId -f $ComposePath ps -q log_structurer | Out-String).Trim()
+    $container = Get-K8ContractedNativeText -StepId 'C-09' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '-q', 'log_structurer')
     if ([string]::IsNullOrWhiteSpace($container)) {
         throw 'log_structurer container could not be resolved for the application-readiness gate; not proceeding to capture/trigger.'
     }
@@ -2607,7 +4151,7 @@ function Wait-K8LogStructurerReady {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         $attemptStart = (Get-Date).ToUniversalTime().ToString('o')
-        $dump = @((docker exec $container sh -lc $probe 2>&1 | Out-String) -split "`n")
+        $dump = @((Get-K8ContractedNativeText -StepId 'C-10' -FilePath 'docker' -ArgumentList @('exec', $container, 'sh', '-lc', $probe)) -split "`n")
         $tsharkLive = [bool]($dump | Where-Object { $_ -match 'tshark' -and $_ -match 'dnp3' })
         $bulkLoaderLive = [bool]($dump | Where-Object { $_ -match 'bulk_loader\.py' -and $_ -match 'dnp3' })
         $canaryHitCount = 0
@@ -2625,7 +4169,12 @@ function Wait-K8LogStructurerReady {
             [ordered]@{ gate='log-structurer-dnp3-functional-readiness'; result='PASS'; container=$container; attempts=$attempts } |
                 ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $envDir 'log-structurer-readiness.json') -Encoding utf8NoBOM
             Write-K8ShakedownLog -Message "log_structurer functional readiness PASS after $($attempts.Count) attempt(s): pipeline processes live AND $canaryHitCount operational-canary document(s) observed in ot-logs-dnp3-*."
-            return
+            # Returned so the caller can observe I-07 (the apt-installed tshark
+            # identity) WITHOUT resolving the container a second time. A second
+            # resolution would be a process site the contract does not have,
+            # and adding an unlisted site is precisely what breaks the closed
+            # world -- unlike adding a LISTED one, which does not.
+            return $container
         }
         Start-Sleep -Seconds $PollSeconds
     }
@@ -2711,7 +4260,7 @@ function Wait-K8ZoneDetectorReady {
         [int] $PollSeconds = 3
     )
     $envDir = Join-Path $RunEvidence 'environment'
-    $container = (docker compose -p $RunId -f $ComposePath ps -q zone_detector | Out-String).Trim()
+    $container = Get-K8ContractedNativeText -StepId 'C-11' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '-q', 'zone_detector')
     if ([string]::IsNullOrWhiteSpace($container)) {
         throw 'zone_detector container could not be resolved for the application-readiness gate; not proceeding to capture/trigger.'
     }
@@ -2720,12 +4269,12 @@ function Wait-K8ZoneDetectorReady {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         $attemptStart = (Get-Date).ToUniversalTime().ToString('o')
-        $dump = @((docker exec $container sh -lc $probe 2>&1 | Out-String) -split "`n")
+        $dump = @((Get-K8ContractedNativeText -StepId 'C-12' -FilePath 'docker' -ArgumentList @('exec', $container, 'sh', '-lc', $probe)) -split "`n")
         $pluginLive = [bool]($dump | Where-Object { $_ -match 'python3' -and $_ -match 'signal-1-zone-violation' })
 
         # Resolve the container's OWN configured ES_URL (zone_violation.py's
         # own default if unset), then check connectivity from inside it.
-        $esUrlRaw = (docker exec $container sh -lc 'printf "%s" "${ES_URL:-http://elasticsearch:9200}"' 2>&1 | Out-String).Trim()
+        $esUrlRaw = Get-K8ContractedNativeText -StepId 'C-13' -FilePath 'docker' -ArgumentList @('exec', $container, 'sh', '-lc', 'printf "%s" "${ES_URL:-http://elasticsearch:9200}"')
         $esUrl = if ($esUrlRaw) { $esUrlRaw } else { 'http://elasticsearch:9200' }
         # STDOUT/STDERR captured separately for both python3 checks below: a
         # stray interpreter warning on stderr (e.g. a DeprecationWarning)
@@ -2733,7 +4282,7 @@ function Wait-K8ZoneDetectorReady {
         # even on an otherwise-successful request -- the same defect class
         # as the tshark stdout/stderr bug this round's review found.
         $connectivityScript = "import sys,urllib.request`ntry:`n r=urllib.request.urlopen('$esUrl/_cluster/health',timeout=5)`n sys.stdout.write(str(r.status))`nexcept Exception as e:`n sys.stdout.write('ERROR:'+str(e))`n sys.exit(1)`n"
-        $connCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $container, 'python3', '-c', (ConvertTo-K8PythonExecOneLiner -Script $connectivityScript))
+        $connCapture = Invoke-K8SeparatedNativeCapture -StepId 'C-14' -FilePath 'docker' -ArgumentList @('exec', $container, 'python3', '-c', (ConvertTo-K8PythonExecOneLiner -Script $connectivityScript))
         $connOut = ($connCapture.Stdout | Out-String).Trim()
         $connExit = $connCapture.ExitCode
         $connectivityOk = ($connExit -eq 0 -and $connOut -match '^2[0-9][0-9]$')
@@ -2744,13 +4293,13 @@ function Wait-K8ZoneDetectorReady {
         $searchResult = $null
         if ($connectivityOk) {
             $searchScript = "import sys,json,urllib.request,urllib.error`nbody=b'{`"size`": 50, `"sort`": [{`"_doc`": `"desc`"}], `"query`": {`"wildcard`": {`"layers.frame.frame_frame_protocols`": `"*dnp3*`"}}}'`ntry:`n req=urllib.request.Request('$esUrl/ot-logs-dnp3-*/_search',data=body,headers={'Content-Type':'application/json'},method='POST')`n r=urllib.request.urlopen(req,timeout=5)`n raw=r.read()`n json.loads(raw)`n sys.stdout.write(str(r.status))`nexcept urllib.error.HTTPError as e:`n sys.stdout.write('HTTPERROR:'+str(e.code))`n sys.exit(1)`nexcept Exception as e:`n sys.stdout.write('ERROR:'+str(e))`n sys.exit(1)`n"
-            $searchCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $container, 'python3', '-c', (ConvertTo-K8PythonExecOneLiner -Script $searchScript))
+            $searchCapture = Invoke-K8SeparatedNativeCapture -StepId 'C-15' -FilePath 'docker' -ArgumentList @('exec', $container, 'python3', '-c', (ConvertTo-K8PythonExecOneLiner -Script $searchScript))
             $searchResult = ($searchCapture.Stdout | Out-String).Trim()
             $searchExit = $searchCapture.ExitCode
             $searchOk = ($searchExit -eq 0 -and $searchResult -match '^2[0-9][0-9]$')
         }
 
-        $recentLog = (docker logs --tail 20 $container 2>&1 | Out-String)
+        $recentLog = Get-K8ContractedNativeText -StepId 'C-16' -FilePath 'docker' -ArgumentList @('logs', '--tail', '20', $container)
         $recentLogHasError = [bool]($recentLog -match 'search failed|bulk write failed')
 
         $attempts += [ordered]@{
@@ -2812,7 +4361,7 @@ function Invoke-K8ElasticsearchRequest {
         [string] $Body = '',
         [Parameter(Mandatory)][string] $OutputPath
     )
-    $container = (docker compose -p $RunId -f $ComposePath ps -q elasticsearch | Out-String).Trim()
+    $container = Get-K8ContractedNativeText -StepId 'C-17' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '-q', 'elasticsearch')
     if (-not $container) { throw 'Elasticsearch container could not be resolved' }
     if (Test-Path $OutputPath) { throw "refusing to overwrite existing Elasticsearch response: $OutputPath" }
     $remoteBody = "/tmp/k8-es-$([guid]::NewGuid().ToString('N')).body"
@@ -2825,11 +4374,11 @@ function Invoke-K8ElasticsearchRequest {
     $curlArgs = @('exec', $container, 'curl', '-sS', '-o', $remoteBody, '-w', '%{http_code}', '-X', $Method,
         "http://localhost:9200/$Endpoint", '-H', 'Content-Type: application/json')
     if ($Body) { $curlArgs += @('--data-binary', $Body) }
-    $statusCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList $curlArgs
+    $statusCapture = Invoke-K8SeparatedNativeCapture -StepId 'F-15' -FilePath 'docker' -ArgumentList $curlArgs
     $curlExit = $statusCapture.ExitCode
-    $bodyCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $container, 'cat', $remoteBody)
+    $bodyCapture = Invoke-K8SeparatedNativeCapture -StepId 'C-18' -FilePath 'docker' -ArgumentList @('exec', $container, 'cat', $remoteBody)
     $bodyExit = $bodyCapture.ExitCode
-    docker exec $container rm -f $remoteBody 2>&1 | Out-Null
+    [void](Invoke-K8ContractedNative -StepId 'C-19' -FilePath 'docker' -ArgumentList @('exec', $container, 'rm', '-f', $remoteBody))
     $rawBody = if ($bodyExit -eq 0) { $bodyCapture.Stdout | Out-String } else { '' }
     $effectiveExit = if ($curlExit -ne 0) { $curlExit } elseif ($bodyExit -ne 0) { 98 } else { 0 }
     $diagnostic = "stdout: $($statusCapture.Stdout -join ' ') | stderr: $($statusCapture.Stderr.Trim()) | body-read stderr: $($bodyCapture.Stderr.Trim())"
@@ -2862,11 +4411,16 @@ function Invoke-K8FaultObservationCommand {
         c2-dnp3-step4-range-b-fault-pilot.md SS4 check 2 success condition)
         was indistinguishable from "empty because tc failed".
     #>
-    param([Parameter(Mandatory)][string[]] $Argv, [Parameter(Mandatory)][string] $Label)
+    param(
+        [Parameter(Mandatory)][string] $StepId,
+        [Parameter(Mandatory)][string[]] $Argv,
+        [Parameter(Mandatory)][string] $Label
+    )
     $timestamp = (Get-Date).ToUniversalTime().ToString('o')
-    $capture = Invoke-K8SeparatedNativeCapture -FilePath $Argv[0] -ArgumentList @($Argv[1..($Argv.Count - 1)])
+    $capture = Invoke-K8SeparatedNativeCapture -StepId $StepId -FilePath $Argv[0] -ArgumentList @($Argv[1..($Argv.Count - 1)])
     $stdout = ($capture.Stdout | Out-String)
     return [pscustomobject]@{
+        StepId = $StepId
         # Argv is the display string the retained artifact prints; ArgvList is
         # the real argument vector, kept so a failure record can report the
         # exact argv instead of re-splitting a joined string.
@@ -2979,7 +4533,7 @@ function Assert-K8UnrelatedMirrorFilter {
     $observations = New-Object System.Collections.Generic.List[object]
     $linkArgv = @('docker', 'exec', $Gateway.Router, 'ip', '-o', 'link', 'show')
     $linkStartedUtc = Get-K8UtcNow
-    $linksCapture = Invoke-K8SeparatedNativeCapture -FilePath $linkArgv[0] -ArgumentList @($linkArgv[1..($linkArgv.Count - 1)])
+    $linksCapture = Invoke-K8SeparatedNativeCapture -StepId 'C-20' -FilePath $linkArgv[0] -ArgumentList @($linkArgv[1..($linkArgv.Count - 1)])
     $observations.Add((New-K8SeparatedCommandObservation -Label 'interface enumeration: ip -o link show' `
         -Argv $linkArgv -ExitCode $linksCapture.ExitCode -TimestampUtc $linkStartedUtc `
         -Stdout ((@($linksCapture.Stdout) | ForEach-Object { "$_" }) -join "`n") -Stderr $linksCapture.Stderr `
@@ -2999,7 +4553,7 @@ function Assert-K8UnrelatedMirrorFilter {
         if ($interface -eq 'lo' -or $interface -eq $Gateway.Interface) { continue }
         $filterArgv = @('docker', 'exec', $Gateway.Router, 'tc', 'filter', 'show', 'dev', $interface, 'parent', 'ffff:')
         $filterStartedUtc = Get-K8UtcNow
-        $filterCapture = Invoke-K8SeparatedNativeCapture -FilePath $filterArgv[0] -ArgumentList @($filterArgv[1..($filterArgv.Count - 1)])
+        $filterCapture = Invoke-K8SeparatedNativeCapture -StepId 'F-04' -FilePath $filterArgv[0] -ArgumentList @($filterArgv[1..($filterArgv.Count - 1)])
         $filter = ($filterCapture.Stdout | Out-String)
         $observations.Add((New-K8SeparatedCommandObservation -Label "unrelated interface probe: $interface" `
             -Argv $filterArgv -ExitCode $filterCapture.ExitCode -TimestampUtc $filterStartedUtc `
@@ -3036,7 +4590,7 @@ function Invoke-K8TsharkFieldDecode {
     )
     if (-not (Test-Path $LocalPcapPath)) { throw "pcap not found for decode: $LocalPcapPath" }
     $remote = "/tmp/$RemoteNameHint.pcap"
-    & docker cp $LocalPcapPath "${Container}:$remote" 2>&1 | Out-Null
+    [void](Invoke-K8ContractedNative -StepId 'C-21' -FilePath 'docker' -ArgumentList @('cp', $LocalPcapPath, "${Container}:$remote"))
     if ($LASTEXITCODE -ne 0) { throw "could not copy $LocalPcapPath into log_structurer for decode" }
     try {
         # STDOUT and STDERR captured SEPARATELY: tshark writes "Running as
@@ -3057,7 +4611,7 @@ function Invoke-K8TsharkFieldDecode {
         # argument, so the `-split "`t"` below (an actual PowerShell tab
         # character, unrelated to this CLI syntax) is correct exactly as it
         # already was and needs no change once tshark is emitting real tabs.
-        $capture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @(
+        $capture = Invoke-K8SeparatedNativeCapture -StepId 'F-01' -FilePath 'docker' -ArgumentList @(
             'exec', $Container, 'tshark', '-r', $remote, '-Y', $DisplayFilter, '-T', 'fields', '-E', 'separator=/t',
             '-e', 'frame.number', '-e', 'frame.time_epoch', '-e', 'ip.src', '-e', 'ip.dst',
             '-e', 'tcp.srcport', '-e', 'tcp.dstport', '-e', 'dnp3.al.func', '-e', 'dnp3.src', '-e', 'dnp3.dst'
@@ -3068,7 +4622,7 @@ function Invoke-K8TsharkFieldDecode {
         $raw = $capture.Stdout
     }
     finally {
-        docker exec $Container rm -f $remote 2>&1 | Out-Null
+        [void](Invoke-K8ContractedNative -StepId 'C-22' -FilePath 'docker' -ArgumentList @('exec', $Container, 'rm', '-f', $remote))
     }
     $rows = @()
     foreach ($line in $raw) {
@@ -3149,12 +4703,21 @@ function Invoke-K8Robs05LifecycleStep {
        capture_lifecycle.py retains per step: exact argv, exit code, output,
        and BOTH the start and completion UTC instants (they prove different
        things -- see c2-dnp3-capture-procedure.md SS5.1). #>
-    param([Parameter(Mandatory)][string] $Step, [Parameter(Mandatory)][string[]] $Argv)
+    param(
+        [Parameter(Mandatory)][string] $StepId,
+        [Parameter(Mandatory)][string] $Step,
+        [Parameter(Mandatory)][string[]] $Argv
+    )
     $started = (Get-Date).ToUniversalTime().ToString('o')
-    $capture = Invoke-K8SeparatedNativeCapture -FilePath $Argv[0] -ArgumentList @($Argv[1..($Argv.Count - 1)])
+    $capture = Invoke-K8SeparatedNativeCapture -StepId $StepId -FilePath $Argv[0] -ArgumentList @($Argv[1..($Argv.Count - 1)])
     $completed = (Get-Date).ToUniversalTime().ToString('o')
+    # The exit code is NOT gated here. Each caller already inspects it against
+    # a frozen success condition of its own ("listening on" in the logs, the
+    # helper still Running at the window end), and those conditions are
+    # scientific, not CLI-level. What C-8 adds is that the exit is now part of
+    # a declared contract row rather than an undeclared convention.
     return [ordered]@{
-        step = $Step; argv = $Argv; exit_code = $capture.ExitCode
+        step = $Step; step_id = $StepId; argv = $Argv; exit_code = $capture.ExitCode
         stdout = ($capture.Stdout | Out-String).Trim(); stderr = $capture.Stderr.Trim()
         started_utc = $started; completed_utc = $completed
     }
@@ -3179,7 +4742,7 @@ function Start-K8Robs05LivenessCapture {
     New-Item -ItemType Directory -Force -Path $contractDir | Out-Null
     $lifecyclePath = Join-Path $RunEvidence $spec.Lifecycle
 
-    $nsCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '-q', $spec.NamespaceService)
+    $nsCapture = Invoke-K8SeparatedNativeCapture -StepId 'C-23' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '-q', $spec.NamespaceService)
     $namespaceContainer = ($nsCapture.Stdout | Out-String).Trim()
     if ($nsCapture.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($namespaceContainer)) {
         throw "R-OBS-05 liveness capture STOP (apparatus failure): namespace container for '$($spec.NamespaceService)' was not resolved (exit $($nsCapture.ExitCode)). stderr: $($nsCapture.Stderr.Trim())"
@@ -3202,7 +4765,7 @@ function Start-K8Robs05LivenessCapture {
 
     # Exactly the frozen helper argv shape (capture_lifecycle.py
     # expected_argv), MINUS the trailing filter argument.
-    $startStep = Invoke-K8Robs05LifecycleStep -Step 'start' -Argv @(
+    $startStep = Invoke-K8Robs05LifecycleStep -StepId 'F-09' -Step 'start' -Argv @(
         'docker', 'run', '-d', '--name', $spec.HelperName,
         '--network', "container:$namespaceContainer", '--cap-add', 'NET_RAW', $spec.HelperImage,
         '-i', $spec.Interface, '-nn', '-s', '0', '-w', $spec.ContainerPcap
@@ -3214,7 +4777,7 @@ function Start-K8Robs05LivenessCapture {
     }
     $record.helper_container_id = $startStep.stdout.Trim()
 
-    $listenStep = Invoke-K8Robs05LifecycleStep -Step 'listening-check' -Argv @('docker', 'logs', $spec.HelperName)
+    $listenStep = Invoke-K8Robs05LifecycleStep -StepId 'F-10' -Step 'listening-check' -Argv @('docker', 'logs', $spec.HelperName)
     $record.steps += $listenStep
     $record | ConvertTo-Json -Depth 6 | Set-Content -Path $lifecyclePath -Encoding utf8NoBOM
     if ($listenStep.exit_code -ne 0 -or "$($listenStep.stdout)`n$($listenStep.stderr)" -notmatch 'listening on') {
@@ -3263,7 +4826,7 @@ function Complete-K8Robs05LivenessCapture {
         throw "R-OBS-05 liveness capture STOP (apparatus failure): listening was confirmed at $($listening[0].completed_utc), after the frozen window start $($windowStart.ToString('o')); the capture cannot be shown to cover [T0-5s, T0+15s]."
     }
 
-    $liveStep = Invoke-K8Robs05LifecycleStep -Step 'window-end-liveness-check' -Argv @('docker', 'inspect', '--format', '{{.State.Running}}', $spec.HelperName)
+    $liveStep = Invoke-K8Robs05LifecycleStep -StepId 'F-11' -Step 'window-end-liveness-check' -Argv @('docker', 'inspect', '--format', '{{.State.Running}}', $spec.HelperName)
     $steps.Add($liveStep)
     if (([datetimeoffset]::Parse($liveStep.started_utc)) -lt $windowEnd) {
         throw "R-OBS-05 liveness capture STOP (apparatus failure): window-end liveness check ran at $($liveStep.started_utc), before the frozen window end $($windowEnd.ToString('o'))."
@@ -3272,12 +4835,12 @@ function Complete-K8Robs05LivenessCapture {
         throw "R-OBS-05 liveness capture STOP (apparatus failure): helper was not running at the window end (exit $($liveStep.exit_code), reported '$($liveStep.stdout.Trim())'); the capture did not cover the window."
     }
 
-    $stopStep = Invoke-K8Robs05LifecycleStep -Step 'stop' -Argv @('docker', 'stop', $spec.HelperName)
+    $stopStep = Invoke-K8Robs05LifecycleStep -StepId 'F-12' -Step 'stop' -Argv @('docker', 'stop', $spec.HelperName)
     $steps.Add($stopStep)
     $artifactPath = Join-Path $RunEvidence $spec.Artifact
-    $exportStep = Invoke-K8Robs05LifecycleStep -Step 'export' -Argv @('docker', 'cp', "$($spec.HelperName):$($spec.ContainerPcap)", $artifactPath)
+    $exportStep = Invoke-K8Robs05LifecycleStep -StepId 'F-13' -Step 'export' -Argv @('docker', 'cp', "$($spec.HelperName):$($spec.ContainerPcap)", $artifactPath)
     $steps.Add($exportStep)
-    $removeStep = Invoke-K8Robs05LifecycleStep -Step 'remove' -Argv @('docker', 'container', 'rm', $spec.HelperName)
+    $removeStep = Invoke-K8Robs05LifecycleStep -StepId 'F-14' -Step 'remove' -Argv @('docker', 'container', 'rm', $spec.HelperName)
     $steps.Add($removeStep)
 
     $record.steps = $steps.ToArray()
@@ -3333,7 +4896,7 @@ function Write-K8UnrelatedPcapRows {
     if (-not (Test-Path $pcap)) {
         throw "R-OBS-05 STOP (apparatus failure): the auxiliary liveness pcap is missing at $pcap. The frozen contract SS4 correlates against this pcap; the Sensor pcap is never an acceptable substitute (its frozen BPF filter structurally excludes the unrelated flow)."
     }
-    $container = (docker compose -p $RunId -f $ComposePath ps -q log_structurer | Out-String).Trim()
+    $container = Get-K8ContractedNativeText -StepId 'C-24' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '-q', 'log_structurer')
     if (-not $container) { throw 'log_structurer container could not be resolved for frozen pcap decode' }
     $display = '(ip.src == 10.1.10.10 && ip.dst == 10.1.40.10 && tcp.dstport == 20000 && (dnp3.al.func == 1 || dnp3.al.func == 5) && dnp3.src == 1 && dnp3.dst == 20) || (ip.src == 10.1.40.10 && ip.dst == 10.1.10.10 && tcp.srcport == 20000 && dnp3.al.func == 129 && dnp3.src == 20 && dnp3.dst == 1)'
     $rows = Invoke-K8TsharkFieldDecode -Container $container -LocalPcapPath $pcap -DisplayFilter $display -RemoteNameHint "$RunId-r-obs-05"
@@ -3402,7 +4965,7 @@ function Write-K8TargetCaptureDecode {
         'sensor'       = @{ pcap = 'sensor-input\mirror-capture\c2-mirror-sensor.pcap'; out = 'sensor-input\mirror-capture\decoded-verification.json' }
     }
     $pcap = Join-Path $RunEvidence $stagePaths[$Stage].pcap
-    $container = (docker compose -p $RunId -f $ComposePath ps -q log_structurer | Out-String).Trim()
+    $container = Get-K8ContractedNativeText -StepId 'C-25' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '-q', 'log_structurer')
     if (-not $container) { throw "log_structurer container could not be resolved for the $Stage capture decode" }
     # freeze-decision-table.md SS3, Ground Truth/Sensor row, verbatim.
     $display = 'ip.src==10.1.20.11 && ip.dst==10.1.10.10 && tcp.dstport==20000 && dnp3.al.func==5 && dnp3.src==1024 && dnp3.dst==1'
@@ -3512,7 +5075,7 @@ function Invoke-K8AutomatedQueries {
     # either query is trusted -- fail-closed on drift, for both ranges (not
     # only when Range B's R-OBS-05 happens to share the same ot-logs-dnp3-*
     # index and field set).
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'collector-mapping-gate', '--mapping', $collectorMapping, '--output', (Join-Path $RunEvidence 'collector-output\collector-selector-mapping-gate.json')) -Description 'Collector selector exact-match mapping gate'
+    Invoke-K8ShakedownCommand -StepId 'C-39' -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'collector-mapping-gate', '--mapping', $collectorMapping, '--output', (Join-Path $RunEvidence 'collector-output\collector-selector-mapping-gate.json')) -Description 'Collector selector exact-match mapping gate'
     # `rule-mapping-gate` PASSes (exit 0) both when the Rule index exists
     # with correct field types AND when it does not exist at all -- the
     # Rule alert index is created LAZILY by zone_violation.py only on its
@@ -3524,7 +5087,7 @@ function Invoke-K8AutomatedQueries {
     # record of which case occurred; log it here so the console transcript
     # states the same distinction the retained JSON does, not just PASS.
     $ruleMappingGatePath = Join-Path $RunEvidence 'rule-output\rule-selector-mapping-gate.json'
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'rule-mapping-gate', '--mapping', $ruleMapping, '--output', $ruleMappingGatePath) -Description 'Rule selector exact-match mapping gate (signal/src_ip/dst_ip/source_dnp3_doc_id)'
+    Invoke-K8ShakedownCommand -StepId 'C-40' -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'rule-mapping-gate', '--mapping', $ruleMapping, '--output', $ruleMappingGatePath) -Description 'Rule selector exact-match mapping gate (signal/src_ip/dst_ip/source_dnp3_doc_id)'
     $ruleMappingGateResult = Get-Content $ruleMappingGatePath -Raw | ConvertFrom-Json
     if (Get-K8ObjectPropertyValue -Object $ruleMappingGateResult -Name 'index_present') {
         Write-K8ShakedownLog -Message 'Rule selector mapping gate PASS: ot-signals-zone-violation-* exists with the required signal/src_ip/dst_ip/source_dnp3_doc_id .keyword shape.'
@@ -3553,17 +5116,17 @@ function Invoke-K8AutomatedQueries {
     Write-K8ShakedownLog -Message "Rule request finalized against $($collectorIds.Count) accepted Collector hit ID(s)."
 
     Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method POST -Endpoint 'ot-signals-zone-violation-*/_search' -Body $ruleQuery -OutputPath $ruleResponse
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'target-correlation', '--collector', $collectorResponse, '--rule', $ruleResponse, '--output', (Join-Path $RunEvidence 'rule-output\collector-rule-correlation.json')) -Description 'retain complete Collector hit IDs and mechanically verify every Rule hit correlates'
+    Invoke-K8ShakedownCommand -StepId 'C-41' -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'target-correlation', '--collector', $collectorResponse, '--rule', $ruleResponse, '--output', (Join-Path $RunEvidence 'rule-output\collector-rule-correlation.json')) -Description 'retain complete Collector hit IDs and mechanically verify every Rule hit correlates'
     if ($Range -eq 'b') {
         $mappingPath = Join-Path $RunEvidence 'contract-output\r-obs-05-mapping-response.json'
         $mappingDecision = Join-Path $RunEvidence 'contract-output\r-obs-05-mapping-gate.json'
         Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method GET -Endpoint 'ot-logs-dnp3-*/_mapping' -OutputPath $mappingPath
-        Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'mapping-gate', '--mapping', $mappingPath, '--output', $mappingDecision) -Description 'R-OBS-05 exact mapping field/type gate'
+        Invoke-K8ShakedownCommand -StepId 'C-42' -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'mapping-gate', '--mapping', $mappingPath, '--output', $mappingDecision) -Description 'R-OBS-05 exact mapping field/type gate'
         $response = Join-Path $RunEvidence 'contract-output\r-obs-05-response.json'
         Invoke-K8ElasticsearchRequest -RunId $RunId -ComposePath $ComposePath -Method POST -Endpoint 'ot-logs-dnp3-*/_search' -Body (Get-Content (Join-Path $envDir 'r-obs-05-query.json') -Raw) -OutputPath $response
         Write-K8Robs05ContractReference -RunEvidence $RunEvidence -Study01Root (Join-Path (Get-K8ShakedownState).repo_root 'Study01') | Out-Null
         $frames = Write-K8UnrelatedPcapRows -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
-        Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'r-obs-05', '--response', $response, '--frames', $frames, '--window-start', $WindowStart, '--window-end', $WindowEnd, '--output', (Join-Path $RunEvidence 'contract-output\r-obs-05-correlation.json')) -Description 'R-OBS-05 exact integer-nanosecond pcap/document correlation'
+        Invoke-K8ShakedownCommand -StepId 'C-43' -FilePath 'python' -ArgumentList @((Join-Path $PSScriptRoot 'k8_shakedown_evidence.py'), 'r-obs-05', '--response', $response, '--frames', $frames, '--window-start', $WindowStart, '--window-end', $WindowEnd, '--output', (Join-Path $RunEvidence 'contract-output\r-obs-05-correlation.json')) -Description 'R-OBS-05 exact integer-nanosecond pcap/document correlation'
     }
 }
 
@@ -3623,8 +5186,8 @@ function Resolve-K8GatewayInterface {
         [Parameter(Mandatory)][string] $RunEvidence
     )
     $C = Get-K8ShakedownConstants
-    $router = (docker compose -p $RunId -f $ComposePath ps -q wan_router | Out-String).Trim()
-    $observer = (docker compose -p $RunId -f $ComposePath ps -q tap_observer | Out-String).Trim()
+    $router = Get-K8ContractedNativeText -StepId 'C-26' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '-q', 'wan_router')
+    $observer = Get-K8ContractedNativeText -StepId 'C-27' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '-q', 'tap_observer')
     if ([string]::IsNullOrWhiteSpace($router) -or [string]::IsNullOrWhiteSpace($observer)) {
         throw "wan_router or tap_observer container was not resolved for $RunId; not starting a helper, not triggering."
     }
@@ -3632,9 +5195,22 @@ function Resolve-K8GatewayInterface {
     New-Item -ItemType Directory -Force -Path $contractDir | Out-Null
     $evidencePath = Join-Path $contractDir 'gateway-interface-resolution.txt'
 
+    # I-08: identity of the RUNTIME-INSTALLED iproute2 that F-02/F-03/F-04 and
+    # the Range B fault (F-05..F-08) all depend on. The generated compose
+    # startup runs `(command -v ip || apt-get install iproute2 || apk add
+    # iproute2)`, so -- exactly like tshark in log_structurer -- these bytes
+    # are NOT fixed by the pinned image identity. Observed, never gated: no
+    # frozen source pins an iproute2 version.
+    #
+    # RETURNED to the caller rather than stashed in a script-scope variable.
+    # A module-scope stash is initialised once per import, so in a process
+    # handling two runs the second run's record would inherit the first run's
+    # reading -- an observation attributed to a run that never made it.
+    $ipObservation = Get-K8OptionalToolObservation -StepId 'I-08' -FilePath 'docker' -ArgumentList @('exec', $router, 'ip', '-V')
+
     # STDOUT/STDERR captured SEPARATELY: a stray stderr line must never be
     # treated as a candidate address line.
-    $addrCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $router, 'ip', '-o', '-4', 'addr', 'show')
+    $addrCapture = Invoke-K8SeparatedNativeCapture -StepId 'F-02' -FilePath 'docker' -ArgumentList @('exec', $router, 'ip', '-o', '-4', 'addr', 'show')
     $addrLines = @($addrCapture.Stdout)
     "exit $($addrCapture.ExitCode)`nstdout:`n$($addrLines -join "`n")`nstderr:`n$($addrCapture.Stderr.Trim())" |
         Set-Content -Path $evidencePath -Encoding utf8NoBOM
@@ -3661,7 +5237,7 @@ function Resolve-K8GatewayInterface {
     # Independent re-verification, BEFORE this value is trusted for fault
     # injection: query the resolved NAME directly and confirm it is a real
     # interface that actually carries the target CIDR.
-    $verifyCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('exec', $router, 'ip', '-o', '-4', 'addr', 'show', 'dev', $resolvedIf)
+    $verifyCapture = Invoke-K8SeparatedNativeCapture -StepId 'F-03' -FilePath 'docker' -ArgumentList @('exec', $router, 'ip', '-o', '-4', 'addr', 'show', 'dev', $resolvedIf)
     $verifyLines = @($verifyCapture.Stdout)
     $verifyOk = ($verifyCapture.ExitCode -eq 0) -and (@($verifyLines | Where-Object { $_ -match [regex]::Escape($C.GatewayCidr) }).Count -gt 0)
     "exit $($addrCapture.ExitCode)`nstdout:`n$($addrLines -join "`n")`nstderr:`n$($addrCapture.Stderr.Trim())`n`n--- independent re-verification: ip -o -4 addr show dev $resolvedIf ---`nexit $($verifyCapture.ExitCode)`nstdout:`n$($verifyLines -join "`n")`nstderr:`n$($verifyCapture.Stderr.Trim())" |
@@ -3671,7 +5247,7 @@ function Resolve-K8GatewayInterface {
     }
 
     Write-K8ShakedownLog -Message "Resolved and independently re-verified gateway interface: $resolvedIf (from token '$token')"
-    return [pscustomobject]@{ Router = $router; Observer = $observer; Interface = $resolvedIf }
+    return [pscustomobject]@{ Router = $router; Observer = $observer; Interface = $resolvedIf; ToolObservation = $ipObservation }
 }
 
 # ---------------------------------------------------------------------------
@@ -3881,7 +5457,7 @@ print("capture-lifecycle early check: PASS for ground-truth and sensor")
     $tmpScript = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-early-lifecycle-" + [guid]::NewGuid().ToString('N') + '.py')
     Set-Content -Path $tmpScript -Value $script -Encoding utf8NoBOM
     try {
-        Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @($tmpScript, $RunEvidence, $RunId, $ScriptsDir) `
+        Invoke-K8ShakedownCommand -StepId 'C-38' -FilePath 'python' -ArgumentList @($tmpScript, $RunEvidence, $RunId, $ScriptsDir) `
             -Description 'early capture-lifecycle check (frozen capture_lifecycle.validate/capture_context.validate, before runtime PASS is reported)'
     }
     finally {
@@ -3988,7 +5564,7 @@ function Invoke-K8ShakedownRangeABBody {
     # 1. Run evidence tree, via the frozen evidence_tree.create() -- not reimplemented here.
     Set-K8ShakedownRunStage -Stage 'evidence-tree'
     $createScript = "import sys; sys.path.insert(0, r'$ScriptsDir'); from pathlib import Path; from study01.evidence_tree import create; create(Path(r'$RunEvidence'))"
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @('-c', $createScript) -Description 'run evidence tree (frozen evidence_tree.create)'
+    Invoke-K8ShakedownCommand -StepId 'F-18' -FilePath 'python' -ArgumentList @('-c', $createScript) -Description 'run evidence tree (frozen evidence_tree.create)'
 
     # 1a. Mirror the pre-tree provenance into the evidence tree the instant the
     # frozen creator has made it. At the tree ROOT: the frozen preflight requires
@@ -4004,7 +5580,7 @@ function Invoke-K8ShakedownRangeABBody {
     Set-K8ShakedownRunStage -Stage 'compose-generate'
     Push-Location $WorktreeDir
     try {
-        Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @('platform/cli.py', 'provision', 'manifests/power-grid-reference.yaml', '-o', "manifests/$ComposeFile") `
+        Invoke-K8ShakedownCommand -StepId 'F-19' -FilePath 'python' -ArgumentList @('platform/cli.py', 'provision', 'manifests/power-grid-reference.yaml', '-o', "manifests/$ComposeFile") `
             -Description "generate Range $($Range.ToUpper()) Compose file"
     }
     finally { Pop-Location }
@@ -4013,7 +5589,7 @@ function Invoke-K8ShakedownRangeABBody {
 
     # 3. Execution preflight gate -- do not provision if this fails.
     Set-K8ShakedownRunStage -Stage 'preflight'
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @(
+    Invoke-K8ShakedownCommand -StepId 'F-20' -FilePath 'python' -ArgumentList @(
         (Join-Path $ScriptsDir 'study01_preflight.py'),
         '--run-id', $RunId, '--worktree', $WorktreeDir, '--compose', $ComposePath,
         '--run-evidence', $RunEvidence, '--project-name', $RunId, '--teardown-target', $RunId,
@@ -4041,7 +5617,7 @@ function Invoke-K8ShakedownRangeABBody {
     # scientific evidence tree as a per-run Shakedown runtime/debug log.
     Set-K8ShakedownRunStage -Stage 'provision'
     $buildLog = Join-Path $state.shakedown_root "runtime-logs\$RunId\docker-compose-up-build.log"
-    Invoke-K8ShakedownLoggedCommand -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'up', '-d', '--build') `
+    Invoke-K8ShakedownLoggedCommand -StepId 'F-21' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'up', '-d', '--build') `
         -LogPath $buildLog -Description "provision Range $($Range.ToUpper())" | Out-Null
 
     # 4a. Environment readiness: wait for every defined service to report a
@@ -4067,8 +5643,26 @@ function Invoke-K8ShakedownRangeABBody {
     # the real VM failure / pinned-source root cause it closes.
     Set-K8ShakedownRunStage -Stage 'application-readiness'
     Wait-K8ElasticsearchReady -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
-    Wait-K8LogStructurerReady -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
+    $logStructurerContainer = Wait-K8LogStructurerReady -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
     Wait-K8ZoneDetectorReady -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
+
+    # I-07: identity of the RUNTIME-INSTALLED tshark that F-01 depends on.
+    #
+    # An earlier draft claimed container image identity fixed this. Frozen
+    # c2-dnp3-image-inventory.md SS1 records that log_structurer's generated
+    # startup command INSTALLS tshark, and SS2 states plainly that a
+    # bit-identical local image is not claimed, "because of the package-
+    # repository state consulted by apt-get". The same SS1 warns against
+    # presenting a runtime package installation as a separately pinned package
+    # image -- which is exactly what that claim would have been.
+    #
+    # So the identity is observed per run. Taken HERE because the apt-get race
+    # is already gated by Wait-K8LogStructurerReady above. Never gated: no
+    # frozen source pins a tshark version. Recording it does not make the bytes
+    # reproducible, and this batch does not claim that it does.
+    # Accumulated in a RUN-LOCAL list and written once, after every runtime
+    # observation this run makes has actually been made (see below).
+    $runtimeToolVersions = @(Get-K8OptionalToolObservation -StepId 'I-07' -FilePath 'docker' -ArgumentList @('exec', $logStructurerContainer, 'tshark', '--version'))
 
     # 4b. Full image inventory (c2-dnp3-image-inventory.md SS4), before trigger:
     # per-service image reference/ID from `compose images`, THEN `docker image
@@ -4082,6 +5676,16 @@ function Invoke-K8ShakedownRangeABBody {
     Set-K8ShakedownRunStage -Stage 'gateway-resolution'
     $gw = Resolve-K8GatewayInterface -RunId $RunId -ComposePath $ComposePath -RunEvidence $RunEvidence
 
+    # The runtime tool-identity record is written HERE, not earlier: I-08 is
+    # observed inside gateway resolution, which runs on BOTH ranges, and
+    # writing before it would leave every record missing its own run's
+    # iproute2 reading. The value travels back on $gw rather than through a
+    # module-scope variable, so a second run in the same process cannot
+    # inherit the first run's observation.
+    $runtimeToolVersions += @($gw.ToolObservation)
+    try { [void](Write-K8ToolVersionRecord -RunId $RunId -Records $runtimeToolVersions -CapturePhase 'run') }
+    catch { Write-K8ShakedownLog -Level WARN -Message "runtime tool-version record could not be written ($($_.Exception.Message)); provenance only, so the run continues." }
+
     # 6. Range B only: the sole permitted fault.
     if ($Range -eq 'b') {
         Set-K8ShakedownRunStage -Stage 'fault-injection'
@@ -4094,8 +5698,8 @@ function Invoke-K8ShakedownRangeABBody {
         # The artifact is written BEFORE the exit-code assertion so a failing
         # command still leaves its own diagnostic behind.
         $preObservations = @(
-            (Invoke-K8FaultObservationCommand -Label 'pre-fault: tc qdisc show' -Argv @('docker', 'exec', $gw.Router, 'tc', 'qdisc', 'show', 'dev', $gw.Interface))
-            (Invoke-K8FaultObservationCommand -Label 'pre-fault: tc filter show parent ffff:' -Argv @('docker', 'exec', $gw.Router, 'tc', 'filter', 'show', 'dev', $gw.Interface, 'parent', 'ffff:'))
+            (Invoke-K8FaultObservationCommand -StepId 'F-05' -Label 'pre-fault: tc qdisc show' -Argv @('docker', 'exec', $gw.Router, 'tc', 'qdisc', 'show', 'dev', $gw.Interface))
+            (Invoke-K8FaultObservationCommand -StepId 'F-06' -Label 'pre-fault: tc filter show parent ffff:' -Argv @('docker', 'exec', $gw.Router, 'tc', 'filter', 'show', 'dev', $gw.Interface, 'parent', 'ffff:'))
         )
         Write-K8FaultObservationArtifact -Observations $preObservations -RunEvidence $RunEvidence `
             -ArtifactRelativePath 'contract-output\qdisc-pre-fault.txt' -Title 'Range B pre-fault observation (target gateway interface)' `
@@ -4106,7 +5710,7 @@ function Invoke-K8ShakedownRangeABBody {
         # retained too (frozen SS3 "Preserve pre/post command output"); this
         # adds no new scientific acceptance condition.
         $faultObservations = @(
-            (Invoke-K8FaultObservationCommand -Label 'fault: tc qdisc del ingress (the sole permitted fault)' -Argv @('docker', 'exec', $gw.Router, 'tc', 'qdisc', 'del', 'dev', $gw.Interface, 'ingress'))
+            (Invoke-K8FaultObservationCommand -StepId 'F-07' -Label 'fault: tc qdisc del ingress (the sole permitted fault)' -Argv @('docker', 'exec', $gw.Router, 'tc', 'qdisc', 'del', 'dev', $gw.Interface, 'ingress'))
         )
         Write-K8FaultObservationArtifact -Observations $faultObservations -RunEvidence $RunEvidence `
             -ArtifactRelativePath 'contract-output\fault-injection-command.txt' -Title 'Range B fault injection command' `
@@ -4117,7 +5721,7 @@ function Invoke-K8ShakedownRangeABBody {
         # shape ("no remaining target-segment mirror filter"), NOT a missing
         # artifact -- the file is always written and records stdout_empty.
         $postObservations = @(
-            (Invoke-K8FaultObservationCommand -Label 'post-fault: tc filter show parent ffff:' -Argv @('docker', 'exec', $gw.Router, 'tc', 'filter', 'show', 'dev', $gw.Interface, 'parent', 'ffff:'))
+            (Invoke-K8FaultObservationCommand -StepId 'F-08' -Label 'post-fault: tc filter show parent ffff:' -Argv @('docker', 'exec', $gw.Router, 'tc', 'filter', 'show', 'dev', $gw.Interface, 'parent', 'ffff:'))
         )
         Write-K8FaultObservationArtifact -Observations $postObservations -RunEvidence $RunEvidence `
             -ArtifactRelativePath 'contract-output\qdisc-post-fault.txt' -Title 'Range B post-fault observation (target gateway interface)' `
@@ -4142,13 +5746,13 @@ function Invoke-K8ShakedownRangeABBody {
     # 7. Capture: resolve then start, both stages, in this fixed order.
     Set-K8ShakedownRunStage -Stage 'capture-start'
     foreach ($stage in @('ground-truth', 'sensor')) {
-        Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @(
+        Invoke-K8ShakedownCommand -StepId 'F-25' -FilePath 'python' -ArgumentList @(
             (Join-Path $ScriptsDir 'study01_capture.py'), 'resolve',
             '--run-id', $RunId, '--run-evidence', $RunEvidence, '--stage', $stage, '--compose', $ComposePath
         ) -Description "capture context resolve: $stage"
     }
     foreach ($stage in @('ground-truth', 'sensor')) {
-        Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @(
+        Invoke-K8ShakedownCommand -StepId 'F-26' -FilePath 'python' -ArgumentList @(
             (Join-Path $ScriptsDir 'study01_capture.py'), 'start',
             '--run-id', $RunId, '--run-evidence', $RunEvidence, '--stage', $stage
         ) -Description "capture helper start: $stage"
@@ -4174,20 +5778,20 @@ function Invoke-K8ShakedownRangeABBody {
 
     # 8. Sender: directory prep -> docker cp -> hash verify -> exactly one invocation.
     Set-K8ShakedownRunStage -Stage 'sender-trigger'
-    $senderContainer = (docker compose -p $RunId -f $ComposePath ps -q sub_a_ied_02 | Out-String).Trim()
+    $senderContainer = Get-K8ContractedNativeText -StepId 'C-28' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '-q', 'sub_a_ied_02')
     if ([string]::IsNullOrWhiteSpace($senderContainer)) { throw 'sub_a_ied_02 container was not resolved' }
-    Invoke-K8ShakedownCommand -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'exec', '-T', 'sub_a_ied_02', 'sh', '-lc', 'mkdir -p /study/traffic') `
+    Invoke-K8ShakedownCommand -StepId 'C-29' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'exec', '-T', 'sub_a_ied_02', 'sh', '-lc', 'mkdir -p /study/traffic') `
         -Description 'sender directory preparation'
-    Invoke-K8ShakedownCommand -FilePath 'docker' -ArgumentList @('cp', $SenderAssetHost.Path, "${senderContainer}:$($C.SenderAssetInContainerPath)") `
+    Invoke-K8ShakedownCommand -StepId 'F-22' -FilePath 'docker' -ArgumentList @('cp', $SenderAssetHost.Path, "${senderContainer}:$($C.SenderAssetInContainerPath)") `
         -Description 'sender asset placement (docker cp is the only permitted mechanism)'
-    $shaOut = (docker compose -p $RunId -f $ComposePath exec -T sub_a_ied_02 sh -lc "sha256sum $($C.SenderAssetInContainerPath)" | Out-String)
+    $shaOut = Get-K8ContractedNativeText -StepId 'F-23' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'exec', '-T', 'sub_a_ied_02', 'sh', '-lc', "sha256sum $($C.SenderAssetInContainerPath)")
     $inContainerSha = ($shaOut.Trim().Split()[0]).ToUpperInvariant()
     if ($inContainerSha -ne $C.SenderAssetSha256) {
         throw "sender hash mismatch: expected $($C.SenderAssetSha256), got $inContainerSha"
     }
     Write-K8ShakedownLog -Message "sender asset hash verified in-container: $inContainerSha"
 
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @(
+    Invoke-K8ShakedownCommand -StepId 'F-24' -FilePath 'python' -ArgumentList @(
         (Join-Path $ScriptsDir 'study01_sender.py'), '--run-id', $RunId, '--run-evidence', $RunEvidence, '--',
         'docker', 'compose', '-p', $RunId, '-f', $ComposePath, 'exec', '-T', 'sub_a_ied_02',
         'python3', $C.SenderAssetInContainerPath, '--target-ip', '10.1.10.10', '--target-port', '20000', '--function-code', '5', '--repeat', '1'
@@ -4205,7 +5809,7 @@ function Invoke-K8ShakedownRangeABBody {
     # docstring for the real VM failure this fixed.
     Set-K8ShakedownRunStage -Stage 'capture-stop-export'
     foreach ($stage in @('ground-truth', 'sensor')) {
-        Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @(
+        Invoke-K8ShakedownCommand -StepId 'F-27' -FilePath 'python' -ArgumentList @(
             (Join-Path $ScriptsDir 'study01_capture.py'), 'stop-export',
             '--run-id', $RunId, '--run-evidence', $RunEvidence, '--stage', $stage
         ) -Description "capture stop/export: $stage"
@@ -4402,7 +6006,7 @@ function Get-K8ComposeDeclaredSubnets {
         defect requires, so it is intentionally excluded here.
     #>
     param([Parameter(Mandatory)][string] $RunId, [Parameter(Mandatory)][string] $ComposePath)
-    $capture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'config', '--format', 'json')
+    $capture = Invoke-K8SeparatedNativeCapture -StepId 'C-30' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'config', '--format', 'json')
     if ($capture.ExitCode -ne 0) {
         throw "'docker compose config --format json' failed (exit $($capture.ExitCode)); cannot resolve this run's declared network subnets for the pool-conflict preflight. stderr: $($capture.Stderr.Trim())"
     }
@@ -4439,7 +6043,7 @@ function Get-K8LeftoverShakedownNetworks {
         design (see Test-K8ShakedownNetworkPreflight's docstring).
     #>
     param([Parameter(Mandatory)][string] $RunId)
-    $lsCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('network', 'ls', '--format', 'json')
+    $lsCapture = Invoke-K8SeparatedNativeCapture -StepId 'C-31' -FilePath 'docker' -ArgumentList @('network', 'ls', '--format', 'json')
     if ($lsCapture.ExitCode -ne 0) {
         throw "'docker network ls --format json' failed (exit $($lsCapture.ExitCode)); cannot check for leftover Shakedown networks. stderr: $($lsCapture.Stderr.Trim())"
     }
@@ -4452,7 +6056,7 @@ function Get-K8LeftoverShakedownNetworks {
     $result = New-Object System.Collections.Generic.List[object]
     foreach ($net in $candidates) {
         $name = [string](Get-K8ObjectPropertyValue -Object $net -Name 'Name')
-        $inspectCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('network', 'inspect', $name, '--format', 'json')
+        $inspectCapture = Invoke-K8SeparatedNativeCapture -StepId 'C-32' -FilePath 'docker' -ArgumentList @('network', 'inspect', $name, '--format', 'json')
         if ($inspectCapture.ExitCode -ne 0) { continue }  # network may have been removed between ls and inspect; not this preflight's concern
         $inspectRaw = ($inspectCapture.Stdout | Out-String)
         if ([string]::IsNullOrWhiteSpace($inspectRaw)) { continue }
@@ -4647,7 +6251,7 @@ function Wait-K8ComposeReady {
         $attempts++
         # STDOUT/STDERR captured separately: a Compose warning on stderr
         # must not be merged into the JSON this parses.
-        $psCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '--all', '--format', 'json')
+        $psCapture = Invoke-K8SeparatedNativeCapture -StepId 'C-33' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '--all', '--format', 'json')
         $lastRaw = ($psCapture.Stdout | Out-String)
         if ($psCapture.ExitCode -ne 0) {
             $lastParseDiagnostic = "'docker compose ps' failed (exit $($psCapture.ExitCode)): $($psCapture.Stderr.Trim())"
@@ -4712,7 +6316,7 @@ function Write-K8ImageInventory {
     # STDOUT/STDERR captured separately throughout: a stray Compose/Docker
     # stderr line merged into either JSON capture below would corrupt the
     # mandatory image inventory (a completeness-gate-required artifact).
-    $imagesCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'images', '--format', 'json')
+    $imagesCapture = Invoke-K8SeparatedNativeCapture -StepId 'F-16' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'images', '--format', 'json')
     if ($imagesCapture.ExitCode -ne 0) { throw "docker compose images failed (exit $($imagesCapture.ExitCode)); image inventory is mandatory. stderr: $($imagesCapture.Stderr.Trim())" }
     $psJson = $imagesCapture.Stdout
     # `-join` (not a bare pipeline): Set-Content creates NO FILE when nothing
@@ -4720,7 +6324,7 @@ function Write-K8ImageInventory {
     # silently leave no artifact at all -- the same cause class as the Range B
     # post-fault retention defect.
     (@($psJson) -join "`n") | Set-Content -Path (Join-Path $envDir 'compose-images.json') -Encoding utf8NoBOM
-    $composePsCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps')
+    $composePsCapture = Invoke-K8SeparatedNativeCapture -StepId 'C-34' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps')
     (@($composePsCapture.Stdout) -join "`n") | Set-Content -Path (Join-Path $envDir 'compose-ps.txt') -Encoding utf8NoBOM
 
     # NOT wrapped in @() -- ConvertFrom-K8ComposePsJson already force-returns
@@ -4736,7 +6340,7 @@ function Write-K8ImageInventory {
         $tag = Get-K8ObjectPropertyValue -Object $img -Name 'Tag'
         $ref = if ($id) { $id } elseif ($repository -and $tag) { "${repository}:$tag" } else { $null }
         if (-not $ref) { throw "image reference/ID missing for expected service '$service'" }
-        $inspectCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('image', 'inspect', $ref)
+        $inspectCapture = Invoke-K8SeparatedNativeCapture -StepId 'F-17' -FilePath 'docker' -ArgumentList @('image', 'inspect', $ref)
         if ($inspectCapture.ExitCode -ne 0) { throw "docker image inspect failed for service '$service' image '$ref' (exit $($inspectCapture.ExitCode)). stderr: $($inspectCapture.Stderr.Trim())" }
         $raw = ($inspectCapture.Stdout | Out-String)
         $inspection = @($raw | ConvertFrom-Json)
@@ -4788,10 +6392,10 @@ function Write-K8RuntimeContractRecord {
         [Parameter(Mandatory)] $Gateway
     )
     $contractDir = Join-Path $RunEvidence 'contract-output'
-    $psText = (docker compose -p $RunId -f $ComposePath ps 2>&1 | Out-String)
+    $psText = Get-K8ContractedNativeText -StepId 'C-35' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps')
     # STDOUT/STDERR captured separately: a stray stderr line must not be
     # merged into the JSON this parses for the Range B service-state gate.
-    $psJsonCapture = Invoke-K8SeparatedNativeCapture -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '--all', '--format', 'json')
+    $psJsonCapture = Invoke-K8SeparatedNativeCapture -StepId 'C-36' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps', '--all', '--format', 'json')
     if ($psJsonCapture.ExitCode -ne 0) { throw "docker compose ps --format json failed while building the runtime contract record (exit $($psJsonCapture.ExitCode)). stderr: $($psJsonCapture.Stderr.Trim())" }
     # NOT wrapped in @() -- ConvertFrom-K8ComposePsJson already force-returns
     # a real array; see its own return statement.
@@ -4947,15 +6551,15 @@ function Complete-K8ShakedownRangeABBody {
     # Frozen ordering: prove the runtime evidence is complete and hash it while
     # the project still exists. Only then may cleanup destroy project/volumes.
     Set-K8ShakedownRunStage -Stage 'pre-teardown-validate'
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'validate-evidence', $RunEvidence) -Description 'pre-teardown validate-evidence'
+    Invoke-K8ShakedownCommand -StepId 'F-28' -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'validate-evidence', $RunEvidence) -Description 'pre-teardown validate-evidence'
     Set-K8ShakedownRunStage -Stage 'pre-teardown-finalize'
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'finalize-evidence', $RunEvidence) -Description 'pre-teardown finalize/hash'
+    Invoke-K8ShakedownCommand -StepId 'F-29' -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'finalize-evidence', $RunEvidence) -Description 'pre-teardown finalize/hash'
     if (-not (Test-Path (Join-Path $RunEvidence 'hashes.sha256'))) { throw 'pre-teardown finalize did not create hashes.sha256; refusing teardown' }
 
     Set-K8ShakedownRunStage -Stage 'teardown'
-    Invoke-K8ShakedownCommand -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'down', '-v', '--remove-orphans') `
+    Invoke-K8ShakedownCommand -StepId 'F-30' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'down', '-v', '--remove-orphans') `
         -Description 'destroy project + volumes (prevent state carry-over)'
-    $finalPs = (docker compose -p $RunId -f $ComposePath ps 2>&1 | Out-String)
+    $finalPs = Get-K8ContractedNativeText -StepId 'C-37' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'ps')
     $finalPs | Add-Content -Path (Join-Path $RunEvidence 'environment\compose-ps.txt') -Encoding utf8NoBOM
 
     Set-K8ShakedownRunStage -Stage 'cleanup-record'
@@ -4971,9 +6575,9 @@ function Complete-K8ShakedownRangeABBody {
     "cleanup_utc=$((Get-Date).ToUniversalTime().ToString('o'))`ncommand=docker compose -p $RunId -f $ComposePath down -v --remove-orphans`nresult=PASS" |
         Set-Content -Path (Join-Path $RunEvidence 'environment\cleanup-result.txt') -Encoding utf8NoBOM
     Set-K8ShakedownRunStage -Stage 'final-finalize'
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'finalize-evidence', $RunEvidence) -Description 'final finalize/hash including cleanup record'
+    Invoke-K8ShakedownCommand -StepId 'F-31' -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'finalize-evidence', $RunEvidence) -Description 'final finalize/hash including cleanup record'
     Set-K8ShakedownRunStage -Stage 'final-verify'
-    Invoke-K8ShakedownCommand -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'verify-integrity', $RunEvidence) -Description 'final verify-integrity'
+    Invoke-K8ShakedownCommand -StepId 'F-32' -FilePath 'python' -ArgumentList @((Join-Path $ScriptsDir 'study01_collect.py'), 'verify-integrity', $RunEvidence) -Description 'final verify-integrity'
 
     # C-3 (4). Ordering, and only this ordering:
     #     final-finalize -> final-verify -> identity freeze -> run completion.

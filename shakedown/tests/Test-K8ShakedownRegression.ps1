@@ -68,6 +68,23 @@ function Restore-K8SuiteWorkspace {
     Remove-Item $script:SuiteRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# C-8: a few checks exercise the command helpers against SYNTHETIC commands
+# (`cmd.exe /c exit 3`) that deliberately have no place in the real contract.
+# The helpers now refuse any step id they do not know, which is the point --
+# so the test adds its row inside the MODULE's own scope and reloads the
+# module afterwards.
+#
+# Deliberately not a production function: nothing on a real run may append to
+# the contract, or the closed-world claim would be self-granted. Reaching into
+# module scope from the test harness makes that asymmetry explicit.
+function Add-K8TestContractRow {
+    param([Parameter(Mandatory)][hashtable] $Row)
+    & (Get-Module K8ShakedownCommon) { param($r) $script:K8CommandContract = @($script:K8CommandContract) + @($r) } $Row
+}
+function Reset-K8ContractRows {
+    Import-Module $script:CommonPath -Force
+}
+
 $failures = @()
 function Assert-K8Test {
     param([Parameter(Mandatory)][string] $Name, [Parameter(Mandatory)][scriptblock] $Body)
@@ -2592,6 +2609,10 @@ Assert-K8Test 'MEASURED: Set-Content creates no file for $null / empty-array inp
 
 Assert-K8Test 'REGRESSION: fault observation artifact is ALWAYS created -- pre/post, empty and non-empty stdout, with argv/exit/stdout_empty/timestamp retained' {
     Import-Module $CommonPath -Force
+    Add-K8TestContractRow -Row @{ step_id = 'TEST-FAULT'; class = 'C'; ranges = 'b'
+        source_file = 'test'; producer_scope = 'test'; callee = 'cmd.exe'; call_ordinal = 1
+        argv_shape = @('cmd.exe', '/c', '<synthetic>'); stream_expectation = 'separated'
+        accepted_exit_codes = @(0, 3); exit_note = 'synthetic fixture; not a real call site' }
     foreach ($case in @(
         @{ Name = 'pre: empty stdout + exit 0';    Argv = @('cmd.exe', '/c', 'exit 0');            Empty = $true;  Exit = 0; File = 'qdisc-pre-fault.txt' }
         @{ Name = 'pre: nonempty stdout';          Argv = @('cmd.exe', '/c', 'echo qdisc ingress'); Empty = $false; Exit = 0; File = 'qdisc-pre-fault.txt' }
@@ -2601,7 +2622,7 @@ Assert-K8Test 'REGRESSION: fault observation artifact is ALWAYS created -- pre/p
         $d = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-fobs-" + [guid]::NewGuid())
         New-Item -ItemType Directory -Force -Path $d | Out-Null
         try {
-            $obs = @(Invoke-K8FaultObservationCommand -Label $case.Name -Argv $case.Argv)
+            $obs = @(Invoke-K8FaultObservationCommand -StepId 'TEST-FAULT' -Label $case.Name -Argv $case.Argv)
             if ($obs[0].StdoutEmpty -ne $case.Empty) { throw "$($case.Name): stdout_empty was $($obs[0].StdoutEmpty), expected $($case.Empty)" }
             if ($obs[0].ExitCode -ne $case.Exit) { throw "$($case.Name): exit was $($obs[0].ExitCode), expected $($case.Exit)" }
             $relative = "contract-output\$($case.File)"
@@ -2635,8 +2656,12 @@ Assert-K8Test 'REGRESSION: fault observation artifact is ALWAYS created -- pre/p
 
 Assert-K8Test 'REGRESSION: empty stdout with a NONZERO exit fails closed -- never read as a successful "no remaining filter"' {
     Import-Module $CommonPath -Force
+    Add-K8TestContractRow -Row @{ step_id = 'TEST-FAULT'; class = 'C'; ranges = 'b'
+        source_file = 'test'; producer_scope = 'test'; callee = 'cmd.exe'; call_ordinal = 1
+        argv_shape = @('cmd.exe', '/c', '<synthetic>'); stream_expectation = 'separated'
+        accepted_exit_codes = @(0, 3); exit_note = 'synthetic fixture; not a real call site' }
     foreach ($stage in @('pre-fault observation', 'post-fault observation')) {
-        $obs = @(Invoke-K8FaultObservationCommand -Label $stage -Argv @('cmd.exe', '/c', 'exit 3'))
+        $obs = @(Invoke-K8FaultObservationCommand -StepId 'TEST-FAULT' -Label $stage -Argv @('cmd.exe', '/c', 'exit 3'))
         if (-not $obs[0].StdoutEmpty) { throw 'fixture did not produce the empty-stdout case' }
         $stopped = $false; $msg = ''
         try { Assert-K8FaultObservationsSucceeded -Observations $obs -Stage $stage } catch { $stopped = $true; $msg = $_.Exception.Message }
@@ -2647,7 +2672,11 @@ Assert-K8Test 'REGRESSION: empty stdout with a NONZERO exit fails closed -- neve
 
 Assert-K8Test 'REGRESSION: fault observations separate stdout from stderr (never merged via 2>&1)' {
     Import-Module $CommonPath -Force
-    $obs = @(Invoke-K8FaultObservationCommand -Label 'sep' -Argv @('cmd.exe', '/c', 'echo OUT& echo ERRLINE 1>&2'))
+    Add-K8TestContractRow -Row @{ step_id = 'TEST-FAULT'; class = 'C'; ranges = 'b'
+        source_file = 'test'; producer_scope = 'test'; callee = 'cmd.exe'; call_ordinal = 1
+        argv_shape = @('cmd.exe', '/c', '<synthetic>'); stream_expectation = 'separated'
+        accepted_exit_codes = @(0, 3); exit_note = 'synthetic fixture; not a real call site' }
+    $obs = @(Invoke-K8FaultObservationCommand -StepId 'TEST-FAULT' -Label 'sep' -Argv @('cmd.exe', '/c', 'echo OUT& echo ERRLINE 1>&2'))
     if ($obs[0].Stdout -notmatch 'OUT') { throw 'stdout was not captured' }
     if ($obs[0].Stdout -match 'ERRLINE') { throw 'stderr leaked into stdout -- streams are being merged' }
     if ($obs[0].Stderr -notmatch 'ERRLINE') { throw 'stderr was not retained' }
@@ -3473,6 +3502,14 @@ Assert-K8Test 'Non-command termination records the common fields and fabricates 
 
 Assert-K8Test 'External-command termination retains argv, exit code and the full captured transcript' {
     Import-Module $CommonPath -Force
+    Add-K8TestContractRow -Row @{ step_id = 'TEST-GIT-STRICT'; class = 'C'; ranges = 'a'
+        source_file = 'test'; producer_scope = 'test'; callee = "'git'"; call_ordinal = 1
+        argv_shape = @('git', '-C', '<repo>', 'rev-parse', '--verify', '<ref>'); stream_expectation = 'separated'
+        accepted_exit_codes = @(0); exit_note = 'synthetic fixture: a strict site, so a missing ref STOPs' }
+    Add-K8TestContractRow -Row @{ step_id = 'TEST-GIT-TOLERANT'; class = 'C'; ranges = 'a'
+        source_file = 'test'; producer_scope = 'test'; callee = "'git'"; call_ordinal = 2
+        argv_shape = @('git', '-C', '<repo>', 'rev-parse', '--verify', '<ref>'); stream_expectation = 'separated'
+        accepted_exit_codes = @(0, 128); exit_note = 'synthetic fixture: a site whose acceptance domain includes the missing-ref exit' }
     Invoke-K8SequenceSandbox -Action {
         param($sb)
         New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
@@ -3480,7 +3517,7 @@ Assert-K8Test 'External-command termination retains argv, exit code and the full
         try {
             Invoke-K8ShakedownRunBoundary -Run $run -ScriptBlock {
                 Set-K8ShakedownRunStage -Stage 'preflight'
-                Invoke-K8ShakedownCommand -FilePath 'git' -ArgumentList @('-C', $sb.Repo, 'rev-parse', '--verify', 'refs/heads/no-such-branch')
+                Invoke-K8ShakedownCommand -StepId 'TEST-GIT-STRICT' -FilePath 'git' -ArgumentList @('-C', $sb.Repo, 'rev-parse', '--verify', 'refs/heads/no-such-branch')
             }.GetNewClosure()
             throw 'the boundary did not re-throw'
         }
@@ -3503,6 +3540,14 @@ Assert-K8Test 'External-command termination retains argv, exit code and the full
 
 Assert-K8Test 'A tolerated command failure is not grafted onto a later unrelated termination' {
     Import-Module $CommonPath -Force
+    Add-K8TestContractRow -Row @{ step_id = 'TEST-GIT-STRICT'; class = 'C'; ranges = 'a'
+        source_file = 'test'; producer_scope = 'test'; callee = "'git'"; call_ordinal = 1
+        argv_shape = @('git', '-C', '<repo>', 'rev-parse', '--verify', '<ref>'); stream_expectation = 'separated'
+        accepted_exit_codes = @(0); exit_note = 'synthetic fixture: a strict site, so a missing ref STOPs' }
+    Add-K8TestContractRow -Row @{ step_id = 'TEST-GIT-TOLERANT'; class = 'C'; ranges = 'a'
+        source_file = 'test'; producer_scope = 'test'; callee = "'git'"; call_ordinal = 2
+        argv_shape = @('git', '-C', '<repo>', 'rev-parse', '--verify', '<ref>'); stream_expectation = 'separated'
+        accepted_exit_codes = @(0, 128); exit_note = 'synthetic fixture: a site whose acceptance domain includes the missing-ref exit' }
     Invoke-K8SequenceSandbox -Action {
         param($sb)
         New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
@@ -3511,7 +3556,7 @@ Assert-K8Test 'A tolerated command failure is not grafted onto a later unrelated
             Invoke-K8ShakedownRunBoundary -Run $run -ScriptBlock {
                 Set-K8ShakedownRunStage -Stage 'preflight'
                 # Fails, but its exit code is allowed: it must leave nothing behind.
-                Invoke-K8ShakedownCommand -FilePath 'git' -ArgumentList @('-C', $sb.Repo, 'rev-parse', '--verify', 'refs/heads/no-such-branch') -AllowExitCodes @(0, 128) | Out-Null
+                Invoke-K8ShakedownCommand -StepId 'TEST-GIT-TOLERANT' -FilePath 'git' -ArgumentList @('-C', $sb.Repo, 'rev-parse', '--verify', 'refs/heads/no-such-branch') | Out-Null
                 throw 'an unrelated internal assertion'
             }.GetNewClosure()
         }
@@ -4707,6 +4752,570 @@ Assert-K8Test 'frozen apparatus non-regression: a Range A/B tree carrying the C-
             }
         }
         finally { Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+
+# --- 29. C-8: external command contract closure (Batch 3A) --------------------
+#
+# What these checks defend is not "the commands are right" -- that is a human
+# judgment C-8 deliberately does not automate. It is that the declared contract
+# cannot drift away from either the frozen documents it cites or the code it
+# describes, and that the inventory backing the closed-world claim cannot be
+# faked by a single broken observer.
+
+$C8Tools = Join-Path $RepoRoot 'shakedown\tools'
+$C8Inventory = Join-Path $RepoRoot 'shakedown\tests\k8_command_inventory.ps1'
+$C8Reachability = Join-Path $RepoRoot 'shakedown\tests\k8_command_reachability.ps1'
+
+function Get-K8ObservedSiteTable {
+    <# Both inventory oracles, unioned, with a contract-style ordinal per
+       (file, scope, callee) so a row's locator can be resolved to a real
+       extent. The union key is (file, line, ordinal_in_line). #>
+    $inv = & $C8Inventory -ToolsDir $C8Tools
+    $rea = & $C8Reachability -RepoRoot $RepoRoot
+    $counter = @{}
+    $rows = @()
+    foreach ($s in (@($inv.Sites) + @($rea.CrossBoundarySites))) {
+        $k = "$($s.file)|$($s.scope)|$($s.callee)"
+        if (-not $counter.ContainsKey($k)) { $counter[$k] = 0 }
+        $counter[$k]++
+        $rows += [pscustomobject]@{
+            file = $s.file; line = $s.line; scope = $s.scope; callee = $s.callee
+            ord = $counter[$k]; key = $s.key
+        }
+    }
+    return [pscustomobject]@{
+        Sites = $rows; Local = @($inv.Sites); Cross = @($rea.CrossBoundarySites); Dynamic = @($inv.Dynamic)
+    }
+}
+
+Assert-K8Test 'C-8: the contract is a single data structure, and every row states a complete, non-default acceptance domain' {
+    $rows = @(Get-K8CommandContract)
+    if ($rows.Count -ne 100) { throw "expected 100 process-site rows, got $($rows.Count)" }
+    $byClass = @{}
+    foreach ($c in 'F', 'C', 'I') { $byClass[$c] = @($rows | Where-Object { $_.class -eq $c }).Count }
+    if ($byClass['F'] -ne 37 -or $byClass['C'] -ne 60 -or $byClass['I'] -ne 3) {
+        throw "class split is F=$($byClass['F']) C=$($byClass['C']) I=$($byClass['I']); the Plan fixes F=37 C=60 I=3"
+    }
+    if (@($rows.step_id | Sort-Object -Unique).Count -ne $rows.Count) { throw 'step_id values are not unique' }
+    foreach ($r in $rows) {
+        # Throws on an undeclared or empty domain, and on a $null outside
+        # Class I -- i.e. this is the check that no default can creep back.
+        [void](Get-K8RowAcceptedExitCodes -Row $r)
+        foreach ($f in 'source_file', 'producer_scope', 'callee', 'call_ordinal', 'argv_shape', 'stream_expectation') {
+            if (-not $r.ContainsKey($f)) { throw "row $($r.step_id) is missing '$f'" }
+        }
+    }
+    $pollAny = @($rows | Where-Object { $_.accepted_exit_codes -is [string] })
+    if ($pollAny.Count -ne 8) { throw "expected 8 poll-any rows, got $($pollAny.Count)" }
+    $required = @($rows | Where-Object { $_.ContainsKey('availability_policy') -and $_.availability_policy -eq 'required' })
+    if ($required.Count -ne 5) { throw "expected 5 availability_policy=required rows, got $($required.Count)" }
+}
+
+Assert-K8Test 'C-8: no module-wide exit default exists, and an empty acceptance domain STOPs rather than silently meaning @(0)' {
+    # The removed `-AllowExitCodes = @(0)` is the specific regression guarded
+    # here: reintroducing it would hand every site a receipt condition no
+    # frozen source states.
+    $source = Get-Content (Join-Path $C8Tools 'K8ShakedownCommon.psm1') -Raw
+    if ($source -match '\$AllowExitCodes') { throw 'AllowExitCodes reappeared in the module; the acceptance domain must come from the contract row, per call site' }
+    if ($source -match 'accepted_exit_codes\s*=\s*@\(\s*\)') { throw 'a row declares an EMPTY acceptance domain' }
+
+    $undeclared = @{ step_id = 'X-99'; class = 'C'; accepted_exit_codes = @() }
+    $threw = $false
+    try { [void](Get-K8RowAcceptedExitCodes -Row $undeclared) } catch { $threw = $true }
+    if (-not $threw) { throw 'an empty accepted_exit_codes was accepted; it must be treated as UNDECLARED and STOP' }
+
+    # 'poll-any' is not a way to skip the gate: it is only legal where the
+    # gate genuinely lives in a loop deadline.
+    $fakePoll = @{ step_id = 'X-98'; class = 'C'; accepted_exit_codes = 'poll-any' }
+    $threw = $false
+    try { [void](Get-K8RowAcceptedExitCodes -Row $fakePoll) } catch { $threw = $true }
+    if (-not $threw) { throw "'poll-any' was accepted on a row without poll_loop = `$true" }
+}
+
+Assert-K8Test 'C-8: acceptance domains are call-site specific in BOTH directions -- exit 0 is not assumed good, non-zero is not assumed bad' {
+    # F-35: the Range C validator. exit 1 is the frozen EXPECTED outcome and
+    # exit 0 is a scientific observation ("the apparatus did not reject the
+    # negative manifest"). Turning either into a STOP would convert a finding
+    # into a tooling error. Only >=2 is an execution failure.
+    $f35 = Get-K8CommandContractRow -StepId 'F-35'
+    foreach ($e in 0, 1) {
+        if (-not (Test-K8ExitAccepted -Row $f35 -ExitCode $e)) { throw "F-35 must accept exit $e" }
+    }
+    if (Test-K8ExitAccepted -Row $f35 -ExitCode 2) { throw 'F-35 must NOT accept exit 2 (argparse/interpreter failure)' }
+
+    # C-54/C-55: `git rev-parse HEAD` used as an EXPLORATION. 128 = unborn
+    # HEAD, which the else branch answers with a clean re-checkout.
+    foreach ($id in 'C-54', 'C-55') {
+        $row = Get-K8CommandContractRow -StepId $id
+        foreach ($e in 0, 128) {
+            if (-not (Test-K8ExitAccepted -Row $row -ExitCode $e)) { throw "$id must accept exit $e; a blanket non-zero STOP would break Setup" }
+        }
+        if (Test-K8ExitAccepted -Row $row -ExitCode 1) { throw "$id must not accept exit 1" }
+    }
+
+    # poll-any: every exit is a legitimate poll outcome, because the gate is
+    # the loop deadline and the readiness predicate.
+    $c06 = Get-K8CommandContractRow -StepId 'C-06'
+    foreach ($e in 0, 7, 137) {
+        if (-not (Test-K8ExitAccepted -Row $c06 -ExitCode $e)) { throw "C-06 is poll-any and must accept exit $e" }
+    }
+}
+
+Assert-K8Test 'C-8: every poll-any row names a real deadline-bounded loop whose timeout still fails closed' {
+    $source = Get-Content (Join-Path $C8Tools 'K8ShakedownCommon.psm1') -Raw
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$null, [ref]$null)
+    $funcs = @{}
+    foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) { $funcs[$f.Name] = $f }
+
+    $pollRows = @(Get-K8CommandContract | Where-Object { $_.accepted_exit_codes -is [string] })
+    $producers = @($pollRows.producer_scope | Sort-Object -Unique)
+    if ($producers.Count -ne 4) { throw "poll-any spans $($producers.Count) producers; the Plan closes it at 4" }
+    foreach ($row in $pollRows) {
+        if (-not $row.ContainsKey('poll_loop') -or -not $row['poll_loop']) { throw "$($row.step_id) is poll-any without poll_loop" }
+        if ($row['timeout_behavior'] -ne 'throw') { throw "$($row.step_id) does not declare timeout_behavior = throw" }
+        $fn = $funcs[$row.producer_scope]
+        if (-not $fn) { throw "poll-any producer $($row.producer_scope) does not exist" }
+        $body = $fn.Extent.Text
+        if ($body -notmatch 'while\s*\(') { throw "$($row.producer_scope) declares a poll loop but contains no while loop" }
+        if ($body -notmatch [regex]::Escape('$' + $row['deadline_param'])) { throw "$($row.producer_scope) does not use its declared deadline parameter $($row['deadline_param'])" }
+        # Without this, 'poll-any' would be a way to observe an exit and then
+        # discard it forever.
+        $afterLoop = $body.Substring($body.LastIndexOf('}'))
+        if ($body -notmatch '(?s)while\s*\(.*\}\s*[^}]*throw ') { throw "$($row.producer_scope) does not fail closed after its deadline" }
+    }
+}
+
+Assert-K8Test 'C-8: the closed world is a SET equation over four oracles, not four equal counts' {
+    $obs = Get-K8ObservedSiteTable
+    $local = @($obs.Local.key)
+    $cross = @($obs.Cross.key)
+
+    # (2) the cross-boundary set is disjoint from the local set -- otherwise
+    #     the union would double-count and the totals would still "agree".
+    $overlap = @($local | Where-Object { $cross -contains $_ })
+    if ($overlap.Count -ne 0) { throw "local and cross-boundary site sets overlap: $($overlap -join ', ')" }
+
+    # (3) union == contract. The counts are deliberately NOT compared
+    #     directly: AST_local is 99, cross is 1, and the contract is 100, so a
+    #     count equality would either fail or hide a double count.
+    $union = @($local + $cross | Sort-Object -Unique)
+    $contractRows = @(Get-K8CommandContract)
+    if ($union.Count -ne $contractRows.Count) {
+        throw "union of observed sites is $($union.Count) but the contract has $($contractRows.Count) rows"
+    }
+    if (@($union | Sort-Object -Unique).Count -ne $union.Count) { throw 'the union key (file, line, ordinal_in_line) is not unique' }
+}
+
+Assert-K8Test 'C-8: every row locator resolves to exactly one real call site, and every call site has a row' {
+    $obs = Get-K8ObservedSiteTable
+    $index = @{}
+    foreach ($o in $obs.Sites) {
+        $k = "$($o.file)|$($o.scope)|$($o.callee)|$($o.ord)"
+        if ($index.ContainsKey($k)) { throw "locator $k resolves to more than one extent" }
+        $index[$k] = $o
+    }
+    $covered = @{}
+    foreach ($row in (Get-K8CommandContract)) {
+        $k = "$($row.source_file)|$($row.producer_scope)|$($row.callee)|$($row.call_ordinal)"
+        if (-not $index.ContainsKey($k)) {
+            throw "row $($row.step_id) declares locator $k, which resolves to NO call site. A row that names nothing is a contract that describes code which does not exist."
+        }
+        $covered[$k] = $row.step_id
+    }
+    foreach ($k in $index.Keys) {
+        if (-not $covered.ContainsKey($k)) {
+            throw "call site $k has no contract row. Adding a site is allowed; leaving it out of the contract is what breaks the closed world."
+        }
+    }
+}
+
+Assert-K8Test 'C-8: a missing site plus a duplicate site does NOT pass, even though the total count is unchanged' {
+    # The failure mode the count comparison would miss, reproduced against a
+    # producer that really does hold several sites for the same callee.
+    $obs = Get-K8ObservedSiteTable
+    $group = @($obs.Sites | Where-Object { $_.scope -eq 'Wait-K8ZoneDetectorReady' })
+    if ($group.Count -lt 3) { throw "expected Wait-K8ZoneDetectorReady to hold several same-callee sites; found $($group.Count)" }
+
+    $keys = @($obs.Sites.key)
+    $mutated = @($keys | Where-Object { $_ -ne $group[1].key }) + @($group[0].key)
+    if ($mutated.Count -ne $keys.Count) { throw 'the injected mutation changed the total; the test would not prove anything' }
+    if (@($mutated | Sort-Object -Unique).Count -eq @($keys | Sort-Object -Unique).Count) {
+        throw 'dropping one site and duplicating another left the DISTINCT key set unchanged; the set equation would not detect it'
+    }
+}
+
+Assert-K8Test 'C-8: the two inventory oracles do not share a blind spot -- reachability alone catches an unregistered frozen launcher' {
+    # This is the defect that actually happened: the AST and lexical oracles
+    # agreed on 97 while both missed Get-K8WslField, because both decide by
+    # matching KNOWN NAMES. Adding another same-question oracle cannot fix
+    # that; asking a different question can.
+    $cross = @((Get-K8ObservedSiteTable).Cross)
+    if ($cross.Count -lt 1) { throw 'the reachability oracle found no cross-boundary site; the Get-K8WslField case must remain covered' }
+    if (@($cross | Where-Object { $_.callee -eq 'Get-K8WslField' }).Count -ne 1) {
+        throw 'Get-K8WslField is no longer reported as a cross-boundary process site'
+    }
+    # The AST oracle must NOT see it -- if it did, the two oracles would be
+    # answering the same question again and the union would prove nothing.
+    $local = @((Get-K8ObservedSiteTable).Local)
+    if (@($local | Where-Object { $_.callee -eq 'Get-K8WslField' }).Count -ne 0) {
+        throw 'the AST oracle now reports Get-K8WslField; the oracles must stay structurally different'
+    }
+    # And the reachability oracle must not be carrying a name list.
+    $src = Get-Content $C8Reachability -Raw
+    if ($src -match "'docker'\s*,\s*'git'" -or $src -match '\$script:InvNative') {
+        throw 'the reachability oracle appears to carry a native-name table; that would recreate the shared blind spot'
+    }
+}
+
+Assert-K8Test 'C-8: dynamic invocations are surfaced and adjudicated, never dropped' {
+    $dynamic = @((Get-K8ObservedSiteTable).Dynamic)
+    if ($dynamic.Count -eq 0) { throw 'the AST oracle reported no UNRESOLVED-DYNAMIC entries; `& $var` sites must be surfaced, not skipped' }
+    # The adjudication: every one is either a helper's own process-start
+    # primitive or a scriptblock invocation. Pinning the set means a NEWLY
+    # added `& $var` fails this check until a human classifies it.
+    $primitiveScopes = @('Invoke-K8ShakedownCommand', 'Invoke-K8SeparatedNativeCapture',
+                         'Invoke-K8ShakedownLoggedCommand', 'Invoke-K8ContractedNative')
+    $unadjudicated = @($dynamic | Where-Object {
+        $primitiveScopes -notcontains $_.scope -and $_.expression -notmatch '^\$(Action|deny|mutation|ScriptBlock|Probe|Body)$'
+    })
+    if ($unadjudicated.Count -ne 0) {
+        throw ("unadjudicated dynamic invocation(s): " + (($unadjudicated | ForEach-Object { "$($_.file):$($_.line) $($_.expression)" }) -join '; ') +
+               '. Each must be classified BY HAND as a process-start primitive or a scriptblock call before the inventory can close.')
+    }
+}
+
+Assert-K8Test 'C-8: source_identity_match and contract_conformance are independent facts, and neither is inferred from the other' {
+    $row = Get-K8CommandContractRow -StepId 'F-01'
+    # Conformant argv against an unchanged source: both facts true.
+    $argv = @($row['argv_shape'] | ForEach-Object { if ($_ -match '^<.*>$') { 'x' } else { $_ } })
+    [void](Assert-K8CommandContract -StepId 'F-01' -Argv $argv)
+
+    # Now make ONLY the contract non-conformant. The source is untouched, so
+    # source_identity_match stays true while contract_conformance goes false
+    # -- demonstrating the two are not the same fact.
+    $bad = @($argv); $bad[11] = 'separator=\t'          # the exact SD-09 rewrite
+    $threw = $false
+    try { [void](Assert-K8CommandContract -StepId 'F-01' -Argv $bad) } catch { $threw = $true; $msg = $_.Exception.Message }
+    if (-not $threw) { throw 'SD-09 (separator=/t -> separator=\t) was NOT caught as a contract mismatch' }
+    if ($msg -notmatch 'pre-execution') { throw "expected a pre-execution violation, got: $msg" }
+    if ((Test-K8SourceIdentityMatch -Row $row) -ne $true) { throw 'source identity should still match; a contract mismatch must not be reported as a source change' }
+}
+
+Assert-K8Test 'C-8: SD-09 and SD-11 are caught as contract mismatches, not by a literal blacklist' {
+    # SD-11: the governing step is `ip -o -4 addr show`; the wrong procedure's
+    # command is `ip -br addr`. The point is that ANY departure from the
+    # declared shape fails, not that this one string is banned.
+    $row = Get-K8CommandContractRow -StepId 'F-02'
+    $argv = @('docker', 'exec', 'router1', 'ip', '-br', 'addr')
+    $threw = $false
+    try { [void](Assert-K8CommandContract -StepId 'F-02' -Argv $argv) } catch { $threw = $true }
+    if (-not $threw) { throw 'SD-11 substitution was not caught' }
+
+    # An unrelated, never-blacklisted departure must fail the same way.
+    $novel = @('docker', 'exec', 'router1', 'ip', '-o', '-6', 'addr', 'show')
+    $threw = $false
+    try { [void](Assert-K8CommandContract -StepId 'F-02' -Argv $novel) } catch { $threw = $true }
+    if (-not $threw) { throw 'an UNKNOWN departure from the declared shape passed; the check is behaving like a blacklist' }
+
+    # The check must be implemented as a comparison against the declared
+    # shape, not as a test for known-bad literals. What matters is the
+    # DECIDING CODE: a row's exit_note may legitimately name the historical
+    # error it descends from -- that is documentation, and banning the words
+    # would only make the record less legible.
+    foreach ($fn in 'Test-K8ArgvShapeConformance', 'Assert-K8CommandContract') {
+        $body = Get-K8CommentStrippedFunctionBody -Path (Join-Path $C8Tools 'K8ShakedownCommon.psm1') -Name $fn
+        foreach ($literal in 'ip -br addr', 'separator=\t') {
+            if ($body -match [regex]::Escape($literal)) { throw "$fn compares against the known-bad literal '$literal'; conformance must be decided against the declared shape" }
+        }
+    }
+}
+
+Assert-K8Test 'C-8: changing one byte of a governing frozen document STOPs the Class F step before it runs' {
+    $row = Get-K8CommandContractRow -StepId 'F-04'
+    $path = Get-K8FrozenSourcePath -RelativePath $row['governing_sources'][0]['path']
+    $original = [System.IO.File]::ReadAllBytes($path)
+    try {
+        [System.IO.File]::WriteAllBytes($path, ($original + [byte]0x0A))
+        $threw = $false
+        try { [void](Test-K8SourceIdentityMatch -Row $row) } catch { $threw = $true; $msg = $_.Exception.Message }
+        if (-not $threw) { throw 'a modified governing document did not STOP the step' }
+        if ($msg -notmatch 'NOT a statement that the implementation is wrong') {
+            throw 'the diagnostic does not distinguish "the basis moved" from "the implementation is wrong"'
+        }
+    }
+    finally { [System.IO.File]::WriteAllBytes($path, $original) }
+    # And it must pass again once restored, so the check is not simply always failing.
+    if ((Test-K8SourceIdentityMatch -Row $row) -ne $true) { throw 'the frozen document was not restored correctly' }
+}
+
+Assert-K8Test 'C-8: no frozen prose is parsed at runtime, and no absolute path is baked into the resolver' {
+    $src = Get-Content (Join-Path $C8Tools 'K8ShakedownCommon.psm1') -Raw
+    $start = $src.IndexOf('$script:K8CommandContract = @(')
+    $end = $src.IndexOf('function ConvertTo-K8PythonExecOneLiner')
+    $section = $src.Substring($start, $end - $start)
+    if ($section -match 'Get-Content[^\r\n]*protocol') { throw 'the contract path reads frozen protocol prose at runtime; D-3 forbids it' }
+    if ($section -match 'Select-String|-match\s+.\^#{1,6}\s') { throw 'the contract path appears to parse markdown structure' }
+    if ($src -match "C:\\\\Users|/home/|[A-Za-z]:\\\\K8\\\\") { throw 'an absolute path is hardcoded; that breaks verification from a fresh clone in another directory' }
+}
+
+Assert-K8Test 'C-8: every Class F row cites at least one pinned frozen source, and Class C/I cite none' {
+    foreach ($row in (Get-K8CommandContract)) {
+        $sources = Get-K8CommandContractField -Row $row -Name 'governing_sources'
+        if ($row.class -eq 'F') {
+            if (-not $sources -or @($sources).Count -eq 0) { throw "Class F row $($row.step_id) cites no governing source" }
+            foreach ($s in @($sources)) {
+                foreach ($f in 'path', 'sha256', 'clause') { if (-not $s[$f]) { throw "$($row.step_id) governing source missing '$f'" } }
+                $full = Get-K8FrozenSourcePath -RelativePath $s['path']
+                if (-not (Test-Path -LiteralPath $full)) { throw "$($row.step_id) cites a nonexistent source: $($s['path'])" }
+            }
+        }
+        elseif ($sources) {
+            throw "Class $($row.class) row $($row.step_id) cites a governing source. Declaring a frozen basis that does not exist fabricates normative authority."
+        }
+    }
+    # Several rows genuinely need TWO sources; a singular field would have made
+    # the author pick one and let the other drift unnoticed.
+    $multi = @(Get-K8CommandContract | Where-Object { $_.class -eq 'F' -and @($_['governing_sources']).Count -gt 1 })
+    if ($multi.Count -lt 2) { throw 'expected several Class F rows with multiple governing sources' }
+}
+
+Assert-K8Test 'C-8: a pre-execution violation records NO command semantics -- no argv, no exit code, nothing executed' {
+    $row = Get-K8CommandContractRow -StepId 'F-02'
+    $proposed = @('docker', 'exec', 'router1', 'ip', '-br', 'addr')
+    $caught = $null
+    try { [void](Assert-K8CommandContract -StepId 'F-02' -Argv $proposed) } catch { $caught = $_.Exception }
+    if (-not $caught) { throw 'expected a pre-execution violation' }
+    $data = $caught.Data['k8_conformance']
+    if (-not $data) { throw 'the violation carries no conformance block' }
+    foreach ($f in 'step_id', 'expected_argv', 'proposed_argv', 'mismatch_indices') {
+        if (-not $data.Contains($f)) { throw "conformance block is missing '$f'" }
+    }
+    # The Batch 1 fields mean "an executed command's semantics". They must be
+    # ABSENT, not null: a planned argv written into `argv` would record an
+    # unexecuted command as executed.
+    foreach ($f in 'argv', 'exit_code', 'stdout', 'stderr') {
+        if ($data.Contains($f)) { throw "the conformance block carries '$f'; command semantics must not be fabricated for a command that never ran" }
+    }
+    if ($data['proposed_argv'] -join ' ' -ne ($proposed -join ' ')) { throw 'proposed_argv does not match what the producer was about to run' }
+    if (@($data['mismatch_indices']).Count -eq 0) { throw 'no mismatch positions were reported' }
+}
+
+Assert-K8Test 'C-8: caller-role rows bind on PROVENANCE, not on a variable name, and cover every generic-executor caller' {
+    $callers = @(Get-K8CallerRoleContract)
+    if ($callers.Count -ne 8) { throw "expected 8 caller-role rows, got $($callers.Count)" }
+    foreach ($cr in $callers) {
+        [void](Get-K8CommandContractRow -StepId $cr.process_step_id)
+        if (-not $cr.ContainsKey('governing_sources') -or @($cr['governing_sources']).Count -eq 0) { throw "$($cr.caller_id) cites no governing source" }
+    }
+    # The two tshark callers use the SAME local variable name, which is why a
+    # name-based binding would not even distinguish them.
+    $src = Get-Content (Join-Path $C8Tools 'K8ShakedownCommon.psm1') -Raw
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$null)
+    $funcs = @{}
+    foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) { $funcs[$f.Name] = $f }
+    foreach ($fn in 'Write-K8UnrelatedPcapRows', 'Write-K8TargetCaptureDecode') {
+        if ($funcs[$fn].Extent.Text -notmatch '\$pcap\s*=') { throw "$fn no longer holds its pcap in `$pcap; the point of the provenance anchor was that BOTH callers use the same name" }
+    }
+    # CR-01's anchor is what actually closes SD-13.
+    $cr01 = @($callers | Where-Object { $_.caller_id -eq 'CR-01' })[0]
+    $anchor = $cr01['artifact_provenance_anchor']
+    if ($anchor['kind'] -ne 'derived-from-function') { throw 'CR-01 must bind to the assignment source, not a name' }
+    if ($funcs['Write-K8UnrelatedPcapRows'].Extent.Text -notmatch [regex]::Escape($anchor['anchor'])) {
+        throw "CR-01's declared provenance anchor $($anchor['anchor']) does not appear in its producer"
+    }
+    # The anchor must be a POSITIVE requirement, not a blacklist of the wrong pcap.
+    foreach ($cr in $callers) {
+        if (($cr | ConvertTo-Json -Depth 6) -match 'c2-mirror-sensor\.pcap' -and $cr.caller_id -eq 'CR-01') {
+            throw 'CR-01 names the forbidden pcap; the binding must state what IS required'
+        }
+    }
+}
+
+Assert-K8Test 'C-8: SD-13 is caught by provenance even though the argv and the variable name are unchanged' {
+    $src = Get-Content (Join-Path $C8Tools 'K8ShakedownCommon.psm1') -Raw
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$null)
+    $fn = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Write-K8UnrelatedPcapRows' }, $true))[0]
+    $cr01 = @(Get-K8CallerRoleContract | Where-Object { $_.caller_id -eq 'CR-01' })[0]
+    $anchor = $cr01['artifact_provenance_anchor']['anchor']
+
+    # Positive: the real code satisfies the anchor.
+    if ($fn.Extent.Text -notmatch [regex]::Escape($anchor)) { throw 'the live code does not satisfy CR-01 (positive case failed)' }
+
+    # Negative: reassign $pcap from the Sensor pcap instead. argv_shape is
+    # untouched and the variable is still called $pcap -- the ONLY thing that
+    # changed is where the value came from, which is exactly what SD-13 was.
+    $mutated = $fn.Extent.Text -replace [regex]::Escape('$spec.Artifact'), "'sensor-input\mirror-capture\c2-mirror-sensor.pcap'"
+    $mutated = $mutated -replace [regex]::Escape('$spec = Get-K8Robs05LivenessSpec -RunId $RunId'), '$spec = $null'
+    if ($mutated -match [regex]::Escape($anchor)) { throw 'the mutation did not actually remove the anchor; the negative case proves nothing' }
+    if ($mutated -notmatch '\$pcap\s*=') { throw 'the mutation also removed the variable; it must isolate PROVENANCE from naming' }
+}
+
+Assert-K8Test 'C-8: tool versions are retained but never gated, while a missing REQUIRED tool still STOPs' {
+    # Version drift must not stop anything: no frozen source pins a version.
+    $rows = @(Get-K8CommandContract | Where-Object { $_.ContainsKey('availability_policy') })
+    foreach ($r in @($rows | Where-Object { $_.class -eq 'I' })) {
+        if ($r['availability_policy'] -ne 'optional') { throw "Class I row $($r.step_id) must be optional" }
+        if ($null -ne $r['accepted_exit_codes']) { throw "Class I row $($r.step_id) must declare accepted_exit_codes = `$null (not gated)" }
+    }
+    foreach ($r in @($rows | Where-Object { $_['availability_policy'] -eq 'required' })) {
+        if ($r.class -eq 'I') { throw "row $($r.step_id) is Class I but required; a site that stops Setup is not informational" }
+    }
+
+    # A required tool that is absent must still STOP, and must say so as a
+    # MISSING BINARY -- the previous code reported "not found on PATH" even
+    # when the binary was present but produced no output.
+    $threw = $false; $msg = ''
+    try {
+        [void](Get-K8RequiredToolVersion -StepId 'C-56' -FilePath 'k8-definitely-not-a-real-binary' -ArgumentList @('--version') -Requirement 'test')
+    }
+    catch { $threw = $true; $msg = $_.Exception.Message }
+    if (-not $threw) { throw 'a missing required tool did not STOP' }
+
+    # And the optional probe must survive its own failure without stopping.
+    $rec = Get-K8CollapsedToolObservation -StepId 'I-05' -Probe { throw 'simulated wsl failure' }
+    if ($rec['status'] -eq 'succeeded') { throw 'a failed optional probe was recorded as succeeded' }
+    if ($null -ne $rec['exit_code']) { throw 'an unobservable exit code must be null, never 0' }
+
+    # I-05's frozen producer reports failure IN BAND, as a string. Recording
+    # that as a success would convert "could not observe" into "observed".
+    $inBand = Get-K8CollapsedToolObservation -StepId 'I-05' -Probe { 'unavailable: exit 1 : wsl not installed' }
+    if ($inBand['status'] -ne 'unavailable') { throw "an in-band 'unavailable:' string was recorded as $($inBand['status'])" }
+}
+
+Assert-K8Test 'C-8: I-07/I-08 declare full fidelity and actually retain exit and stderr -- the label matches the record' {
+    Reset-K8ContractRows
+    # A synthetic Class I row: accepted_exit_codes = $null, so the contracted
+    # path observes the exit without gating on it -- which is what lets a
+    # non-zero come back as a RECORD rather than as a throw.
+    Add-K8TestContractRow -Row @{ step_id = 'TEST-OPTIONAL'; class = 'I'; ranges = 'ab'
+        source_file = 'test'; producer_scope = 'test'; callee = 'cmd.exe'; call_ordinal = 1
+        argv_shape = @('cmd.exe', '/c', '<synthetic>'); stream_expectation = 'separated'
+        accepted_exit_codes = $null; availability_policy = 'optional'; informational_value = $true
+        exit_note = 'synthetic fixture; not a real call site' }
+    # A separate row for the missing-binary case: its argv has a different
+    # SHAPE, and reusing the row above would make the probe fail the
+    # pre-execution gate instead of reaching the not-found path -- which would
+    # test the wrong thing while still looking like a failure to classify.
+    Add-K8TestContractRow -Row @{ step_id = 'TEST-OPTIONAL-MISSING'; class = 'I'; ranges = 'ab'
+        source_file = 'test'; producer_scope = 'test'; callee = 'test'; call_ordinal = 1
+        argv_shape = @('<binary>', '--version'); stream_expectation = 'separated'
+        accepted_exit_codes = $null; availability_policy = 'optional'; informational_value = $true
+        exit_note = 'synthetic fixture; not a real call site' }
+
+    # The defect this guards: an earlier implementation routed I-07/I-08
+    # through the same helper as I-05, whose probe returns only a STRING. The
+    # rows said observation_fidelity = full while every record carried
+    # exit_code = null and no stderr at all -- a claim to have observed more
+    # than was kept. The two helpers are now separate functions so the record
+    # shape follows from which one was called, not from a label the caller
+    # chose.
+    $body = Get-K8CommentStrippedFunctionBody -Path (Join-Path $C8Tools 'K8ShakedownCommon.psm1') -Name 'Get-K8OptionalToolObservation'
+    foreach ($field in "exit_code", 'stdout', 'stderr') {
+        if ($body -notmatch [regex]::Escape("'$field'")) { throw "Get-K8OptionalToolObservation does not record '$field'" }
+    }
+    if ($body -notmatch 'Invoke-K8ContractedNative') { throw 'the full-fidelity probe does not go through the contracted path, so it cannot see the exit code' }
+
+    # A non-zero exit is recorded as unavailable WITH its real exit code, and
+    # never stops the run.
+    $nonZero = Get-K8OptionalToolObservation -StepId 'TEST-OPTIONAL' -FilePath 'cmd.exe' -ArgumentList @('/c', 'echo OUT& exit /b 4')
+    if ($nonZero['exit_code'] -ne 4) { throw "expected the real exit code 4, got '$($nonZero['exit_code'])'" }
+    if ($nonZero['status'] -ne 'unavailable') { throw "a non-zero exit was recorded as $($nonZero['status']); non-empty stdout must not make a failure look like a success" }
+    if ($nonZero['observation_fidelity'] -ne 'full') { throw 'a fully observable site must not claim degraded fidelity' }
+
+    # A clean run records the exit AND both streams.
+    $ok = Get-K8OptionalToolObservation -StepId 'TEST-OPTIONAL' -FilePath 'cmd.exe' -ArgumentList @('/c', 'echo VERSION 1.2& echo NOISE 1>&2')
+    if ($ok['status'] -ne 'succeeded') { throw "a clean probe was recorded as $($ok['status'])" }
+    if ($ok['exit_code'] -ne 0) { throw 'exit code was not retained on the success path' }
+    if ($ok['stdout'] -notmatch 'VERSION') { throw 'stdout was not retained' }
+    if ($ok['stderr'] -notmatch 'NOISE') { throw 'stderr was DISCARDED; the row claims full fidelity' }
+
+    # Exit 0 with no output is not a version observation.
+    $silent = Get-K8OptionalToolObservation -StepId 'TEST-OPTIONAL' -FilePath 'cmd.exe' -ArgumentList @('/c', 'exit /b 0')
+    if ($silent['status'] -eq 'succeeded') { throw 'a silent exit-0 probe was recorded as a successful version observation' }
+
+    # A missing binary is not-found, and still does not stop anything.
+    $missing = Get-K8OptionalToolObservation -StepId 'TEST-OPTIONAL-MISSING' -FilePath 'k8-definitely-not-a-real-binary' -ArgumentList @('--version')
+    if ($missing['status'] -ne 'not-found') { throw "a missing binary was recorded as $($missing['status'])" }
+    if ($null -ne $missing['exit_code']) { throw 'a command that never ran must not carry an exit code' }
+}
+
+Assert-K8Test 'C-8: the runtime tool record is written AFTER I-08 is observed, and cannot inherit another run''s reading' {
+    $src = Get-Content (Join-Path $C8Tools 'K8ShakedownCommon.psm1') -Raw
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$null)
+    $body = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-K8ShakedownRangeABBody' }, $true))[0].Extent.Text
+
+    # ORDER: I-08 is observed inside gateway resolution, so the record must be
+    # written after that call -- not after I-07, which comes earlier.
+    $gatewayAt = $body.IndexOf('Resolve-K8GatewayInterface -RunId')
+    $writeAt = $body.IndexOf('Write-K8ToolVersionRecord')
+    if ($gatewayAt -lt 0 -or $writeAt -lt 0) { throw 'could not locate the gateway resolution or the record write' }
+    if ($writeAt -lt $gatewayAt) {
+        throw 'the runtime tool-version record is written BEFORE gateway resolution, so every record would be missing its own run''s I-08 reading'
+    }
+
+    # NO CARRY-OVER: a module-scope stash is initialised once per import, so a
+    # second run in the same process would inherit the first run's value. The
+    # observation must travel back on the gateway result instead.
+    if ($src -match '\$script:K8RuntimeToolVersions') {
+        throw 'I-08 is held in a module-scope variable; in a process handling two runs the second record could carry the first run''s observation'
+    }
+    $resolve = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Resolve-K8GatewayInterface' }, $true))[0].Extent.Text
+    if ($resolve -notmatch "ToolObservation\s*=") { throw 'Resolve-K8GatewayInterface does not return its I-08 observation to the caller' }
+    if ($body -notmatch [regex]::Escape('$gw.ToolObservation')) { throw 'the run body does not take I-08 from the gateway result' }
+
+    # Both ranges take this path: gateway resolution is not Range B only, so
+    # neither range may end up with a record that has no I-08 entry.
+    $rangeGuard = [regex]::Match($body, "(?s)Set-K8ShakedownRunStage -Stage 'gateway-resolution'.{0,400}")
+    if ($rangeGuard.Value -match "if \(\`$Range -eq 'b'\)") { throw 'gateway resolution appears to be gated on Range B; I-08 must be observed on both ranges' }
+}
+
+Assert-K8Test 'C-8: two consecutive runs each record their OWN runtime observations, with no carry-over' {
+    # Exercised against the record writer directly: the defect being excluded
+    # is a stale value surviving between runs in one process.
+    $runA = 'k8shakedown-rangea-toolrec-a'
+    $runB = 'k8shakedown-rangeb-toolrec-b'
+    $obsA = [ordered]@{ step_id = 'I-08'; status = 'succeeded'; value = 'ip utility, iproute2-A'; exit_code = 0; stdout = 'A'; stderr = ''; observation_fidelity = 'full'; availability_policy = 'optional' }
+    $obsB = [ordered]@{ step_id = 'I-08'; status = 'succeeded'; value = 'ip utility, iproute2-B'; exit_code = 0; stdout = 'B'; stderr = ''; observation_fidelity = 'full'; availability_policy = 'optional' }
+    $pathA = Write-K8ToolVersionRecord -RunId $runA -Records @($obsA) -CapturePhase 'run'
+    $pathB = Write-K8ToolVersionRecord -RunId $runB -Records @($obsB) -CapturePhase 'run'
+    try {
+        $a = Get-Content -LiteralPath $pathA -Raw | ConvertFrom-Json
+        $b = Get-Content -LiteralPath $pathB -Raw | ConvertFrom-Json
+        if ($a.run_id -eq $b.run_id) { throw 'the two runs wrote to the same record' }
+        if (@($a.tools).Count -ne 1 -or @($b.tools).Count -ne 1) { throw 'a record carries more entries than the run observed' }
+        if ($a.tools[0].value -notmatch 'iproute2-A') { throw "run A's record does not hold run A's observation" }
+        if ($b.tools[0].value -notmatch 'iproute2-B') { throw "run B's record holds a carried-over observation: $($b.tools[0].value)" }
+        if ($a.gated -ne $false -or $b.gated -ne $false) { throw 'the record does not state that these values are not gated' }
+        if ($a.capture_phase -ne 'run') { throw 'capture_phase is not recorded' }
+    }
+    finally {
+        foreach ($id in $runA, $runB) {
+            Remove-Item (Join-Path (Get-K8RunRecordsDir) $id) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Assert-K8Test 'C-8: runtime-installed container tools are observed per run, and are never claimed to be fixed by image identity' {
+    foreach ($id in 'I-07', 'I-08') {
+        $row = Get-K8CommandContractRow -StepId $id
+        if ($row.class -ne 'I') { throw "$id must be Class I -- no frozen source pins these versions" }
+        if ($null -ne $row['accepted_exit_codes']) { throw "$id must not be gated" }
+    }
+    # The retracted claim must not be anywhere in the module: frozen
+    # c2-dnp3-image-inventory.md SS1/SS2 record that log_structurer INSTALLS
+    # tshark at startup and that a bit-identical image is not claimed.
+    $src = Get-Content (Join-Path $C8Tools 'K8ShakedownCommon.psm1') -Raw
+    if ($src -match 'image identity[^.]{0,80}fixes? the (bytes|version)' -or
+        $src -match 'digest[^.]{0,60}so (the )?tshark') {
+        throw 'the module claims container image identity fixes a runtime-installed tool; the frozen inventory explicitly does not claim that'
+    }
+    # I-05 is the only row whose observation fidelity is degraded, and it must
+    # SAY so rather than reconstruct what the frozen producer destroyed.
+    $collapsed = @(Get-K8CommandContract | Where-Object { $_['observation_fidelity'] -eq 'frozen-producer-collapsed' })
+    if ($collapsed.Count -ne 1 -or $collapsed[0].step_id -ne 'I-05') {
+        throw "exactly one row (I-05) may declare frozen-producer-collapsed; found $($collapsed.Count)"
     }
 }
 

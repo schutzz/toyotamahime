@@ -69,7 +69,7 @@ Write-K8ShakedownLog -Level STEP -Message "=== Shakedown Range C starting: $RunI
 Set-K8ShakedownRunStage -Stage 'source-worktree-check'
 $rangeCSource = $state.amenonuboco_rangec_dir
 $disposable = Join-Path $state.shakedown_root "runs\$RunId\worktree"
-$sourceStatus = (git -C $rangeCSource status --porcelain | Out-String).Trim()
+$sourceStatus = Get-K8ContractedNativeText -StepId 'C-46' -FilePath 'git' -ArgumentList @('-C', $rangeCSource, 'status', '--porcelain')
 if ($sourceStatus) {
     throw "Range C source checkout $rangeCSource is not clean before copy:`n$sourceStatus`nNot proceeding -- this is a STOP condition, not something to auto-fix (e.g. from a leftover prior Shakedown run)."
 }
@@ -108,8 +108,8 @@ Copy-Item -Path $derivedPatch -Destination (Join-Path $RunEvidence 'range-c-deri
 Set-K8ShakedownRunStage -Stage 'patch-apply'
 Push-Location $disposable
 try {
-    Invoke-K8ShakedownCommand -FilePath 'git' -ArgumentList @('apply', '--ignore-space-change', '--check', $derivedPatch) -Description 'derived patch check'
-    Invoke-K8ShakedownCommand -FilePath 'git' -ArgumentList @('apply', '--ignore-space-change', $derivedPatch) -Description 'derived patch apply'
+    Invoke-K8ShakedownCommand -StepId 'F-33' -FilePath 'git' -ArgumentList @('apply', '--ignore-space-change', '--check', $derivedPatch) -Description 'derived patch check'
+    Invoke-K8ShakedownCommand -StepId 'F-34' -FilePath 'git' -ArgumentList @('apply', '--ignore-space-change', $derivedPatch) -Description 'derived patch apply'
     # Retained HERE, immediately after `git apply` succeeded and before the
     # validator runs: these are exactly the bytes the validator is about to
     # read, and nothing modifies the file between this copy and that read.
@@ -121,12 +121,29 @@ try {
     $stdoutPath = Join-Path $RunEvidence 'validate.stdout.txt'
     $stderrPath = Join-Path $RunEvidence 'validate.stderr.txt'
     Write-K8ShakedownLog -Level STEP -Message 'RUN: python platform/cli.py validate manifests/power-grid-reference.range-c-negative.yaml'
-    $pyVersion = (python --version 2>&1 | Out-String).Trim()
+    # C-60: python must be runnable before the single permitted command. The
+    # VERSION is retained, never gated; being executable IS gated.
+    $pyVersionRecord = Get-K8RequiredToolVersion -StepId 'C-60' -FilePath 'python' -ArgumentList @('--version') `
+        -Requirement 'python is required to run the pinned Range C validator'
+    $pyVersion = $pyVersionRecord['value']
+
     $validatorArgv = @('cmd.exe', '/c', 'python', 'platform\cli.py', 'validate', 'manifests\power-grid-reference.range-c-negative.yaml')
+    # F-35 PRE-EXECUTION gate. Not routed through Invoke-K8ContractedNative:
+    # this call redirects both streams to files inside cmd.exe precisely so no
+    # PowerShell re-encoding happens, and the row's stream_expectation is
+    # file-backed to say so. The contract is applied around the call instead.
+    [void](Assert-K8CommandContract -StepId 'F-35' -Argv $validatorArgv)
     $validatorStartedUtc = Get-K8UtcNow
     & cmd.exe /c "python platform\cli.py validate manifests\power-grid-reference.range-c-negative.yaml > `"$stdoutPath`" 2> `"$stderrPath`""
     $exitCode = $LASTEXITCODE
     Write-K8ShakedownLog -Message "validate exit code: $exitCode (exit 1 is the EXPECTED outcome per README SS5.3/SS6.1 -- not treated as failure)"
+    # F-35 POST-OBSERVATION gate. The acceptance domain is @(0, 1) and BOTH
+    # values pass: exit 1 is the frozen expected rejection, and exit 0 is the
+    # scientific observation that the apparatus did NOT reject the negative
+    # manifest. Turning exit 0 into a tooling STOP would convert a finding into
+    # an error. Only >=2 (argparse/interpreter failure) stops here.
+    [void](Assert-K8CommandObservation -StepId 'F-35' -ExitCode $exitCode -Argv $validatorArgv `
+        -Diagnostic "stdout file: $stdoutPath; stderr file: $stderrPath")
 
     # C-4. This is the closed-world's only `direct cmd.exe` producer, and the
     # one whose emptiness matters most: a Range C stdout of 0 bytes is the
