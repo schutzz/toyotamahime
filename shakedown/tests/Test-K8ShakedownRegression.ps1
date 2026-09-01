@@ -5032,6 +5032,78 @@ Assert-K8Test 'C-8: SD-09 and SD-11 are caught as contract mismatches, not by a 
     }
 }
 
+Assert-K8Test 'C-8: F-15 accepts BOTH real Elasticsearch shapes, and the variadic tail does not stop the prefix being checked' {
+    # F-15 is the one row whose argv genuinely varies in length, and the Plan's
+    # Annex A fixed a single fixed-length shape for it. That shape would have
+    # STOPped the legitimate POST form, so the as-built row ends in '<*>'.
+    # A tail wildcard introduces the OPPOSITE risk -- quietly checking less --
+    # so both directions are pinned here rather than only the passing one.
+    $c = 'k8shakedown-collector'
+    $url = 'http://localhost:9200/logs-ot-dnp3-collector/_mapping'
+    $head = @('docker', 'exec', $c, 'curl', '-sS', '-o', '/tmp/es-body.json', '-w', '%{http_code}', '-X')
+    $hdr = @('-H', 'Content-Type: application/json')
+
+    # (1) GET mapping: no request body, so the variadic tail is EMPTY. If the
+    #     prefix comparison required at least one tail element, this real call
+    #     would STOP.
+    [void](Assert-K8CommandContract -StepId 'F-15' -Argv ($head + @('GET', $url) + $hdr))
+
+    # (2) POST search: same invariant prefix, plus the body pair. This is the
+    #     call the Annex A shape would have rejected.
+    [void](Assert-K8CommandContract -StepId 'F-15' -Argv ($head + @('POST', $url) + $hdr + @('--data-binary', '{"query":{"match_all":{}}}')))
+
+    # (3) An ALTERED invariant element must STOP even though the tail is free.
+    #     Without -w %{http_code} the HTTP status is not parseable at all, so
+    #     this is exactly the kind of substitution the row exists to catch.
+    $altered = @('docker', 'exec', $c, 'curl', '-sS', '-o', '/tmp/es-body.json', '-w', '%{time_total}', '-X', 'GET', $url) + $hdr
+    $threw = $false
+    try { [void](Assert-K8CommandContract -StepId 'F-15' -Argv $altered) } catch { $threw = $true }
+    if (-not $threw) { throw 'an altered invariant element passed; the trailing <*> is swallowing the prefix check' }
+
+    # (4) A MISSING invariant element must STOP. This is the failure mode a
+    #     variadic tail invites: an argv that simply runs out before the
+    #     mismatch would be reached.
+    $threw = $false
+    try { [void](Assert-K8CommandContract -StepId 'F-15' -Argv @('docker', 'exec', $c, 'curl', '-sS', '-o', '/tmp/es-body.json')) } catch { $threw = $true }
+    if (-not $threw) { throw 'a truncated argv passed; a shorter command must not become "conformant" by ending early' }
+
+    # (5) The Content-Type header is emitted UNCONDITIONALLY by the producer,
+    #     so it belongs to the pinned prefix and not to the GET/POST variation.
+    #     Dropping it must STOP; otherwise the wildcard would be covering an
+    #     invariant, which is more than the correction claims to allow.
+    $threw = $false
+    try { [void](Assert-K8CommandContract -StepId 'F-15' -Argv ($head + @('GET', $url))) } catch { $threw = $true }
+    if (-not $threw) { throw 'the Content-Type header is not pinned; the variadic tail covers more than the GET/POST difference' }
+}
+
+Assert-K8Test 'C-8: a variadic marker is valid ONLY as the last element, and only F-15 uses one' {
+    # Synthetic shapes on purpose: what is pinned here is the conformance
+    # engine's rule. Putting a mid-shape '<*>' into a real contract row to test
+    # it would be committing the very defect the rule rejects.
+    $threw = $false; $msg = ''
+    try {
+        [void](Test-K8ArgvShapeConformance -Shape @('docker', '<*>', 'ip', '-o', '-4', 'addr', 'show') `
+                                           -Argv  @('docker', 'exec', 'router1', 'ip', '-br', 'addr'))
+    }
+    catch { $threw = $true; $msg = $_.Exception.Message }
+    if (-not $threw) { throw "a '<*>' in a non-final position was accepted; SD-11's substitution would slide through the wildcard" }
+    if ($msg -notmatch 'only as the LAST element') { throw "the rejection does not name the rule it enforces: $msg" }
+
+    # No real row may carry one anywhere but last...
+    foreach ($row in (Get-K8CommandContract)) {
+        $shape = @($row['argv_shape'])
+        for ($i = 0; $i -lt ($shape.Count - 1); $i++) {
+            if ($shape[$i] -eq '<*>') { throw "row $($row.step_id) has a non-final '<*>' at position $i" }
+        }
+    }
+    # ...and exactly one row needs one at all. A second would mean the tail
+    # wildcard had started being used as a way to avoid declaring a shape.
+    $variadic = @(Get-K8CommandContract | Where-Object { @($_['argv_shape'])[-1] -eq '<*>' })
+    if ($variadic.Count -ne 1 -or $variadic[0].step_id -ne 'F-15') {
+        throw "expected exactly F-15 to use a trailing '<*>'; got [$(@($variadic.step_id) -join ', ')]"
+    }
+}
+
 Assert-K8Test 'C-8: changing one byte of a governing frozen document STOPs the Class F step before it runs' {
     $row = Get-K8CommandContractRow -StepId 'F-04'
     $path = Get-K8FrozenSourcePath -RelativePath $row['governing_sources'][0]['path']

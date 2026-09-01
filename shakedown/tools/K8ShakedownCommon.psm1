@@ -2044,9 +2044,9 @@ $script:K8CommandContract = @(
     @{ step_id = 'F-15'; class = 'F'; ranges = 'ab'
        source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ElasticsearchRequest'; callee = "'docker'"; call_ordinal = 2
        governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md' -Clause 'SS3 fixed request, no retry'))
-       argv_shape = @('docker','exec','<container>','curl','-sS','-o','<body-file>','-w','%{http_code}','-X','<method>','<url>','<*>')
+       argv_shape = @('docker','exec','<container>','curl','-sS','-o','<body-file>','-w','%{http_code}','-X','<method>','<url>','-H','Content-Type: application/json','<*>')
        stream_expectation = 'separated'; accepted_exit_codes = @(0)
-       exit_note = 'Generic executor, and the one row that needs a variadic tail: a GET mapping request ends at the URL while a POST search adds -H and --data-binary. The invariant prefix -- including the fixed -sS (no retry, errors surfaced) and the -w %{http_code} marker -- is pinned here; WHICH request this is (Collector, Rule or R-OBS-05) is fixed by caller-role rows CR-03..CR-08, never by this argv.' }
+       exit_note = 'Generic executor, and the one row that needs a variadic tail: the ONLY part of this argv that varies is the trailing body pair, which a POST search carries (--data-binary <body>) and a GET mapping request does not. Everything else -- including the fixed -sS (no retry, errors surfaced), the -w %{http_code} marker, and the unconditional Content-Type header -- is invariant and is pinned in the prefix, so the tail wildcard covers exactly the GET/POST difference and nothing more. WHICH request this is (Collector, Rule or R-OBS-05) is fixed by caller-role rows CR-03..CR-08, never by this argv.' }
 
     @{ step_id = 'F-16'; class = 'F'; ranges = 'ab'
        source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Write-K8ImageInventory'; callee = "'docker'"; call_ordinal = 1
@@ -2908,8 +2908,10 @@ function Test-K8ArgvShapeConformance {
 
     # A trailing '<*>' pins an invariant PREFIX and leaves the tail
     # unconstrained. Exactly one row needs it: F-15's generic Elasticsearch
-    # executor, whose argv genuinely varies in length (a GET mapping request
-    # carries no -H / --data-binary, a POST search does). The alternative --
+    # executor, whose argv genuinely varies in length -- a POST search carries
+    # a `--data-binary <body>` pair that a GET mapping request does not. The
+    # Content-Type header is NOT part of that variation: it is emitted
+    # unconditionally, so it belongs to the pinned prefix. The alternative --
     # padding the shape with optional slots -- would let a role substitution
     # slide through as a "shorter but conformant" argv.
     #
