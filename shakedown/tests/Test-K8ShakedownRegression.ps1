@@ -5958,6 +5958,18 @@ Assert-K8Test 'C-9: the embedded source identity is bound to the sequence it cla
             'an unconfirmed ancestry' = @{ ancestry = 'not-observed'; ancestry_note = 'injected' }
             'a wrong schema'         = @{ schema = 'k8shakedown-source-identity/999' }
             'a blank remote_ref'     = @{ remote_ref = '' }
+
+            # These are the ones a non-empty check misses. `confirmed` is the
+            # record's claim about ITSELF: it says publication was confirmed,
+            # never against WHAT. Each of the next three is well-formed, has
+            # ancestry=confirmed, and names something that is not the canonical
+            # producer source.
+            'a foreign but non-empty remote'  = @{ remote_url_normalized = 'github.com/somebody/else' }
+            'a foreign but non-empty ref'     = @{ remote_ref = 'refs/heads/foreign' }
+            'fetched_oid != remote_ref_commit' = @{ fetched_oid = ('a' * 40) }
+            'a malformed OID'                 = @{ remote_ref_commit = 'not-a-sha' }
+            'a dirty tree'                    = @{ tree_clean = $false }
+            'dirty paths despite a clean flag' = @{ dirty_paths = @(' M something.ps1') }
         }
         foreach ($case in $mutations.Keys) {
             try {
@@ -5974,6 +5986,63 @@ Assert-K8Test 'C-9: the embedded source identity is bound to the sequence it cla
         # Still good after the restores, so the failures above were the
         # mutations and not collateral damage.
         [void](Assert-K8EmbeddedSourceIdentity -Consistency $consistency)
+    }
+}
+
+Assert-K8Test 'C-9: the manifest builder trusts no caller-supplied selection object' {
+    Import-Module $CommonPath -Force
+    # An earlier version took a -Consistency object and asserted in a comment
+    # that only Assert-K8BundleRunConsistency could produce one. PowerShell
+    # gives a PSCustomObject no such property, and the module exports
+    # everything, so any caller could have handed over a look-alike and skipped
+    # a/b/c coverage, completed_runs membership and terminated exclusion --
+    # a second entrance to the gate B3B-P-04 had just closed.
+    $params = (Get-Command New-K8TransferManifest).Parameters
+    if ($params.ContainsKey('Consistency')) { throw 'New-K8TransferManifest still accepts a caller-supplied selection object; a plain object is not proof that a gate ran' }
+    if (-not $params.ContainsKey('RunIds')) { throw 'New-K8TransferManifest does not take run IDs, so it cannot be running the gate itself' }
+    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'New-K8TransferManifest'
+    if ($body -notmatch 'Assert-K8BundleRunConsistency') { throw 'New-K8TransferManifest does not re-run the consistency gate' }
+
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $seq = New-K8QualificationSequence -RepoRoot $sb.Repo
+        $ids = @()
+        foreach ($range in 'a', 'b', 'c') {
+            $run = Start-K8ShakedownRun -Range $range -RepoRoot $sb.Repo
+            Complete-K8ShakedownRunInSequence -Run $run | Out-Null
+            $ids += $run.RunId
+        }
+        # A second sequence, whose runs are perfectly real and belong elsewhere.
+        $seq2 = New-K8QualificationSequence -RepoRoot $sb.Repo
+        $other = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        Complete-K8ShakedownRunInSequence -Run $other | Out-Null
+
+        $bundle = Join-Path $sb.Root 'bundle'
+        New-Item -ItemType Directory -Force -Path $bundle | Out-Null
+        'data' | Set-Content -LiteralPath (Join-Path $bundle 'evidence.txt') -Encoding utf8NoBOM
+
+        # The forgery the old signature would have accepted: correct sequence
+        # and HEAD (so the source-identity comparison passes), arbitrary runs.
+        $forged = [pscustomobject]@{
+            SequenceId  = $seq.sequence_id
+            ToolingHead = $sb.Head
+            Sequence    = @{ locked_head = $sb.Head; completed_runs = @(); terminated_runs = @() }
+            Runs        = @([ordered]@{ run_id = $other.RunId; range = 'a'; sequence_id = $seq.sequence_id; tooling_head = $sb.Head })
+        }
+        $rejected = $false
+        try { New-K8TransferManifest -Consistency $forged -BundleRoot $bundle -Exclusions @() }
+        catch { $rejected = $true }
+        if (-not $rejected) { throw 'a forged selection object produced a manifest' }
+
+        # And the honest path still works, so this is not simply failing.
+        $manifest = New-K8TransferManifest -RunIds $ids -BundleRoot $bundle -Exclusions @()
+        if ($manifest.sequence_id -ne $seq.sequence_id) { throw 'the genuine selection did not produce a manifest for its own sequence' }
+
+        # Passing the other sequence's run through the front door is refused by
+        # the gate the builder now runs itself.
+        Assert-K8FailsClosed -What 'building a manifest from a run outside the sequence' -Because 'C-9' -Attempt {
+            New-K8TransferManifest -RunIds @($other.RunId) -BundleRoot $bundle -Exclusions @()
+        }
     }
 }
 

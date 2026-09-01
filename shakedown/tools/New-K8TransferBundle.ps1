@@ -105,7 +105,10 @@ $exclusions = @(
 )
 
 # 3. The producer's claim.
-$manifest = New-K8TransferManifest -Consistency $consistency -BundleRoot $Destination -Exclusions $exclusions
+# Deliberately passes the run IDs again rather than the object from step 1:
+# the manifest builder re-runs the gate itself, so nothing it produces depends
+# on a caller having done so.
+$manifest = New-K8TransferManifest -RunIds $RunId -BundleRoot $Destination -Exclusions $exclusions
 $manifestPath = Join-Path $Destination 'transfer-manifest.json'
 Write-K8AtomicFile -Path $manifestPath -Content (($manifest | ConvertTo-Json -Depth 12) + "`n")
 Write-K8ShakedownLog -Message "transfer-manifest.json written over $(@($manifest.files).Count) file(s)."

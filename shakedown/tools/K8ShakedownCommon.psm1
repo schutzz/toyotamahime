@@ -2257,8 +2257,18 @@ function Assert-K8EmbeddedSourceIdentity {
         source identity is the anchor the whole chain hangs from, so an
         unchecked one breaks the chain at its centre while looking intact.
 
-        Every field checked here is cross-checked against a DIFFERENT record
-        (the sequence record and the run provenance), not against itself.
+        Nothing here is checked against the record itself. The sequence id,
+        HEAD and locked_head come from the sequence record and the run
+        provenance; the remote identity comes from the canonical pin.
+
+        THE REMOTE FIELDS MATTER MOST, and an earlier version only checked they
+        were non-empty. `ancestry: confirmed` is the record's own claim about
+        itself -- it says publication was confirmed, not WHERE. A record naming
+        a foreign remote or a foreign ref, with ancestry confirmed, was
+        accepted, and would have been published as this bundle's provenance.
+        That is the same collapse the sequence-open gate exists to prevent
+        (an ancestor of SOMETHING is not publication to the canonical source),
+        reappearing at assembly time.
     #>
     param([Parameter(Mandatory)] $Consistency)
     $sequenceId = [string]$Consistency.SequenceId
@@ -2286,6 +2296,40 @@ function Assert-K8EmbeddedSourceIdentity {
     if ([string]$identity['ancestry'] -ne 'confirmed') {
         throw "C-9: the source identity records ancestry '$($identity['ancestry'])'. Only a confirmed publication may be embedded as a bundle's provenance -- $($identity['ancestry_note'])."
     }
+
+    # Re-bind to the canonical pin. `confirmed` alone does not say confirmed
+    # AGAINST WHAT.
+    $pin = Get-K8ProducerSourcePin
+    $allowed = @($pin.CanonicalRemoteUrls | ForEach-Object { ConvertTo-K8NormalizedRemoteUrl -Url $_ })
+    if ($allowed -notcontains [string]$identity['remote_url_normalized']) {
+        throw "C-9: the source identity was confirmed against '$($identity['remote_url_normalized'])', which is not the canonical producer source. A confirmed ancestry on the wrong repository is not publication. Allowed: $($allowed -join ', ')."
+    }
+    if ([string]$identity['remote_ref'] -ne [string]$pin.CanonicalRef) {
+        throw "C-9: the source identity was confirmed against ref '$($identity['remote_ref'])', not the pinned '$($pin.CanonicalRef)'."
+    }
+
+    # The OID judged must be the OID fetched -- the binding Get-K8SourceIdentity
+    # establishes by construction, re-checked here because this record is being
+    # read back from disk rather than produced in-process.
+    foreach ($oidField in 'head', 'fetched_oid', 'remote_ref_commit') {
+        if ([string]$identity[$oidField] -notmatch '^[0-9a-f]{40}$') {
+            throw "C-9: source identity field '$oidField' is not a 40-hex commit: '$($identity[$oidField])'."
+        }
+    }
+    if ([string]$identity['fetched_oid'] -ne [string]$identity['remote_ref_commit']) {
+        throw "C-9: the source identity's fetched_oid ($($identity['fetched_oid'])) and remote_ref_commit ($($identity['remote_ref_commit'])) differ. Those are the same value by construction when observed; a record where they differ was not produced by the observation it claims to be."
+    }
+
+    # The sequence-open gate refused a dirty tree. A record read back from disk
+    # has to still say so, or the bundle would publish a provenance for a
+    # worktree that was not the commit it names.
+    if ([bool]$identity['tree_clean'] -ne $true) {
+        throw "C-9: the source identity records tree_clean = $($identity['tree_clean']); a sequence cannot have been opened on a dirty tree, so this record does not describe the run that produced this bundle."
+    }
+    if (@($identity['dirty_paths']).Count -ne 0) {
+        throw "C-9: the source identity lists $(@($identity['dirty_paths']).Count) dirty path(s) while claiming a clean tree."
+    }
+
     return $identity
 }
 
@@ -2296,15 +2340,25 @@ function New-K8TransferManifest {
         Not written: .gitattributes. See the section header.
     #>
     param(
-        [Parameter(Mandatory)] $Consistency,
+        [Parameter(Mandatory)][string[]] $RunIds,
         [Parameter(Mandatory)][string] $BundleRoot,
         [Parameter(Mandatory)][AllowEmptyCollection()][array] $Exclusions
     )
     Assert-K8ExclusionDeclaration -Exclusions $Exclusions
 
-    # Takes the VERIFIED selection, not loose parameters. Assert-K8BundleRun-
-    # Consistency is the only thing that produces this object, so a manifest
-    # cannot be built from a selection that never passed the gate.
+    # RUNS THE GATE ITSELF, from run IDs.
+    #
+    # An earlier version took a -Consistency object and said in a comment that
+    # Assert-K8BundleRunConsistency was "the only thing that produces this
+    # object". PowerShell gives a PSCustomObject no such property: any caller
+    # could hand over a hashtable with the same field names and skip every
+    # check -- a/b/c coverage, completed_runs membership, terminated exclusion
+    # -- while still satisfying the source-identity comparison, because that
+    # only needed SequenceId and ToolingHead to agree.
+    #
+    # So there is no token to forge. Re-running the gate here costs a few file
+    # reads and removes an entire second entrance to it.
+    $Consistency = Assert-K8BundleRunConsistency -RunIds $RunIds
     $SequenceId = [string]$Consistency.SequenceId
     $Runs = @($Consistency.Runs)
     $sourceIdentity = Assert-K8EmbeddedSourceIdentity -Consistency $Consistency
@@ -2341,7 +2395,11 @@ function New-K8TransferManifest {
         sequence_id     = $SequenceId
         source_identity = $sourceIdentity
         runs            = @($Runs)
-        files           = @($files)
+        # .ToArray(), not @(): wrapping a List[object] whose elements are
+        # ordered dictionaries in @() throws "Argument types do not match" on
+        # this PowerShell. Measured, and the failure is at the array
+        # conversion, not at anything about the contents.
+        files           = $files.ToArray()
         exclusions      = @($Exclusions)
     }
 }
