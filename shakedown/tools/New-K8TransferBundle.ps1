@@ -67,9 +67,11 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'K8ShakedownCommon.psm1') -Force
 
-if ($BundleId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
-    throw "BundleId '$BundleId' is not usable as a git ref component. It becomes refs/heads/k8-transfer-staging/<id> and refs/tags/k8-transfer-cert/<id>, so it is constrained before anything is built rather than after."
-}
+# The id becomes a staging branch AND a certification tag on the consumer side.
+# Asked of git rather than pattern-matched: a character class accepts foo..bar,
+# foo. and foo.lock, every one of which git refuses -- and the failure would
+# then surface in the consumer, after a bundle already exists.
+[void](Assert-K8BundleIdUsableAsRef -BundleId $BundleId)
 if (Test-Path -LiteralPath $Destination) {
     throw "Destination $Destination already exists. A bundle is assembled once; overwriting one would destroy a retained record, and a re-attempt uses a NEW bundle id rather than reusing this one."
 }

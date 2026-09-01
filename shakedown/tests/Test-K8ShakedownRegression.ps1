@@ -87,6 +87,45 @@ function Reset-K8ContractRows {
     Import-Module $script:CommonPath -Force
 }
 
+# Same asymmetry for C-9's canonical source pin. It lives HERE, not in the
+# module: the Plan puts the canonical repository and ref outside the operator's
+# choice, so a production import must not expose any way to move them. Reaching
+# into module scope from the harness is a thing the test process can do and an
+# importer of the module cannot.
+#
+# The saved pin is held on the HARNESS side, so the module carries no
+# test-only state at all.
+#
+# This swaps the PIN, never the gate. Get-K8SourceIdentity still runs every
+# step against a real (local, bare) remote, and
+# Assert-K8SourceIdentityPublished still STOPs on anything but `confirmed`.
+$script:K8SavedSourcePin = $null
+function Set-K8TestSourcePin {
+    param(
+        [Parameter(Mandatory)][string[]] $CanonicalRemoteUrls,
+        [Parameter(Mandatory)][string] $CanonicalRef
+    )
+    $previous = & (Get-Module K8ShakedownCommon) {
+        param($urls, $ref)
+        $prev = $script:K8ProducerSourcePin
+        $script:K8ProducerSourcePin = @{
+            CanonicalRemoteUrls = @($urls)
+            CanonicalRef        = $ref
+            AncestryTempRef     = $prev.AncestryTempRef
+        }
+        $prev
+    } $CanonicalRemoteUrls $CanonicalRef
+    # Only the FIRST swap records what to go back to: a test that re-points the
+    # pin inside a fixture must still restore the real one, not the fixture's.
+    if ($null -eq $script:K8SavedSourcePin) { $script:K8SavedSourcePin = $previous }
+}
+function Reset-K8TestSourcePin {
+    if ($null -ne $script:K8SavedSourcePin) {
+        & (Get-Module K8ShakedownCommon) { param($p) $script:K8ProducerSourcePin = $p } $script:K8SavedSourcePin
+        $script:K8SavedSourcePin = $null
+    }
+}
+
 $failures = @()
 function Assert-K8Test {
     param([Parameter(Mandatory)][string] $Name, [Parameter(Mandatory)][scriptblock] $Body)
@@ -4858,11 +4897,11 @@ Assert-K8Test 'C-8: the contract is a single data structure, and every row state
     # source-identity git call sites as C-61..C-66, so the closed world is now
     # 106 (F 37 / C 66 / I 3). The count is asserted per class, not in total,
     # so a row moving between classes cannot hide inside an unchanged sum.
-    if ($rows.Count -ne 106) { throw "expected 106 process-site rows, got $($rows.Count)" }
+    if ($rows.Count -ne 107) { throw "expected 107 process-site rows, got $($rows.Count)" }
     $byClass = @{}
     foreach ($c in 'F', 'C', 'I') { $byClass[$c] = @($rows | Where-Object { $_.class -eq $c }).Count }
-    if ($byClass['F'] -ne 37 -or $byClass['C'] -ne 66 -or $byClass['I'] -ne 3) {
-        throw "class split is F=$($byClass['F']) C=$($byClass['C']) I=$($byClass['I']); Batch 3A fixes F=37 I=3 and Batch 3B raises C to 66"
+    if ($byClass['F'] -ne 37 -or $byClass['C'] -ne 67 -or $byClass['I'] -ne 3) {
+        throw "class split is F=$($byClass['F']) C=$($byClass['C']) I=$($byClass['I']); Batch 3A fixes F=37 I=3 and Batch 3B raises C to 67"
     }
     if (@($rows.step_id | Sort-Object -Unique).Count -ne $rows.Count) { throw 'step_id values are not unique' }
     foreach ($r in $rows) {
@@ -5474,6 +5513,45 @@ Assert-K8Test 'C-9: source identity is THREE-valued, and none of the three is a 
     if ($body -match 'ancestry\s*=\s*\$(true|false)') { throw 'ancestry is assigned a boolean somewhere; that merges an answer with the absence of one' }
 }
 
+Assert-K8Test 'C-9: the authoritative pins cannot be moved through the module''s public surface' {
+    Import-Module $CommonPath -Force
+    # The Plan puts the canonical repository and ref outside the operator's
+    # choice. "Outside the operator's choice" has to mean the module offers no
+    # way to move them -- not merely that the documented entry points do not.
+
+    # (1) The test seams are not module functions at all. They live in this
+    #     harness and reach into module scope; an importer cannot do that.
+    foreach ($seam in 'Set-K8TestSourcePin', 'Reset-K8TestSourcePin') {
+        $exported = (Get-Module K8ShakedownCommon).ExportedFunctions.Keys
+        if ($exported -contains $seam) { throw "$seam is exported by the module; a production import can then repoint the canonical source pin" }
+        $moduleSrc = Get-Content $CommonPath -Raw
+        if ($moduleSrc -match "function\s+$seam") { throw "$seam is defined in the module; test seams for an authoritative pin do not belong on the production surface" }
+    }
+
+    # (2) The getters hand back a COPY. Otherwise the getter is a setter.
+    $before = Get-K8ProducerSourcePin
+    $pin = Get-K8ProducerSourcePin
+    $pin.CanonicalRef = 'refs/heads/attacker-chosen'
+    $pin.CanonicalRemoteUrls = @('https://example.invalid/other')
+    $after = Get-K8ProducerSourcePin
+    if ($after.CanonicalRef -ne $before.CanonicalRef) { throw 'mutating the value returned by Get-K8ProducerSourcePin changed the authoritative ref' }
+    if (($after.CanonicalRemoteUrls -join ',') -ne ($before.CanonicalRemoteUrls -join ',')) { throw 'mutating the value returned by Get-K8ProducerSourcePin changed the authoritative remote list' }
+
+    $baseBefore = Get-K8ImmutableBase
+    $b = Get-K8ImmutableBase
+    $b.Commit = '0000000000000000000000000000000000000000'
+    $b.FrozenPaths = @('nothing')
+    $baseAfter = Get-K8ImmutableBase
+    if ($baseAfter.Commit -ne $baseBefore.Commit) { throw 'mutating the value returned by Get-K8ImmutableBase moved the immutable base' }
+    if (($baseAfter.FrozenPaths -join ',') -ne ($baseBefore.FrozenPaths -join ',')) { throw 'mutating the value returned by Get-K8ImmutableBase changed which paths are frozen' }
+
+    # (3) And the gate itself still has no parameter offering to skip it.
+    $seq = (Get-Command New-K8QualificationSequence).Parameters.Keys
+    foreach ($p in $seq) {
+        if ($p -match 'Skip|Force|Allow|Ignore') { throw "New-K8QualificationSequence exposes -$p; the source-identity gate is not overridable" }
+    }
+}
+
 Assert-K8Test 'C-9: ancestry is measured against the PINNED repository, not any remote that happens to contain HEAD' {
     Import-Module $CommonPath -Force
     Invoke-K8SequenceSandbox -Action {
@@ -5673,6 +5751,43 @@ Assert-K8Test 'C-9: the transfer manifest states byte facts and never writes a .
         if (-not $lf.trailing_newline -or $bin.trailing_newline) { throw 'trailing_newline is not tracking the last byte' }
     }
     finally { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'C-9: a BundleId is validated against git''s real refname rules, not a character class' {
+    Import-Module $CommonPath -Force
+    # The id becomes BOTH a staging branch and a certification tag on the
+    # consumer side. A pattern like ^[A-Za-z0-9][A-Za-z0-9._-]*$ looks like it
+    # settles that and does not.
+    foreach ($good in 'k8-shakedown-20260901', 'bundle_1', 'a.b-c') {
+        if (-not (Assert-K8BundleIdUsableAsRef -BundleId $good)) { throw "'$good' is a usable ref component and was refused" }
+    }
+    # Each of these passes a plain character class and is refused by git.
+    foreach ($bad in 'foo..bar', 'foo.', 'foo.lock') {
+        Assert-K8FailsClosed -What "a BundleId of '$bad'" -Because 'check-ref-format' -Attempt {
+            Assert-K8BundleIdUsableAsRef -BundleId $bad
+        }
+    }
+    # And ids that are not a single ref COMPONENT at all.
+    foreach ($bad in 'has space', 'a/b') {
+        Assert-K8FailsClosed -What "a BundleId of '$bad'" -Because 'C-9' -Attempt {
+            Assert-K8BundleIdUsableAsRef -BundleId $bad
+        }
+    }
+    # An empty id is refused by the parameter binder before the body runs,
+    # which is a fine place to refuse it -- asserted here so the coverage is
+    # recorded rather than assumed.
+    $emptyRefused = $false
+    try { Assert-K8BundleIdUsableAsRef -BundleId '' } catch { $emptyRefused = $true }
+    if (-not $emptyRefused) { throw 'an empty BundleId was accepted' }
+    # Both derived refs are checked, not just one: the rules are not identical
+    # across namespaces and the id has to work as both.
+    $refs = @(Get-K8BundleRefNames -BundleId 'x')
+    if ($refs.Count -ne 2) { throw "expected the staging branch and the certification tag, got $($refs.Count)" }
+    if ($refs[0] -notmatch '^refs/heads/' -or $refs[1] -notmatch '^refs/tags/') { throw "the derived refs are not a branch and a tag: $($refs -join ', ')" }
+
+    # The rule is ASKED of git, not reimplemented beside it.
+    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Assert-K8BundleIdUsableAsRef'
+    if ($body -notmatch 'check-ref-format') { throw 'the validator does not ask git; a second, slightly-wrong copy of git''s refname rules is exactly what this avoids' }
 }
 
 Assert-K8Test 'C-9: bundle paths are POSIX, and the closed-world equation is phase-aware' {

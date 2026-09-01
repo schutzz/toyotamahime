@@ -644,51 +644,41 @@ $script:K8ImmutableBase = @{
     FrozenPaths = @('Study01', 'bootstrap', 'docs/k8-packaging-certification.md')
 }
 
-function Get-K8ImmutableBase { $script:K8ImmutableBase }
-
-function Get-K8ProducerSourcePin { $script:K8ProducerSourcePin }
-
-function Set-K8TestSourcePin {
-    <#
-        TEST SEAM. Not a production function, and deliberately not an operator
-        override of the gate.
-
-        The regression fixtures build throwaway repositories, which by
-        definition are not published on the real canonical remote. Two ways to
-        make them testable:
-
-          (a) let the tests SKIP the gate, or
-          (b) let the tests point the PIN at a local bare repository they
-              create, and run the gate for real against it.
-
-        (b) is what this does, and it is the stronger of the two: every step --
-        remote get-url, ls-remote, fetch into a temp ref, merge-base,
-        update-ref -- executes exactly as in production, and the negative cases
-        (wrong remote, absent ref, unreachable remote) become real observations
-        rather than mocked ones.
-
-        There is no way to reach this from the operator entry points, and the
-        gate itself has no bypass: Assert-K8SourceIdentityPublished still STOPs
-        on anything other than `confirmed`. Same shape as C-8's
-        Add-K8TestContractRow.
-    #>
-    param(
-        [Parameter(Mandatory)][string[]] $CanonicalRemoteUrls,
-        [Parameter(Mandatory)][string] $CanonicalRef
-    )
-    $script:K8ProducerSourcePinSaved = $script:K8ProducerSourcePin
-    $script:K8ProducerSourcePin = @{
-        CanonicalRemoteUrls = @($CanonicalRemoteUrls)
-        CanonicalRef        = $CanonicalRef
-        AncestryTempRef     = $script:K8ProducerSourcePin.AncestryTempRef
+function Get-K8ImmutableBase {
+    <# A COPY. Returning the live hashtable would make this getter a setter:
+       $b = Get-K8ImmutableBase; $b.Commit = '...' would move the authoritative
+       base through a public read API. #>
+    $b = $script:K8ImmutableBase
+    return @{
+        Commit      = [string]$b.Commit
+        Description = [string]$b.Description
+        FrozenPaths = @([string[]]$b.FrozenPaths)
     }
 }
 
-function Reset-K8TestSourcePin {
-    <# Restores the real pin. Paired with Set-K8TestSourcePin in a finally. #>
-    if ($script:K8ProducerSourcePinSaved) {
-        $script:K8ProducerSourcePin = $script:K8ProducerSourcePinSaved
-        $script:K8ProducerSourcePinSaved = $null
+function Get-K8ProducerSourcePin {
+    <#
+        A COPY, for the same reason as Get-K8ImmutableBase.
+
+        The Plan puts the canonical repository and ref outside the operator's
+        choice -- they are a gate, not a default. A getter that hands back the
+        live hashtable makes that untrue through the public API alone:
+
+            $pin = Get-K8ProducerSourcePin
+            $pin.CanonicalRef = 'refs/heads/anything'
+
+        would rewrite the authoritative pin without going near a test seam.
+
+        The regression fixtures still swap the pin, but they do it by reaching
+        into module scope from the harness -- the same asymmetry C-8's contract
+        seam uses, and one that no importer of this module can perform through
+        its public surface.
+    #>
+    $p = $script:K8ProducerSourcePin
+    return @{
+        CanonicalRemoteUrls = @([string[]]$p.CanonicalRemoteUrls)
+        CanonicalRef        = [string]$p.CanonicalRef
+        AncestryTempRef     = [string]$p.AncestryTempRef
     }
 }
 
@@ -2043,6 +2033,50 @@ $script:K8ExclusionReasons = @('pcap-body-never-in-git')
 
 function Get-K8ExclusionReasons { @($script:K8ExclusionReasons) }
 
+$script:K8StagingRefPrefix = 'refs/heads/k8-transfer-staging/'
+$script:K8CertTagRefPrefix = 'refs/tags/k8-transfer-cert/'
+
+function Get-K8BundleRefNames {
+    <# The two refs a bundle id becomes on the consumer side. Derived in one
+       place so the validator and any later user cannot disagree about them. #>
+    param([Parameter(Mandatory)][string] $BundleId)
+    return @(
+        ($script:K8StagingRefPrefix + $BundleId),
+        ($script:K8CertTagRefPrefix + $BundleId)
+    )
+}
+
+function Assert-K8BundleIdUsableAsRef {
+    <#
+        A bundle id becomes a staging branch and a certification tag on the
+        consumer side, so "usable as a git ref" has to be decided BEFORE the
+        bundle is assembled -- not discovered later by the consumer, whose
+        whole job is to trust this producer's output.
+
+        ASKED OF GIT, NOT OF A REGEX. A character-class pattern looks like it
+        settles this and does not: `foo..bar`, `foo.` and `foo.lock` all pass a
+        plain [A-Za-z0-9._-] test and are all refused by git. Reimplementing
+        git's refname rules here would be a second, slightly-wrong copy of a
+        rule that already exists and can simply be asked.
+
+        Both derived refs are checked, because the rules are not identical
+        across namespaces and a bundle id has to work as both.
+
+        Measured: git check-ref-format exits 0 for a valid ref and 1 for an
+        invalid one.
+    #>
+    param([Parameter(Mandatory)][string] $BundleId)
+    if ([string]::IsNullOrWhiteSpace($BundleId)) { throw 'C-9: BundleId is empty.' }
+    if ($BundleId -match '[\s/]') { throw "C-9: BundleId '$BundleId' contains whitespace or a path separator; it is one ref COMPONENT, not a path." }
+    foreach ($ref in (Get-K8BundleRefNames -BundleId $BundleId)) {
+        $check = Invoke-K8SeparatedNativeCapture -StepId 'C-67' -FilePath 'git' -ArgumentList @('check-ref-format', $ref)
+        if ($check.ExitCode -ne 0) {
+            throw "C-9: BundleId '$BundleId' does not yield a valid git ref: '$ref' is refused by git check-ref-format (exit $($check.ExitCode)). The consumer creates both a staging branch and a certification tag from this id, so an id that cannot become a ref is caught here rather than after the bundle exists."
+        }
+    }
+    return $true
+}
+
 function Get-K8FileByteClass {
     <#
         Observation, not policy.
@@ -3352,6 +3386,12 @@ $script:K8CommandContract = @(
        argv_shape = @('git','-C','<repo>','update-ref','-d','<ref>')
        stream_expectation = 'separated'; accepted_exit_codes = @(0)
        exit_note = 'Cleanup of the ancestry temp ref, in a finally block. Leaving it behind would let a LATER run that failed to fetch resolve a stale OID -- the confusion the explicit temp ref exists to remove.' }
+
+    @{ step_id = 'C-67'; class = 'C'; ranges = 'abc'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Assert-K8BundleIdUsableAsRef'; callee = "'git'"; call_ordinal = 1
+       argv_shape = @('git','check-ref-format','<ref>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0, 1)
+       exit_note = 'Measured: 0 = valid refname, 1 = invalid. 1 is an ANSWER, not a command failure -- it is the whole reason this runs. Asked of git rather than reimplemented: a plain character-class regex accepts foo..bar, foo. and foo.lock, all of which git refuses.' }
 
     # === Class I -- informational ==========================================
     # Retained, NEVER gated. Exactly one baseline member: the site that is
