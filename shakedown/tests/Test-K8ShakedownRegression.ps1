@@ -5842,25 +5842,165 @@ Assert-K8Test 'C-9: exclusions are constrained, and never excuse a file that is 
     }
 }
 
-Assert-K8Test 'C-9: the run selection must be one completed sequence at one HEAD, covering a/b/c once' {
+Assert-K8Test 'C-9: the run selection is checked against real control-plane records, not by looking for guard names' {
     Import-Module $CommonPath -Force
-    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Assert-K8BundleRunConsistency'
-    foreach ($guard in "-ne 'complete'", 'locked_head', "'a,b,c'", 'termination') {
-        if ($body -notmatch [regex]::Escape($guard)) { throw "the bundle consistency gate does not check '$guard'; retaining sequence_id and tooling_head is an observation, not a verification (U-8 is the case where nobody checked)" }
-    }
+    # The previous version of this check read the function body for the strings
+    # "complete", "locked_head", "a,b,c" and "termination". That passes whenever
+    # the words are present, however the comparison behind them is written --
+    # and it is why B3B-P-04 (the selection never being compared against the
+    # sequence's own completed_runs) went unnoticed. Every case below runs
+    # against actual records now.
     Invoke-K8SequenceSandbox -Action {
         param($sb)
+
+        function New-K8SandboxCompletedSequence {
+            param($Sandbox)
+            $seq = New-K8QualificationSequence -RepoRoot $Sandbox.Repo
+            $ids = [ordered]@{}
+            foreach ($range in 'a', 'b', 'c') {
+                $run = Start-K8ShakedownRun -Range $range -RepoRoot $Sandbox.Repo
+                Complete-K8ShakedownRunInSequence -Run $run | Out-Null
+                $ids[$range] = $run.RunId
+            }
+            return [pscustomobject]@{ SequenceId = $seq.sequence_id; Ids = $ids }
+        }
+        function Set-K8SandboxProvenanceField {
+            param([string] $RunId, [string] $Field, $Value)
+            $path = Get-K8RunProvenancePath -RunId $RunId
+            $json = (Get-Content -LiteralPath $path -Raw) | ConvertFrom-Json -AsHashtable
+            $json[$Field] = $Value
+            ($json | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $path -Encoding utf8NoBOM
+        }
+
+        $done = New-K8SandboxCompletedSequence -Sandbox $sb
+        $all = @($done.Ids['a'], $done.Ids['b'], $done.Ids['c'])
+
+        # POSITIVE CONTROL first: without it, every negative below could be
+        # passing because the gate refuses everything.
+        $ok = Assert-K8BundleRunConsistency -RunIds $all
+        if ($ok.SequenceId -ne $done.SequenceId) { throw "the genuine selection was attributed to $($ok.SequenceId), not $($done.SequenceId)" }
+        if (@($ok.Runs).Count -ne 3) { throw 'the genuine selection did not yield three runs' }
+
+        # (1) A range missing.
+        Assert-K8FailsClosed -What 'bundling only Range A and B' -Because 'a, b and c' -Attempt {
+            Assert-K8BundleRunConsistency -RunIds @($done.Ids['a'], $done.Ids['b'])
+        }
+
+        # (2) A run from a DIFFERENT sequence.
+        $second = New-K8SandboxCompletedSequence -Sandbox $sb
+        Assert-K8FailsClosed -What 'mixing runs from two sequences' -Because 'sequences' -Attempt {
+            Assert-K8BundleRunConsistency -RunIds @($done.Ids['a'], $done.Ids['b'], $second.Ids['c'])
+        }
+
+        # (3) SUBSTITUTION -- the case a self-description check cannot see.
+        #     Take a run from the second sequence and rewrite its provenance so
+        #     it CLAIMS the first sequence, the first sequence's HEAD, and
+        #     Range C. Every self-reported field now agrees. It still is not one
+        #     of the runs that sequence completed.
+        $impostor = $second.Ids['c']
+        Set-K8SandboxProvenanceField -RunId $impostor -Field 'sequence_id' -Value $done.SequenceId
+        Set-K8SandboxProvenanceField -RunId $impostor -Field 'range' -Value 'c'
+        Assert-K8FailsClosed -What 'substituting a run that merely claims to belong to the sequence' -Because 'not the runs' -Attempt {
+            Assert-K8BundleRunConsistency -RunIds @($done.Ids['a'], $done.Ids['b'], $impostor)
+        }
+
+        # (4) A different tooling HEAD among the selected runs.
+        Set-K8SandboxProvenanceField -RunId $done.Ids['b'] -Field 'tooling_head' -Value ('0' * 40)
+        Assert-K8FailsClosed -What 'bundling runs that span two tooling HEADs' -Because 'tooling HEADs' -Attempt {
+            Assert-K8BundleRunConsistency -RunIds $all
+        }
+        Set-K8SandboxProvenanceField -RunId $done.Ids['b'] -Field 'tooling_head' -Value $ok.ToolingHead
+        [void](Assert-K8BundleRunConsistency -RunIds $all)   # restored
+
+        # (5) A sequence that has not completed.
         New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
-        $runA = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
-        # The sequence is still open, and its runs are incomplete: a bundle
-        # asserts a finished qualification, so this must not be transferable.
-        Assert-K8FailsClosed -What 'bundling a run from a sequence that has not completed' -Because 'not' -Attempt {
-            Assert-K8BundleRunConsistency -RunIds @($runA.RunId)
+        $openRun = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        Assert-K8FailsClosed -What 'bundling from a sequence still in progress' -Because 'not' -Attempt {
+            Assert-K8BundleRunConsistency -RunIds @($openRun.RunId)
+        }
+
+        # (6) A terminated run. The record is placed directly: what is being
+        #     tested is that a run carrying one is refused, not how it got one.
+        $termPath = Get-K8TerminationRecordPath -RunId $openRun.RunId
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $termPath) | Out-Null
+        '{"schema":"k8shakedown-termination/1","stage":"test-fixture"}' | Set-Content -LiteralPath $termPath -Encoding utf8NoBOM
+        Assert-K8FailsClosed -What 'bundling a terminated run' -Because 'termination record' -Attempt {
+            Assert-K8BundleRunConsistency -RunIds @($openRun.RunId)
         }
     }
 }
 
-# --- 7. Study01/ untouched on this branch -------------------------------------
+Assert-K8Test 'C-9: the embedded source identity is bound to the sequence it claims, not merely transcribed' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $seq = New-K8QualificationSequence -RepoRoot $sb.Repo
+        $ids = @()
+        foreach ($range in 'a', 'b', 'c') {
+            $run = Start-K8ShakedownRun -Range $range -RepoRoot $sb.Repo
+            Complete-K8ShakedownRunInSequence -Run $run | Out-Null
+            $ids += $run.RunId
+        }
+        $consistency = Assert-K8BundleRunConsistency -RunIds $ids
+
+        # Positive control.
+        $identity = Assert-K8EmbeddedSourceIdentity -Consistency $consistency
+        if ($identity.ancestry -ne 'confirmed') { throw "the genuine source identity was not confirmed: $($identity.ancestry)" }
+
+        $path = Get-K8SourceIdentityPath -SequenceId $consistency.SequenceId
+        $original = Get-Content -LiteralPath $path -Raw
+
+        # Reading a record and embedding it is transcription. Each mutation
+        # below leaves a well-formed file that a transcriber would publish.
+        $mutations = [ordered]@{
+            'a foreign sequence_id'  = @{ sequence_id = 'k8seq-somebody-elses' }
+            'a different HEAD'       = @{ head = ('f' * 40) }
+            'an unconfirmed ancestry' = @{ ancestry = 'not-observed'; ancestry_note = 'injected' }
+            'a wrong schema'         = @{ schema = 'k8shakedown-source-identity/999' }
+            'a blank remote_ref'     = @{ remote_ref = '' }
+        }
+        foreach ($case in $mutations.Keys) {
+            try {
+                $json = $original | ConvertFrom-Json -AsHashtable
+                foreach ($k in $mutations[$case].Keys) { $json[$k] = $mutations[$case][$k] }
+                ($json | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $path -Encoding utf8NoBOM
+                Assert-K8FailsClosed -What "embedding a source identity with $case" -Because 'C-9' -Attempt {
+                    Assert-K8EmbeddedSourceIdentity -Consistency $consistency
+                }
+            }
+            finally { $original | Set-Content -LiteralPath $path -Encoding utf8NoBOM -NoNewline }
+        }
+
+        # Still good after the restores, so the failures above were the
+        # mutations and not collateral damage.
+        [void](Assert-K8EmbeddedSourceIdentity -Consistency $consistency)
+    }
+}
+
+Assert-K8Test 'C-9: bundle path membership uses a separator boundary, not a bare prefix' {
+    Import-Module $CommonPath -Force
+    $base = Join-Path ([System.IO.Path]::GetTempPath()) ('k8pm-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path $base 'bundle'
+    $sibling = Join-Path $base 'bundle-sibling'
+    New-Item -ItemType Directory -Force -Path (Join-Path $root 'sub'), $sibling | Out-Null
+    try {
+        'inside' | Set-Content -LiteralPath (Join-Path $root 'sub\inside.txt') -Encoding utf8NoBOM
+        'outside' | Set-Content -LiteralPath (Join-Path $sibling 'outside.txt') -Encoding utf8NoBOM
+
+        # A REAL sibling whose name begins with the root's. A bare StartsWith
+        # accepted this and returned '-sibling/outside.txt' as its "relative
+        # path inside the bundle" -- measured, and the same defect class as
+        # B2-C7-01.
+        Assert-K8FailsClosed -What 'describing a sibling directory that shares the root prefix' -Because 'not inside the bundle root' -Attempt {
+            ConvertTo-K8BundleRelativePath -Root $root -FullPath (Join-Path $sibling 'outside.txt')
+        }
+
+        # And a genuine member still resolves, so this is not simply refusing.
+        $rel = ConvertTo-K8BundleRelativePath -Root $root -FullPath (Join-Path $root 'sub\inside.txt')
+        if ($rel -ne 'sub/inside.txt') { throw "a genuine bundle member did not resolve correctly: '$rel'" }
+    }
+    finally { Remove-Item $base -Recurse -Force -ErrorAction SilentlyContinue }
+}
 
 Assert-K8Test 'C-9: the frozen-path comparison uses a FIXED immutable base, resolved without fetching' {
     # criterion 11(a) names a fixed immutable base commit. The check this

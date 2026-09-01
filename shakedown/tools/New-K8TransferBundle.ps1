@@ -105,8 +105,7 @@ $exclusions = @(
 )
 
 # 3. The producer's claim.
-$manifest = New-K8TransferManifest -BundleRoot $Destination -SequenceId $consistency.SequenceId `
-    -Runs $consistency.Runs -Exclusions $exclusions
+$manifest = New-K8TransferManifest -Consistency $consistency -BundleRoot $Destination -Exclusions $exclusions
 $manifestPath = Join-Path $Destination 'transfer-manifest.json'
 Write-K8AtomicFile -Path $manifestPath -Content (($manifest | ConvertTo-Json -Depth 12) + "`n")
 Write-K8ShakedownLog -Message "transfer-manifest.json written over $(@($manifest.files).Count) file(s)."

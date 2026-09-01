@@ -2111,12 +2111,37 @@ function ConvertTo-K8BundleRelativePath {
         normalizing it changes nothing that is hashed.
     #>
     param([Parameter(Mandatory)][string] $Root, [Parameter(Mandatory)][string] $FullPath)
+    $sep = [System.IO.Path]::DirectorySeparatorChar
     $rootFull = (Resolve-Path -LiteralPath $Root).Path.TrimEnd('\', '/')
     $full = (Resolve-Path -LiteralPath $FullPath).Path
-    if (-not $full.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+
+    # SEPARATOR BOUNDARY, not a bare prefix. A plain StartsWith accepts a
+    # SIBLING whose name merely begins with the root's:
+    #     root = ...\bundle    file = ...\bundle-sibling\x.txt
+    # was accepted, and came back as the relative path '-sibling/x.txt'.
+    # Measured, not hypothetical. Same defect class as B2-C7-01, where one
+    # prefix comparison was made to answer two different membership questions.
+    $rootWithSep = $rootFull + $sep
+    if (-not $full.StartsWith($rootWithSep, [StringComparison]::OrdinalIgnoreCase)) {
         throw "C-9: $full is not inside the bundle root $rootFull; refusing to describe a file outside the bundle."
     }
-    return ($full.Substring($rootFull.Length).TrimStart('\', '/') -replace '\\', '/')
+
+    $relative = $full.Substring($rootWithSep.Length)
+    # Re-verify after canonical resolution rather than trusting the string
+    # arithmetic that produced it -- C-7's rule that a string comparison is not
+    # the only authority.
+    if ([System.IO.Path]::IsPathRooted($relative)) { throw "C-9: '$relative' resolved to a rooted path; refusing." }
+    foreach ($segment in ($relative -split '[\\/]')) {
+        if ($segment -eq '..' -or $segment -eq '.' -or $segment -eq '') {
+            throw "C-9: '$relative' contains a '$segment' segment after resolution; refusing."
+        }
+    }
+    $recombined = [System.IO.Path]::GetFullPath((Join-Path $rootFull $relative))
+    if ($recombined -ne $full) {
+        throw "C-9: '$relative' does not recombine to $full under $rootFull; refusing a path whose membership does not survive re-resolution."
+    }
+
+    return ($relative -replace '\\', '/')
 }
 
 function Assert-K8ExclusionDeclaration {
@@ -2200,7 +2225,68 @@ function Assert-K8BundleRunConsistency {
     $ranges = @($rows.range | Sort-Object)
     if (($ranges -join ',') -ne 'a,b,c') { throw "C-9: the selected runs cover ranges [$($ranges -join ', ')]; a bundle needs a, b and c exactly once each." }
 
-    return [pscustomobject]@{ Runs = $rows; SequenceId = $sequences[0]; ToolingHead = $heads[0] }
+    # THE SELECTION MUST BE THE SEQUENCE'S OWN RUNS, not merely runs that say
+    # they belong to it.
+    #
+    # Everything above reads each run's SELF-DESCRIPTION: its provenance says
+    # this sequence, this HEAD, this range. Three fabricated or stale
+    # provenance records agreeing with each other would satisfy all of it while
+    # having nothing to do with the three runs the sequence actually completed.
+    # The sequence record is the independent side of that, so the two sets are
+    # compared directly, in order.
+    $completed = @(@($seq['completed_runs']) | ForEach-Object { "$([string]$_['range'])=$([string]$_['run_id'])" })
+    $selected = @($rows | ForEach-Object { "$($_.range)=$($_.run_id)" })
+    if (($completed -join ' ') -ne (($selected | Sort-Object) -join ' ')) {
+        throw "C-9: the selected runs are not the runs sequence $($sequences[0]) completed.`n  sequence completed: $($completed -join ', ')`n  selected:           $(($selected | Sort-Object) -join ', ')`nA run whose provenance merely NAMES this sequence is not one of its completed runs."
+    }
+    if (@($seq['terminated_runs']).Count -ne 0) {
+        throw "C-9: sequence $($sequences[0]) carries $(@($seq['terminated_runs']).Count) terminated run(s); it is not an uninterrupted A -> B -> C."
+    }
+
+    return [pscustomobject]@{ Runs = $rows; SequenceId = $sequences[0]; ToolingHead = $heads[0]; Sequence = $seq }
+}
+
+function Assert-K8EmbeddedSourceIdentity {
+    <#
+        Reads the sequence's source-identity record AND checks that it is
+        actually that sequence's, for that HEAD, and confirmed.
+
+        Reading a file and embedding what it contains is transcription, not
+        verification. If the record were swapped, stale or truncated, the
+        manifest would still publish it as this bundle's provenance -- and the
+        source identity is the anchor the whole chain hangs from, so an
+        unchecked one breaks the chain at its centre while looking intact.
+
+        Every field checked here is cross-checked against a DIFFERENT record
+        (the sequence record and the run provenance), not against itself.
+    #>
+    param([Parameter(Mandatory)] $Consistency)
+    $sequenceId = [string]$Consistency.SequenceId
+    $path = Get-K8SourceIdentityPath -SequenceId $sequenceId
+    if (-not (Test-Path -LiteralPath $path)) { throw "C-9: no source-identity record for sequence $sequenceId at $path." }
+    $identity = (Get-Content -LiteralPath $path -Raw) | ConvertFrom-Json -AsHashtable
+
+    foreach ($field in 'schema', 'sequence_id', 'head', 'ancestry', 'remote_url_normalized', 'remote_ref') {
+        if (-not $identity.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$identity[$field])) {
+            throw "C-9: the source-identity record for $sequenceId is missing '$field'. An incomplete provenance anchor is not embedded as if it were whole."
+        }
+    }
+    if ([string]$identity['schema'] -ne $script:K8SourceIdentitySchema) {
+        throw "C-9: source-identity schema is '$($identity['schema'])', expected '$($script:K8SourceIdentitySchema)'."
+    }
+    if ([string]$identity['sequence_id'] -ne $sequenceId) {
+        throw "C-9: the source-identity record found at $path says it belongs to sequence '$($identity['sequence_id'])', not '$sequenceId'."
+    }
+    if ([string]$identity['head'] -ne [string]$Consistency.ToolingHead) {
+        throw "C-9: the source identity was observed for HEAD $($identity['head']), but the selected runs ran at $($Consistency.ToolingHead). The bundle would publish a provenance for a different commit than the one that produced it."
+    }
+    if ([string]$identity['head'] -ne [string]$Consistency.Sequence['locked_head']) {
+        throw "C-9: the source identity's HEAD $($identity['head']) is not the sequence's locked_head $($Consistency.Sequence['locked_head'])."
+    }
+    if ([string]$identity['ancestry'] -ne 'confirmed') {
+        throw "C-9: the source identity records ancestry '$($identity['ancestry'])'. Only a confirmed publication may be embedded as a bundle's provenance -- $($identity['ancestry_note'])."
+    }
+    return $identity
 }
 
 function New-K8TransferManifest {
@@ -2210,16 +2296,18 @@ function New-K8TransferManifest {
         Not written: .gitattributes. See the section header.
     #>
     param(
+        [Parameter(Mandatory)] $Consistency,
         [Parameter(Mandatory)][string] $BundleRoot,
-        [Parameter(Mandatory)][string] $SequenceId,
-        [Parameter(Mandatory)][array] $Runs,
         [Parameter(Mandatory)][AllowEmptyCollection()][array] $Exclusions
     )
     Assert-K8ExclusionDeclaration -Exclusions $Exclusions
 
-    $sourcePath = Get-K8SourceIdentityPath -SequenceId $SequenceId
-    if (-not (Test-Path -LiteralPath $sourcePath)) { throw "C-9: no source-identity record for sequence $SequenceId at $sourcePath." }
-    $sourceIdentity = (Get-Content -LiteralPath $sourcePath -Raw) | ConvertFrom-Json -AsHashtable
+    # Takes the VERIFIED selection, not loose parameters. Assert-K8BundleRun-
+    # Consistency is the only thing that produces this object, so a manifest
+    # cannot be built from a selection that never passed the gate.
+    $SequenceId = [string]$Consistency.SequenceId
+    $Runs = @($Consistency.Runs)
+    $sourceIdentity = Assert-K8EmbeddedSourceIdentity -Consistency $Consistency
 
     $control = Get-K8BundleControlNames
     $files = New-Object System.Collections.Generic.List[object]
