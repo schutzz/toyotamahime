@@ -2246,6 +2246,57 @@ function Assert-K8BundleRunConsistency {
     return [pscustomobject]@{ Runs = $rows; SequenceId = $sequences[0]; ToolingHead = $heads[0]; Sequence = $seq }
 }
 
+function Assert-K8SourceIdentityFieldTypes {
+    <#
+        Fixes the JSON TYPE of each re-verified source-identity field, not just
+        its presence.
+
+        `if ([bool]$identity['tree_clean'] -ne $true)` reads like a value check
+        and is not one. PowerShell converts every non-empty string to $true
+        (measured: [bool]'false' -> True), so a record carrying the STRING
+        "false" was read as a clean tree while the very same record, published
+        verbatim into the manifest, went on saying false. The checker and the
+        artefact disagreed, and nothing in between could notice.
+
+        A field's type is part of what the record means. Coercing it discards
+        exactly the evidence that the record was not produced by the observation
+        it claims to be, so it is asserted rather than converted.
+    #>
+    param(
+        [Parameter(Mandatory)] $Identity,
+        [Parameter(Mandatory)] $Types,
+        [Parameter(Mandatory)][string] $SequenceId
+    )
+    foreach ($field in $Types.Keys) {
+        if (-not $Identity.Contains($field)) {
+            throw "C-9: the source-identity record for $SequenceId is missing '$field'. An incomplete provenance anchor is not embedded as if it were whole."
+        }
+        $value = $Identity[$field]
+        $actual = if ($null -eq $value) { 'null' } else { $value.GetType().Name }
+        switch ([string]$Types[$field]) {
+            'string' {
+                if ($value -isnot [string]) {
+                    throw "C-9: source-identity field '$field' is $actual, not a JSON string."
+                }
+                if ([string]::IsNullOrWhiteSpace($value)) {
+                    throw "C-9: source-identity field '$field' is blank. An incomplete provenance anchor is not embedded as if it were whole."
+                }
+            }
+            'bool' {
+                if ($value -isnot [bool]) {
+                    throw "C-9: source-identity field '$field' is $actual, not a JSON boolean. PowerShell reads any non-empty string as `$true, so a string here would be CHECKED as one value while the manifest publishes the other."
+                }
+            }
+            'array' {
+                if ($value -isnot [array]) {
+                    throw "C-9: source-identity field '$field' is $actual, not a JSON array. Its cardinality is what is checked, and a scalar has none."
+                }
+            }
+            default { throw "C-9: internal -- no type rule for source-identity field '$field'." }
+        }
+    }
+}
+
 function Assert-K8EmbeddedSourceIdentity {
     <#
         Reads the sequence's source-identity record AND checks that it is
@@ -2276,11 +2327,22 @@ function Assert-K8EmbeddedSourceIdentity {
     if (-not (Test-Path -LiteralPath $path)) { throw "C-9: no source-identity record for sequence $sequenceId at $path." }
     $identity = (Get-Content -LiteralPath $path -Raw) | ConvertFrom-Json -AsHashtable
 
-    foreach ($field in 'schema', 'sequence_id', 'head', 'ancestry', 'remote_url_normalized', 'remote_ref') {
-        if (-not $identity.Contains($field) -or [string]::IsNullOrWhiteSpace([string]$identity[$field])) {
-            throw "C-9: the source-identity record for $sequenceId is missing '$field'. An incomplete provenance anchor is not embedded as if it were whole."
-        }
-    }
+    # Required fields AND their JSON types. `remote_url` is required alongside
+    # `remote_url_normalized` because the Plan keeps them as two observations of
+    # one remote, and only the derived one was being checked -- so a record
+    # naming a foreign raw URL next to the canonical normalized one passed.
+    Assert-K8SourceIdentityFieldTypes -SequenceId $sequenceId -Identity $identity -Types ([ordered]@{
+        schema                = 'string'
+        sequence_id           = 'string'
+        head                  = 'string'
+        remote_name           = 'string'
+        remote_url            = 'string'
+        remote_url_normalized = 'string'
+        remote_ref            = 'string'
+        ancestry              = 'string'
+        tree_clean            = 'bool'
+        dirty_paths           = 'array'
+    })
     if ([string]$identity['schema'] -ne $script:K8SourceIdentitySchema) {
         throw "C-9: source-identity schema is '$($identity['schema'])', expected '$($script:K8SourceIdentitySchema)'."
     }
@@ -2300,6 +2362,16 @@ function Assert-K8EmbeddedSourceIdentity {
     # Re-bind to the canonical pin. `confirmed` alone does not say confirmed
     # AGAINST WHAT.
     $pin = Get-K8ProducerSourcePin
+
+    # The two URL fields must be one remote. remote_url_normalized is DERIVED
+    # from remote_url, so checking only the derived one lets a record hold a
+    # foreign raw URL beside a canonical normalized one -- and the manifest
+    # publishes both as this bundle's source.
+    $rederived = ConvertTo-K8NormalizedRemoteUrl -Url ([string]$identity['remote_url'])
+    if ($rederived -ne [string]$identity['remote_url_normalized']) {
+        throw "C-9: the source identity's remote_url '$($identity['remote_url'])' normalizes to '$rederived', but the record stores remote_url_normalized '$($identity['remote_url_normalized'])'. Those are two observations of ONE remote; a record where they disagree was not produced by the observation it claims to be."
+    }
+
     $allowed = @($pin.CanonicalRemoteUrls | ForEach-Object { ConvertTo-K8NormalizedRemoteUrl -Url $_ })
     if ($allowed -notcontains [string]$identity['remote_url_normalized']) {
         throw "C-9: the source identity was confirmed against '$($identity['remote_url_normalized'])', which is not the canonical producer source. A confirmed ancestry on the wrong repository is not publication. Allowed: $($allowed -join ', ')."
@@ -2310,7 +2382,14 @@ function Assert-K8EmbeddedSourceIdentity {
 
     # The OID judged must be the OID fetched -- the binding Get-K8SourceIdentity
     # establishes by construction, re-checked here because this record is being
-    # read back from disk rather than produced in-process.
+    # read back from disk rather than produced in-process. These two are typed
+    # here rather than above because an unobserved remote legitimately leaves
+    # them null, and that record is refused by the ancestry check, with the
+    # reason it deserves.
+    Assert-K8SourceIdentityFieldTypes -SequenceId $sequenceId -Identity $identity -Types ([ordered]@{
+        fetched_oid       = 'string'
+        remote_ref_commit = 'string'
+    })
     foreach ($oidField in 'head', 'fetched_oid', 'remote_ref_commit') {
         if ([string]$identity[$oidField] -notmatch '^[0-9a-f]{40}$') {
             throw "C-9: source identity field '$oidField' is not a 40-hex commit: '$($identity[$oidField])'."
@@ -2323,10 +2402,10 @@ function Assert-K8EmbeddedSourceIdentity {
     # The sequence-open gate refused a dirty tree. A record read back from disk
     # has to still say so, or the bundle would publish a provenance for a
     # worktree that was not the commit it names.
-    if ([bool]$identity['tree_clean'] -ne $true) {
+    if ($identity['tree_clean'] -ne $true) {
         throw "C-9: the source identity records tree_clean = $($identity['tree_clean']); a sequence cannot have been opened on a dirty tree, so this record does not describe the run that produced this bundle."
     }
-    if (@($identity['dirty_paths']).Count -ne 0) {
+    if ($identity['dirty_paths'].Count -ne 0) {
         throw "C-9: the source identity lists $(@($identity['dirty_paths']).Count) dirty path(s) while claiming a clean tree."
     }
 

@@ -5970,6 +5970,26 @@ Assert-K8Test 'C-9: the embedded source identity is bound to the sequence it cla
             'a malformed OID'                 = @{ remote_ref_commit = 'not-a-sha' }
             'a dirty tree'                    = @{ tree_clean = $false }
             'dirty paths despite a clean flag' = @{ dirty_paths = @(' M something.ps1') }
+
+            # TYPE, not just value. `[bool]$x -ne $true` reads like a value
+            # check and is not: PowerShell reads every non-empty string as
+            # $true (measured: [bool]'false' -> True). So the record below was
+            # CHECKED as a clean tree and PUBLISHED saying "false" -- the
+            # checker and the artefact disagreeing with nothing in between able
+            # to notice. "true" is the same defect with the contradiction
+            # hidden.
+            'the string "false" for tree_clean' = @{ tree_clean = 'false' }
+            'the string "true" for tree_clean'  = @{ tree_clean = 'true' }
+            'a null tree_clean'                 = @{ tree_clean = $null }
+            'a scalar dirty_paths'              = @{ dirty_paths = 'none' }
+            'a null fetched_oid'                = @{ fetched_oid = $null }
+            'a numeric head'                    = @{ head = 12345 }
+
+            # remote_url_normalized is DERIVED from remote_url. Checking only
+            # the derived one let a record hold a foreign raw URL beside a
+            # canonical normalized one, and the manifest would have published
+            # BOTH as this bundle's source.
+            'a foreign raw URL beside a canonical normalized one' = @{ remote_url = 'https://github.com/somebody/foreign.git' }
         }
         foreach ($case in $mutations.Keys) {
             try {
@@ -5983,9 +6003,27 @@ Assert-K8Test 'C-9: the embedded source identity is bound to the sequence it cla
             finally { $original | Set-Content -LiteralPath $path -Encoding utf8NoBOM -NoNewline }
         }
 
+        # Absence, which an assignment-only mutation cannot express.
+        foreach ($missing in 'remote_url', 'remote_name', 'dirty_paths', 'tree_clean') {
+            try {
+                $json = $original | ConvertFrom-Json -AsHashtable
+                $json.Remove($missing)
+                ($json | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $path -Encoding utf8NoBOM
+                Assert-K8FailsClosed -What "embedding a source identity with no '$missing'" -Because 'C-9' -Attempt {
+                    Assert-K8EmbeddedSourceIdentity -Consistency $consistency
+                }
+            }
+            finally { $original | Set-Content -LiteralPath $path -Encoding utf8NoBOM -NoNewline }
+        }
+
         # Still good after the restores, so the failures above were the
-        # mutations and not collateral damage.
-        [void](Assert-K8EmbeddedSourceIdentity -Consistency $consistency)
+        # mutations and not collateral damage -- and the genuine record really
+        # does carry BOTH URL fields, corresponding.
+        $accepted = Assert-K8EmbeddedSourceIdentity -Consistency $consistency
+        if ([string]::IsNullOrWhiteSpace([string]$accepted['remote_url'])) { throw 'the accepted record has no raw remote_url, so the correspondence check has nothing to compare' }
+        if ((ConvertTo-K8NormalizedRemoteUrl -Url $accepted['remote_url']) -ne [string]$accepted['remote_url_normalized']) { throw 'the accepted record''s raw and normalized URLs do not correspond' }
+        if ($accepted['tree_clean'] -isnot [bool]) { throw 'the accepted record does not carry tree_clean as a JSON boolean' }
+        if ($accepted['dirty_paths'] -isnot [array]) { throw 'the accepted record does not carry dirty_paths as a JSON array' }
     }
 }
 
