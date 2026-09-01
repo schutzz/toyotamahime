@@ -387,6 +387,86 @@ Even once Shakedown completes end to end, these remain manual by design (see
    token. The observer record retains what was observed; the scoring value is
    yours.
 
+## Source identity, and where a bundle goes afterwards (C-9)
+
+`Get-K8ToolingIdentity` used to observe HEAD and whether the worktree was
+clean. Neither says the commit was ever published, and a qualification
+sequence is the act of *locking* a HEAD -- so it now also observes whether
+that HEAD is an ancestor of the pinned ref on the canonical remote.
+
+The answer is three-valued and stays that way:
+
+    confirmed        published there
+    not-an-ancestor  observed, and it is not
+    not-observed     the remote could not be observed at all
+
+The last two both STOP at sequence open, and there is no override. "Let it
+through offline" is the same request as "open a qualification sequence on a
+commit that exists only on this disk". Sequence open is also the first command
+you run after cloning or pulling, so having no network at that moment is not
+the ordinary case.
+
+Two details that look like implementation trivia and are not:
+
+* The canonical **repository** is pinned, not just the ref. Ancestry alone
+  would only prove HEAD is an ancestor of *some* remote's ref -- add a local
+  remote and it is trivially true. You may choose the remote NAME; what counts
+  as the right repository is not a per-run choice.
+* `git ls-remote` runs before `git fetch`, because a fetch returns 128 both
+  when the ref is missing and when the host is unreachable (measured). Those
+  are different answers and the run must not lose the difference.
+
+The observation is recorded once per sequence and mirrored into every run's
+evidence tree as `source-identity.txt`, before `finalize-evidence`, so the
+manifest covers it.
+
+### Transfer bundles
+
+    .\tools\New-K8TransferBundle.ps1 -RunId <a>,<b>,<c> -Destination <dir> -BundleId <id>
+
+This exists because of RT-01: the first bundle verified 423/423 against the
+bytes as collected and 97 OK / 326 MISMATCH against the bytes git actually
+commits. It was closed by a person noticing and hand-adding a
+`.gitattributes`; nothing made the next transfer get checked at all.
+
+What the assembler does: copies the selected runs (pcap bodies excluded --
+their hashes travel in each run's own `pcap-hashes.sha256`), checks that the
+selection is one *completed* sequence at one locked HEAD covering a/b/c
+exactly once, and writes `transfer-manifest.json` with each file's SHA-256 and
+its **byte class** (`contains_cr`, `contains_nul`, `trailing_newline`).
+
+What it deliberately does not do: write a `.gitattributes`, or tell the
+consumer what its retention policy should be. "This file contains CR" is a
+fact about the producer's own bytes. "Therefore mark it `-text`" is the
+consumer's decision, and building it in here would make this repository
+depend on how another one stores things.
+
+`README.md` and `.gitattributes` are left for you; the script prints what is
+still owed rather than authoring either. Verification of the transferred bytes
+happens on the consumer side and is not part of this repository.
+
+### Range C now has an identity mechanism
+
+Range A/B carry `hashes.sha256` from the frozen `finalize-evidence`. Range C
+has no such producer and had nothing at all, so it now writes
+`shakedown-retention.sha256` over the artifacts its C-6 contract declares.
+
+It is not named like the frozen manifest on purpose, and it is not a claim to
+satisfy `evidence-schema.md`'s static-validation package shape. The manifest
+is a *required artifact* and is *not in its own hash domain* -- two different
+memberships, which is what makes the obvious circularity disappear rather than
+having to be worked around.
+
+### The frozen-path check no longer uses a moving ref
+
+Criterion 11(a) asks for a byte comparison against a fixed immutable base. The
+check that existed compared against a moving branch and silenced its own fetch
+failure, so a failed fetch compared against an arbitrarily old ref and still
+passed. It now compares against a pinned commit, resolved locally with no
+network call, and the pin itself is checked (a real commit object, and an
+ancestor of HEAD -- an unrelated commit with coincidentally identical frozen
+paths is not a base).
+
 ## Status
 
 Development in progress on branch `shakedown/k8-automation`. No formal

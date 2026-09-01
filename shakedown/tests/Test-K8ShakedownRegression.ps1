@@ -20,7 +20,9 @@
       5. Range C runner does not throw on validator exit 1 (the expected,
          not-forced outcome).
       6. Fail-closed readiness/image/finalize ordering and mechanical evidence gates.
-      7. Study01/ is byte-for-byte unmodified on this branch versus origin/main.
+      7. Study01/ is byte-for-byte unmodified versus the FIXED immutable base
+         commit (C-9 / criterion 11(a)) -- not versus a moving ref, and without
+         a fetch whose failure could go unnoticed.
       8. Elasticsearch application-readiness gate (the curl-exit-7 root-cause
          fix): runs before capture/trigger, shared by Range A and Range B from
          one call site, has a finite timeout, and is structurally distinct
@@ -2835,6 +2837,7 @@ function Invoke-K8SequenceSandbox {
     param([Parameter(Mandatory)][scriptblock] $Action)
     $root = Join-Path ([System.IO.Path]::GetTempPath()) ('k8seq-' + [guid]::NewGuid().ToString('N'))
     $repo = Join-Path ([System.IO.Path]::GetTempPath()) ('k8seqrepo-' + [guid]::NewGuid().ToString('N'))
+    $bare = Join-Path ([System.IO.Path]::GetTempPath()) ('k8seqbare-' + [guid]::NewGuid().ToString('N'))
     $previous = $env:K8_SHAKEDOWN_ROOT
     $env:K8_SHAKEDOWN_ROOT = $root
     New-Item -ItemType Directory -Force -Path $repo | Out-Null
@@ -2846,13 +2849,28 @@ function Invoke-K8SequenceSandbox {
         'seed' | Set-Content -Path (Join-Path $repo 'seed.txt')
         git -C $repo add -A *> $null
         git -C $repo commit -q -m seed *> $null
+
+        # C-9: opening a sequence now also requires the HEAD to be PUBLISHED on
+        # the canonical remote. Rather than skipping that gate for fixtures, the
+        # fixture gets a real published remote: a local bare repository, pushed
+        # to, with the pin pointed at it for the duration. Every step of
+        # Get-K8SourceIdentity then runs for real -- nothing is mocked, and the
+        # gate keeps its only behaviour (STOP on anything but `confirmed`).
+        git -C $repo init -q --bare $bare *> $null
+        git -C $repo remote add origin $bare *> $null
+        git -C $repo push -q origin HEAD:refs/heads/main *> $null
+        Set-K8TestSourcePin -CanonicalRemoteUrls @($bare) -CanonicalRef 'refs/heads/main'
+
         & $Action ([pscustomobject]@{
             Root = $root
             Repo = $repo
+            Bare = $bare
             Head = (git -C $repo rev-parse HEAD).Trim()
         })
     }
     finally {
+        Reset-K8TestSourcePin
+        Remove-Item $bare -Recurse -Force -ErrorAction SilentlyContinue
         if ($null -eq $previous) { Remove-Item Env:\K8_SHAKEDOWN_ROOT -ErrorAction SilentlyContinue }
         else { $env:K8_SHAKEDOWN_ROOT = $previous }
         Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
@@ -2866,6 +2884,20 @@ function Add-K8SandboxCommit {
     git -C $Repo add -A *> $null
     git -C $Repo commit -q -m $Text *> $null
     return (git -C $Repo rev-parse HEAD).Trim()
+}
+
+function Publish-K8SandboxHead {
+    <#
+        Pushes the sandbox repo's current HEAD to its local bare "remote".
+
+        C-9 gates sequence open on the HEAD being published, so a fixture that
+        commits and then opens a sequence has to publish in between -- which is
+        also the real operator order (fix, push, open a new sequence). Making
+        the fixtures do it keeps the gate exercised instead of worked around.
+    #>
+    param([Parameter(Mandatory)] $Sandbox)
+    git -C $Sandbox.Repo push -q --force origin HEAD:refs/heads/main *> $null
+    if ($LASTEXITCODE -ne 0) { throw "sandbox publish failed (exit $LASTEXITCODE)" }
 }
 
 function Assert-K8FailsClosed {
@@ -2994,7 +3026,16 @@ Assert-K8Test 'The in-tree provenance mirror lands at the evidence-tree root, ne
         New-Item -ItemType Directory -Force -Path $tree | Out-Null
         Copy-K8RunProvenanceIntoEvidence -Run $run -RunEvidence $tree
         $landed = @(Get-ChildItem $tree -Recurse -File)
-        if ($landed.Count -ne 1) { throw "expected exactly one mirrored file, found $($landed.Count)" }
+        # Two now: run-provenance.json (C-2) and source-identity.txt (C-9),
+        # written by the same call at the same point so one manifest covers both.
+        $names = @($landed.Name | Sort-Object)
+        if ($landed.Count -ne 2) { throw "expected exactly two mirrored files, found $($landed.Count): $($names -join ', ')" }
+        foreach ($expected in 'run-provenance.json', 'source-identity.txt') {
+            if ($names -notcontains $expected) { throw "the mirror did not write $expected (found: $($names -join ', '))" }
+        }
+        foreach ($f in $landed) {
+            if ((Split-Path -Parent $f.FullName) -ne (Resolve-Path $tree).Path) { throw "$($f.Name) was mirrored into a subdirectory, not the tree root" }
+        }
         if ($landed[0].Name -ne 'run-provenance.json') { throw "unexpected mirrored file $($landed[0].Name)" }
         if ($landed[0].Directory.FullName -ne (Resolve-Path $tree).Path) { throw 'the mirror is not at the evidence-tree root' }
         if ((Get-Content $landed[0].FullName -Raw) -ne (Get-Content (Get-K8RunProvenancePath -RunId $run.RunId) -Raw)) { throw 'the mirror is not byte-identical to the control-plane record' }
@@ -3113,6 +3154,10 @@ Assert-K8Test 'Close then start yields a distinct sequence at the new HEAD, back
             Start-K8ShakedownRun -Range b -RepoRoot $sb.Repo
         }
         $newHead = Add-K8SandboxCommit -Repo $sb.Repo -Text 'the fix'
+        # C-9: the fix has to be PUBLISHED before a sequence can lock it. This
+        # is the real operator sequence too -- fix, push, then open. Without the
+        # push the gate refuses, which is the point of it.
+        Publish-K8SandboxHead -Sandbox $sb
         $second = New-K8QualificationSequence -RepoRoot $sb.Repo
         if ($second['sequence_id'] -eq $first['sequence_id']) { throw 'the new sequence reused the old ID' }
         if ($second['locked_head'] -ne $newHead) { throw 'the new sequence did not lock the new HEAD' }
@@ -4201,8 +4246,17 @@ Assert-K8Test 'C-4: the producer inventory is a closed world across A/B/C, and a
         if ($expectedSidecars -notcontains $sidecar) { throw "'$sidecar' is a sidecar the inventory does not account for" }
     }
     # No new `.txt`: every text artifact in the contract is one that already
-    # existed before Batch 2. Structured output goes into JSON sidecars.
+    # existed before Batch 2, with ONE named exception. Structured output goes
+    # into JSON sidecars.
+    #
+    # source-identity.txt is added by Batch 3B, and it is not a C-4 command
+    # observation at all: docs/k8-independent-reproduction-plan.md SS5.2 asks
+    # for a per-run `source-identity.txt` BY NAME, and the authoritative record
+    # is the JSON under sequences/. Allowing it by name keeps the rule intact --
+    # what C-4 forbids is a second, hand-written text rendering of a command
+    # observation, which this is not.
     $preExistingTxt = @(
+        'source-identity.txt',
         'contract-output\gateway-interface-resolution.txt', 'contract-output\qdisc-pre-fault.txt',
         'contract-output\fault-injection-command.txt', 'contract-output\qdisc-post-fault.txt',
         'contract-output\unrelated-mirror-filters.txt', 'contract-output\r-obs-05-liveness-decode.txt',
@@ -4474,8 +4528,16 @@ Assert-K8Test 'C-6: leaving a stage checks that stage, fails closed there, and t
         if ($message -notmatch "stage 'evidence-tree'") { throw "the failure does not name the stage that owed the artifact: $message" }
         if ($message -notmatch 'run-provenance\.json') { throw "the failure does not name the missing artifact: $message" }
 
-        # With it present, the same transition succeeds.
+        # With it present, the stage still owes source-identity.txt (C-9), and
+        # the gate names THAT one next rather than passing on a partial set.
         '{}' | Set-Content -LiteralPath (Join-Path $evidence 'run-provenance.json') -Encoding utf8NoBOM
+        $stopped = $false; $message = ''
+        try { Set-K8ShakedownRunStage -Stage 'compose-generate' } catch { $stopped = $true; $message = $_.Exception.Message }
+        if (-not $stopped) { throw 'the gate passed while source-identity.txt was still missing' }
+        if ($message -notmatch 'source-identity\.txt') { throw "the failure does not name the remaining missing artifact: $message" }
+
+        # With both present, the same transition succeeds.
+        'x' | Set-Content -LiteralPath (Join-Path $evidence 'source-identity.txt') -Encoding utf8NoBOM
         Set-K8ShakedownRunStage -Stage 'compose-generate'
 
         # The final gate is defense in depth over the SAME contract: it must
@@ -4792,11 +4854,15 @@ function Get-K8ObservedSiteTable {
 
 Assert-K8Test 'C-8: the contract is a single data structure, and every row states a complete, non-default acceptance domain' {
     $rows = @(Get-K8CommandContract)
-    if ($rows.Count -ne 100) { throw "expected 100 process-site rows, got $($rows.Count)" }
+    # Batch 3A fixed 100 rows (F 37 / C 60 / I 3). Batch 3B adds the six C-9
+    # source-identity git call sites as C-61..C-66, so the closed world is now
+    # 106 (F 37 / C 66 / I 3). The count is asserted per class, not in total,
+    # so a row moving between classes cannot hide inside an unchanged sum.
+    if ($rows.Count -ne 106) { throw "expected 106 process-site rows, got $($rows.Count)" }
     $byClass = @{}
     foreach ($c in 'F', 'C', 'I') { $byClass[$c] = @($rows | Where-Object { $_.class -eq $c }).Count }
-    if ($byClass['F'] -ne 37 -or $byClass['C'] -ne 60 -or $byClass['I'] -ne 3) {
-        throw "class split is F=$($byClass['F']) C=$($byClass['C']) I=$($byClass['I']); the Plan fixes F=37 C=60 I=3"
+    if ($byClass['F'] -ne 37 -or $byClass['C'] -ne 66 -or $byClass['I'] -ne 3) {
+        throw "class split is F=$($byClass['F']) C=$($byClass['C']) I=$($byClass['I']); Batch 3A fixes F=37 I=3 and Batch 3B raises C to 66"
     }
     if (@($rows.step_id | Sort-Object -Unique).Count -ne $rows.Count) { throw 'step_id values are not unique' }
     foreach ($r in $rows) {
@@ -5391,14 +5457,380 @@ Assert-K8Test 'C-8: runtime-installed container tools are observed per run, and 
     }
 }
 
+# --- 30. C-9: source / transfer / fresh-clone certification (Batch 3B) --------
+#
+# What these defend is the boundary RT-01 crossed. The producer half is here;
+# the consumer half lives in Kakuriyo and is deliberately NOT shared code --
+# a verifier that imports the implementation it is meant to be able to catch
+# is not an independent check.
+
+Assert-K8Test 'C-9: source identity is THREE-valued, and none of the three is a boolean in disguise' {
+    Import-Module $CommonPath -Force
+    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Get-K8SourceIdentity'
+    foreach ($state in 'confirmed', 'not-an-ancestor', 'not-observed') {
+        if ($body -notmatch [regex]::Escape($state)) { throw "Get-K8SourceIdentity never produces '$state'; the tri-state exists to keep 'observed not to be an ancestor' apart from 'could not observe'" }
+    }
+    # A boolean ancestry field would be the collapse C-5 forbids.
+    if ($body -match 'ancestry\s*=\s*\$(true|false)') { throw 'ancestry is assigned a boolean somewhere; that merges an answer with the absence of one' }
+}
+
+Assert-K8Test 'C-9: ancestry is measured against the PINNED repository, not any remote that happens to contain HEAD' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        # A second bare repo, holding the same commits, added as another remote.
+        # Ancestry against it would be perfectly true -- and would establish
+        # nothing about publication to the canonical source.
+        $decoy = Join-Path ([System.IO.Path]::GetTempPath()) ('k8decoy-' + [guid]::NewGuid().ToString('N'))
+        try {
+            git -C $sb.Repo init -q --bare $decoy *> $null
+            git -C $sb.Repo remote add decoy $decoy *> $null
+            git -C $sb.Repo push -q decoy HEAD:refs/heads/main *> $null
+
+            $stopped = $false; $message = ''
+            try { Get-K8SourceIdentity -RepoRoot $sb.Repo -RemoteName 'decoy' } catch { $stopped = $true; $message = $_.Exception.Message }
+            if (-not $stopped) { throw 'ancestry against a non-canonical remote was accepted; "an ancestor of SOMETHING" is not "published where this study says it is"' }
+            if ($message -notmatch 'not the canonical producer source') { throw "the refusal does not name the reason: $message" }
+
+            # And the canonical one still works, so this is not simply failing.
+            $ok = Get-K8SourceIdentity -RepoRoot $sb.Repo
+            if ($ok.ancestry -ne 'confirmed') { throw "the canonical remote did not confirm: $($ok.ancestry) / $($ok.ancestry_note)" }
+        }
+        finally { Remove-Item $decoy -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Assert-K8Test 'C-9: an absent pinned ref STOPs; it is not reported as "could not observe"' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        # The remote is reachable and answers. What it answers is that the ref
+        # is not there -- an observation, not a failure to observe.
+        Set-K8TestSourcePin -CanonicalRemoteUrls @($sb.Bare) -CanonicalRef 'refs/heads/no-such-branch'
+        $stopped = $false; $message = ''
+        try { Get-K8SourceIdentity -RepoRoot $sb.Repo } catch { $stopped = $true; $message = $_.Exception.Message }
+        if (-not $stopped) { throw 'an absent pinned ref did not STOP' }
+        if ($message -notmatch 'does not exist on') { throw "the refusal does not distinguish an absent ref from an unobservable remote: $message" }
+    }
+}
+
+Assert-K8Test 'C-9: an unreachable remote yields not-observed, and not-observed STOPs at sequence open' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        # Point the pin at a bare repo, then delete it: the remote URL is still
+        # canonical, and it can no longer be observed.
+        $gone = Join-Path ([System.IO.Path]::GetTempPath()) ('k8gone-' + [guid]::NewGuid().ToString('N'))
+        git -C $sb.Repo init -q --bare $gone *> $null
+        git -C $sb.Repo remote add gone $gone *> $null
+        git -C $sb.Repo push -q gone HEAD:refs/heads/main *> $null
+        Remove-Item $gone -Recurse -Force
+        Set-K8TestSourcePin -CanonicalRemoteUrls @($gone) -CanonicalRef 'refs/heads/main'
+
+        $record = Get-K8SourceIdentity -RepoRoot $sb.Repo -RemoteName 'gone'
+        if ($record.ancestry -ne 'not-observed') { throw "an unreachable remote produced '$($record.ancestry)' instead of not-observed" }
+        if ([string]::IsNullOrWhiteSpace($record.ancestry_note)) { throw 'not-observed was recorded without saying why' }
+
+        # And it is not a soft state: the gate refuses it, with no override.
+        $stopped = $false; $message = ''
+        try { Assert-K8SourceIdentityPublished -SourceIdentity $record } catch { $stopped = $true; $message = $_.Exception.Message }
+        if (-not $stopped) { throw 'not-observed passed the sequence-open gate' }
+        if ($message -notmatch 'UNKNOWN, not false') { throw "the refusal collapses 'unknown' into 'false': $message" }
+    }
+}
+
+Assert-K8Test 'C-9: the gate has no override, and a not-an-ancestor HEAD cannot open a sequence' {
+    Import-Module $CommonPath -Force
+    # No parameter anywhere in the module offers to skip it. An operator-facing
+    # override would be the same request as "lock an unpublished commit".
+    $src = Get-Content $CommonPath -Raw
+    foreach ($smell in 'AllowUnpublished', 'SkipSourceIdentity', 'IgnoreAncestry', 'ForceSequence') {
+        if ($src -match [regex]::Escape($smell)) { throw "the module exposes '$smell'; the sequence-open gate is not overridable" }
+    }
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        [void](Add-K8SandboxCommit -Repo $sb.Repo -Text 'unpublished work')
+        # Deliberately NOT published.
+        $stopped = $false; $message = ''
+        try { New-K8QualificationSequence -RepoRoot $sb.Repo } catch { $stopped = $true; $message = $_.Exception.Message }
+        if (-not $stopped) { throw 'a sequence opened on a HEAD that exists only on this disk' }
+        if ($message -notmatch 'not published') { throw "the refusal does not say what is wrong: $message" }
+
+        # Publishing it makes the same open succeed -- so the gate is not
+        # simply refusing everything.
+        Publish-K8SandboxHead -Sandbox $sb
+        $seq = New-K8QualificationSequence -RepoRoot $sb.Repo
+        if (-not $seq.sequence_id) { throw 'publishing the HEAD did not make the sequence openable' }
+    }
+}
+
+Assert-K8Test 'C-9: the ancestry temp ref is deleted, and the decision never reads a remote-tracking ref' {
+    Import-Module $CommonPath -Force
+    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Get-K8SourceIdentity'
+    # Reading <remote>/<ref> would let a successful fetch pair with an
+    # arbitrarily old ref. The refspec fetches into a named temp ref instead.
+    if ($body -match "rev-parse',\s*""\`$RemoteName/") { throw 'the ancestry decision reads a remote-tracking ref' }
+    if ($body -notmatch 'AncestryTempRef') { throw 'the ancestry decision does not use the explicit temp ref' }
+
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $record = Get-K8SourceIdentity -RepoRoot $sb.Repo
+        if ($record.fetched_oid -ne $record.remote_ref_commit) { throw 'the OID fetched and the OID judged are not the same value' }
+        git -C $sb.Repo show-ref (Get-K8ProducerSourcePin).AncestryTempRef *> $null
+        if ($LASTEXITCODE -eq 0) { throw 'the ancestry temp ref was left behind; a later run that failed to fetch could resolve it' }
+    }
+}
+
+Assert-K8Test 'C-9: source-identity.txt is mirrored before finalize, and the sequence record is its source' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $seq = New-K8QualificationSequence -RepoRoot $sb.Repo
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        $tree = Join-Path $sb.Root 'tree'
+        New-Item -ItemType Directory -Force -Path $tree | Out-Null
+        Copy-K8RunProvenanceIntoEvidence -Run $run -RunEvidence $tree
+
+        $txt = Join-Path $tree 'source-identity.txt'
+        if (-not (Test-Path $txt)) { throw 'source-identity.txt was not mirrored into the evidence tree' }
+        $content = Get-Content $txt -Raw
+        $json = (Get-Content (Get-K8SourceIdentityPath -SequenceId $seq.sequence_id) -Raw) | ConvertFrom-Json
+        foreach ($field in $json.head, $json.remote_url, $json.ancestry) {
+            if ($content -notmatch [regex]::Escape($field)) { throw "the mirrored text does not carry '$field' from the authoritative record" }
+        }
+        if ($content -notmatch [regex]::Escape($run.RunId)) { throw 'the per-run mirror does not name the run it belongs to' }
+    }
+}
+
+Assert-K8Test 'C-9: Range C hash domain excludes the manifest itself but the contract still requires it' {
+    Import-Module $CommonPath -Force
+    $rows = @(Get-K8ContractArtifacts -Range 'c')
+    $names = @($rows.artifact)
+    if ($names -notcontains 'shakedown-retention.sha256') { throw 'the Range C manifest is not a required artifact; its identity mechanism would sit outside C-6 entirely' }
+
+    $d = Join-Path ([System.IO.Path]::GetTempPath()) ('k8rcman-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $d | Out-Null
+    try {
+        foreach ($row in $rows) {
+            if ($row.artifact -eq 'shakedown-retention.sha256') { continue }
+            $target = Join-Path $d $row.artifact
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+            "content of $($row.artifact)" | Set-Content -LiteralPath $target -Encoding utf8NoBOM
+        }
+        $domain = @(Write-K8RangeCRetentionManifest -RunEvidence $d)
+        if ($domain -contains 'shakedown-retention.sha256') { throw 'the manifest is inside its own hash domain; that digest cannot be computed without self-reference' }
+
+        $manifestText = Get-Content (Join-Path $d 'shakedown-retention.sha256') -Raw
+        if ($manifestText -match 'shakedown-retention\.sha256') { throw 'the manifest lists itself' }
+        if ($manifestText.Contains([string][char]92)) { throw 'the manifest uses backslash separators; a POSIX consumer cannot resolve those (the existing MANIFEST.sha256 has exactly this defect)' }
+        foreach ($line in ($manifestText -split "`n" | Where-Object { $_.Trim() })) {
+            if ($line -notmatch '^[0-9a-f]{64}  \S') { throw "manifest line is not '<sha256>  <path>': $line" }
+        }
+
+        # And a domain member that was never retained is a STOP, not a silently
+        # shorter manifest.
+        Remove-Item (Join-Path $d 'metadata.md') -Force
+        Assert-K8FailsClosed -What 'writing a Range C manifest with a domain member missing' -Because 'never retained' -Attempt {
+            Write-K8RangeCRetentionManifest -RunEvidence $d
+        }
+    }
+    finally { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'C-9: Range C''s identity snapshot does not reuse Range A/B''s verified wording' {
+    Import-Module $CommonPath -Force
+    $ab = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Write-K8FinalizeIdentitySnapshot'
+    $c  = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Write-K8RangeCIdentitySnapshot'
+    if ($ab -notmatch 'verify-integrity') { throw 'the A/B snapshot no longer says what verified it' }
+    if ($c -match 'verify-integrity \(study01_collect') { throw "the Range C snapshot reuses A/B's verified wording; no frozen verifier runs on that shape, so claiming one describes an observation nobody made" }
+    if ($c -notmatch 'none was run') { throw 'the Range C snapshot does not state that no frozen verify-integrity applies' }
+}
+
+Assert-K8Test 'C-9: the transfer manifest states byte facts and never writes a .gitattributes' {
+    Import-Module $CommonPath -Force
+    # D-4: emitting the repair that fixed RT-01 would make the producer depend
+    # on the consumer's retention policy.
+    foreach ($fn in 'New-K8TransferManifest', 'Get-K8FileByteClass') {
+        $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name $fn
+        if ($body -match '\.gitattributes') { throw "$fn references .gitattributes; the producer must not author the consumer's policy" }
+        if ($body -match '-text') { throw "$fn emits an attribute directive; byte_class is an observation, the directive is the consumer's decision" }
+    }
+    $bundleScript = Get-Content (Join-Path $ToolsDir 'New-K8TransferBundle.ps1') -Raw
+    if ($bundleScript -match "Set-Content[^\r\n]*\.gitattributes") { throw 'the bundle assembler writes a .gitattributes' }
+
+    $d = Join-Path ([System.IO.Path]::GetTempPath()) ('k8bc-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $d | Out-Null
+    try {
+        [System.IO.File]::WriteAllBytes((Join-Path $d 'crlf.txt'), [byte[]](0x61, 0x0D, 0x0A))
+        [System.IO.File]::WriteAllBytes((Join-Path $d 'lf.txt'), [byte[]](0x61, 0x0A))
+        [System.IO.File]::WriteAllBytes((Join-Path $d 'bin.dat'), [byte[]](0x61, 0x00, 0x62))
+        $cr = Get-K8FileByteClass -Path (Join-Path $d 'crlf.txt')
+        $lf = Get-K8FileByteClass -Path (Join-Path $d 'lf.txt')
+        $bin = Get-K8FileByteClass -Path (Join-Path $d 'bin.dat')
+        if (-not $cr.contains_cr) { throw 'a CRLF file was not reported as containing CR -- this is the RT-01 condition itself' }
+        if ($lf.contains_cr) { throw 'an LF-only file was reported as containing CR' }
+        if (-not $bin.contains_nul) { throw 'a NUL-bearing file was not reported as binary-ish' }
+        if (-not $lf.trailing_newline -or $bin.trailing_newline) { throw 'trailing_newline is not tracking the last byte' }
+    }
+    finally { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'C-9: bundle paths are POSIX, and the closed-world equation is phase-aware' {
+    Import-Module $CommonPath -Force
+    $d = Join-Path ([System.IO.Path]::GetTempPath()) ('k8cw-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path (Join-Path $d 'run-a\environment') | Out-Null
+    try {
+        'x' | Set-Content -LiteralPath (Join-Path $d 'run-a\environment\compose-ps.txt') -Encoding utf8NoBOM
+        $rel = ConvertTo-K8BundleRelativePath -Root $d -FullPath (Join-Path $d 'run-a\environment\compose-ps.txt')
+        if ($rel -ne 'run-a/environment/compose-ps.txt') { throw "path was not normalized to POSIX separators: '$rel'" }
+
+        $manifest = [pscustomobject]@{ files = @([pscustomobject]@{ path = 'run-a/environment/compose-ps.txt' }) }
+
+        # C_data: manifest + README + .gitattributes present, certification absent.
+        '{}' | Set-Content -LiteralPath (Join-Path $d 'transfer-manifest.json') -Encoding utf8NoBOM
+        '# bundle' | Set-Content -LiteralPath (Join-Path $d 'README.md') -Encoding utf8NoBOM
+        '* -text' | Set-Content -LiteralPath (Join-Path $d '.gitattributes') -Encoding utf8NoBOM
+        $r = Test-K8BundleClosedWorld -BundleRoot $d -Manifest $manifest
+        if (-not $r.Ok) { throw "C_data did not satisfy the set equation: unaccounted=[$($r.UnaccountedFiles -join ',')] missing=[$($r.MissingFromBundle -join ',')] both=[$($r.ClaimedAsBoth -join ',')]" }
+
+        # C_cert: the certification record appears. Still satisfied -- the
+        # allowlist is names that MAY be control files, not files that must be
+        # present, which is what made the earlier formulation unsatisfiable.
+        '{}' | Set-Content -LiteralPath (Join-Path $d 'transfer-certification.json') -Encoding utf8NoBOM
+        $r2 = Test-K8BundleClosedWorld -BundleRoot $d -Manifest $manifest
+        if (-not $r2.Ok) { throw 'C_cert did not satisfy the set equation once the certification record was added' }
+
+        # An unaccounted file is named, not counted.
+        'stray' | Set-Content -LiteralPath (Join-Path $d 'run-a\stray.txt') -Encoding utf8NoBOM
+        $r3 = Test-K8BundleClosedWorld -BundleRoot $d -Manifest $manifest
+        if ($r3.Ok) { throw 'a file in neither set was accepted' }
+        if (@($r3.UnaccountedFiles) -notcontains 'run-a/stray.txt') { throw 'the unaccounted file was not named' }
+    }
+    finally { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'C-9: exclusions are constrained, and never excuse a file that is actually present' {
+    Import-Module $CommonPath -Force
+    $ok = @([ordered]@{ pattern = '*.pcap'; reason = 'pcap-body-never-in-git'; retained_instead = '*/pcap-hashes.sha256' })
+    Assert-K8ExclusionDeclaration -Exclusions $ok
+
+    $bad = @{
+        'a traversal segment'      = @([ordered]@{ pattern = '../secrets/*'; reason = 'pcap-body-never-in-git'; retained_instead = '' })
+        'an absolute pattern'      = @([ordered]@{ pattern = 'C:\evidence\*'; reason = 'pcap-body-never-in-git'; retained_instead = '' })
+        'an empty path segment'    = @([ordered]@{ pattern = 'runs//x'; reason = 'pcap-body-never-in-git'; retained_instead = '' })
+        'a free-form reason'       = @([ordered]@{ pattern = '*.pcap'; reason = 'too big to commit'; retained_instead = '' })
+        'a duplicate pattern'      = @([ordered]@{ pattern = '*.pcap'; reason = 'pcap-body-never-in-git'; retained_instead = '' }, [ordered]@{ pattern = '*.pcap'; reason = 'pcap-body-never-in-git'; retained_instead = '' })
+        'overlapping patterns'     = @([ordered]@{ pattern = 'runs/*'; reason = 'pcap-body-never-in-git'; retained_instead = '' }, [ordered]@{ pattern = 'runs/a/*'; reason = 'pcap-body-never-in-git'; retained_instead = '' })
+    }
+    foreach ($case in $bad.Keys) {
+        Assert-K8FailsClosed -What "declaring $case" -Because 'exclusion' -Attempt { Assert-K8ExclusionDeclaration -Exclusions $bad[$case] }
+    }
+}
+
+Assert-K8Test 'C-9: the run selection must be one completed sequence at one HEAD, covering a/b/c once' {
+    Import-Module $CommonPath -Force
+    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Assert-K8BundleRunConsistency'
+    foreach ($guard in "-ne 'complete'", 'locked_head', "'a,b,c'", 'termination') {
+        if ($body -notmatch [regex]::Escape($guard)) { throw "the bundle consistency gate does not check '$guard'; retaining sequence_id and tooling_head is an observation, not a verification (U-8 is the case where nobody checked)" }
+    }
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $runA = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        # The sequence is still open, and its runs are incomplete: a bundle
+        # asserts a finished qualification, so this must not be transferable.
+        Assert-K8FailsClosed -What 'bundling a run from a sequence that has not completed' -Because 'not' -Attempt {
+            Assert-K8BundleRunConsistency -RunIds @($runA.RunId)
+        }
+    }
+}
+
 # --- 7. Study01/ untouched on this branch -------------------------------------
 
-Assert-K8Test 'Study01/ is byte-for-byte unchanged versus origin/main' {
+Assert-K8Test 'C-9: the frozen-path comparison uses a FIXED immutable base, resolved without fetching' {
+    # criterion 11(a) names a fixed immutable base commit. The check this
+    # replaces compared against origin/main and swallowed its own fetch
+    # failure; both are recorded in the module beside the pin.
+    $base = Get-K8ImmutableBase
+    if ($base.Commit -notmatch '^[0-9a-f]{40}$') { throw "the immutable base pin is not a 40-hex commit: '$($base.Commit)'" }
+
     Push-Location $RepoRoot
     try {
-        git fetch origin main --quiet 2>$null
-        $diff = git diff --stat origin/main -- Study01 bootstrap docs/k8-packaging-certification.md 2>&1
-        if ($diff) { throw "frozen paths differ from origin/main:`n$diff" }
+        # (1) The pin must be a real commit object IN THIS CLONE. A pin that
+        #     only resolves after a fetch would put the check back on the
+        #     network, which is half of what was wrong before.
+        $type = (git cat-file -t $base.Commit 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $type -ne 'commit') { throw "immutable base $($base.Commit) does not resolve to a commit object without fetching (got '$type', exit $LASTEXITCODE)" }
+
+        # (2) It must be an ANCESTOR of HEAD. A valid-but-unrelated SHA would
+        #     otherwise compare two points that merely happen to agree.
+        git merge-base --is-ancestor $base.Commit HEAD 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "immutable base $($base.Commit) is not an ancestor of HEAD; comparing against it would not establish that the frozen paths never moved from the base this branch descends from" }
+
+        # (3) The comparison itself.
+        $diff = (git diff --stat $base.Commit -- @($base.FrozenPaths) 2>&1 | Out-String).Trim()
+        if ($diff) { throw "frozen paths differ from the immutable base $($base.Commit):`n$diff" }
+    }
+    finally { Pop-Location }
+
+    # (4) The DECIDING CODE must not have reacquired a moving ref or a fetch.
+    #     Scoped to this check's own block: prose elsewhere may legitimately
+    #     name the defect it descends from, and banning the words there would
+    #     only make the record less legible (same narrowing C-8 needed).
+    $src = Get-Content $PSCommandPath -Raw
+    $marker = "Assert-K8Test 'C-9: the frozen-path comparison uses a FIXED immutable base"
+    $start = $src.IndexOf($marker)
+    $next = $src.IndexOf("Assert-K8Test '", $start + $marker.Length)
+    if ($next -lt 0) { $next = $src.Length }
+    $body = $src.Substring($start, $next - $start)
+    # Scan the CODE, not the prose. A comment may legitimately name the defect
+    # this check descends from -- that is documentation, and banning the words
+    # there would only make the record less legible. The audit line itself also
+    # necessarily contains the literals it bans, and it is a comment-free line,
+    # so it is excluded by position.
+    $auditAt = $body.IndexOf('$auditAt')
+    if ($auditAt -gt 0) { $body = $body.Substring(0, $auditAt) }
+    $code = (($body -split "`n") | Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
+    foreach ($banned in 'origin/main', 'git fetch') {
+        if ($code -match [regex]::Escape($banned)) { throw "the frozen-path check's deciding code references '$banned'; criterion 11(a) requires a fixed base resolved locally" }
+    }
+}
+
+Assert-K8Test 'C-9: changing a frozen byte is caught by the immutable-base comparison (the check is not vacuous)' {
+    $base = Get-K8ImmutableBase
+    $victim = Join-Path $RepoRoot 'Study01\README.md'
+    $original = [System.IO.File]::ReadAllBytes($victim)
+    Push-Location $RepoRoot
+    try {
+        [System.IO.File]::WriteAllBytes($victim, ($original + [byte]0x0A))
+        $diff = (git diff --stat $base.Commit -- @($base.FrozenPaths) 2>&1 | Out-String).Trim()
+        if (-not $diff) { throw 'a modified frozen file produced no diff against the immutable base; the comparison is vacuous' }
+    }
+    finally {
+        [System.IO.File]::WriteAllBytes($victim, $original)
+        Pop-Location
+    }
+}
+
+Assert-K8Test 'C-9: a pin that is not an ancestor of HEAD is refused, not silently compared' {
+    # An unrelated commit can share identical frozen paths by coincidence. The
+    # ancestry requirement is what makes "unchanged" mean "unchanged from the
+    # base this branch actually descends from", rather than "agrees with some
+    # other point in the object store".
+    Push-Location $RepoRoot
+    try {
+        # The well-known empty tree, so no object has to be written first.
+        $emptyTree = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+        $orphan = (git commit-tree $emptyTree -m 'k8 c9 non-ancestor probe' 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $orphan -notmatch '^[0-9a-f]{40}$') { throw "could not create a parentless probe commit: $orphan" }
+
+        git merge-base --is-ancestor $orphan HEAD 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { throw 'a parentless probe commit was reported as an ancestor of HEAD; the ancestry guard cannot discriminate' }
+
+        # It IS a real commit object, so "resolves as a commit" alone would have
+        # accepted it -- which is exactly why ancestry is a separate check.
+        $type = (git cat-file -t $orphan 2>&1 | Out-String).Trim()
+        if ($type -ne 'commit') { throw "the probe is not a commit object (got '$type'); this test would not be showing what it claims" }
     }
     finally { Pop-Location }
 }

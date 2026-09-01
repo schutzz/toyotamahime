@@ -222,8 +222,18 @@ Write-K8ShakedownLog -Message "Disposable worktree removed after retention (READ
 # c-2b-sequence-valid sequence -- while an artifact it contracted to retain is
 # missing. Defense in depth over the per-stage gates above, from the same
 # single contract.
+# C-9 (B3B-04). Every producer stage has finished, so the hash domain is
+# complete. The manifest is itself a required artifact of THIS stage, and it is
+# not in its own hash domain -- two different memberships, kept apart.
+Set-K8ShakedownRunStage -Stage 'retention-manifest'
+Write-K8RangeCRetentionManifest -RunEvidence $RunEvidence | Out-Null
+
 Set-K8ShakedownRunStage -Stage 'completeness-gate'
 Assert-K8RunArtifactCompleteness -Range 'c' -RunEvidence $RunEvidence
+
+# Only what passed a gate gets pinned -- Batch 2's ordering rule for the A/B
+# finalize identity snapshot, applied to the Range C manifest.
+Write-K8RangeCIdentitySnapshot -Run $Run -RunEvidence $RunEvidence | Out-Null
 
 # Range C is single-phase, so the sequence advances here rather than in a
 # separate Complete script. If this is the third run of an uninterrupted

@@ -144,3 +144,56 @@ Every external command now names a contract row, and the run stops if:
 None of these change what any command does. They change where a failure
 becomes visible: at the command that caused it, rather than several steps
 later at something that merely depended on it.
+
+New STOP conditions introduced by source identity (C-9)
+-------------------------------------------------------
+Opening a qualification sequence now also checks that the HEAD it is about to
+lock is published on the canonical remote. Start-K8QualificationSequence.ps1
+stops if:
+
+  * the named remote is not the canonical repository
+    -- ancestry against any remote you happen to have added would only show
+       that HEAD is an ancestor of SOMETHING. You choose the remote NAME; the
+       repository and the ref are pinned.
+
+  * the pinned ref does not exist on that remote
+    -- the remote answered, and the answer is that the ref is absent. Reported
+       as an absent ref, never as "could not observe".
+
+  * the remote could not be observed at all
+    -- recorded as not-observed and stopped. Not overridable: proceeding would
+       lock a HEAD whose publication was never established.
+
+  * HEAD is not an ancestor of the pinned ref
+    -- the commit is not published there. Push first, then open the sequence.
+       That is the ordinary order anyway: fix, push, open a new sequence.
+
+The observation is written once per sequence to
+sequences\<id>.source-identity.json and mirrored into each run's evidence tree
+as source-identity.txt, before finalize-evidence hashes the tree.
+
+Assembling a transfer bundle
+----------------------------
+    .\tools\New-K8TransferBundle.ps1 `
+        -RunId <range-a-id>,<range-b-id>,<range-c-id> `
+        -Destination <empty dir> `
+        -BundleId <id>
+
+Which runs go in is your decision. Whether that selection hangs together is
+not: one COMPLETED sequence, one locked HEAD, a/b/c exactly once, and no
+terminated run among them. The first bundle's three "qualification runs" spanned
+different tooling HEADs and nothing noticed.
+
+The script writes transfer-manifest.json and stops there. It does NOT write
+README.md or .gitattributes -- the first is yours to author, the second is the
+consumer's retention policy, which this repository does not decide. Each file's
+byte class (contains_cr / contains_nul / trailing_newline) is in the manifest;
+that is the fact you need in order to choose a policy.
+
+A destination that already exists is refused. Bundles are assembled once, and a
+re-attempt uses a NEW bundle id rather than reusing one.
+
+Verifying the transferred bytes happens on the consumer side, against both the
+bytes as collected AND the bytes git actually commits. Checking only the first
+is what made RT-01 look fine (423/423) while three quarters of the files were
+being rewritten (97 OK / 326 MISMATCH).
