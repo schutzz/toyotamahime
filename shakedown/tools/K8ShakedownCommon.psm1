@@ -1656,7 +1656,16 @@ function Assert-K8StageArtifacts {
         [Parameter(Mandatory)][string] $Stage,
         [Parameter(Mandatory)][string] $RunEvidence
     )
-    $rows = Get-K8ContractArtifacts -Range $Range -Stage $Stage
+    # @() at the CALL SITE, not just inside the selector. The selector already
+    # returns @(...), but PowerShell unrolls a function's output, so the array
+    # wrapper does not survive the call boundary: zero rows arrive as $null and
+    # one row arrives as the bare Hashtable. Under Set-StrictMode the first
+    # throws on .Count, and the second answers with the hashtable's KEY count
+    # (4) instead of 1 -- a wrong cardinality in a retained log line.
+    #
+    # Most stages own no contracted artifact, so the zero case is the normal
+    # one: leaving `compose-generate` reached it on every Range A/B run.
+    $rows = @(Get-K8ContractArtifacts -Range $Range -Stage $Stage)
     if ($rows.Count -eq 0) { return }
     $missing = @($rows | Where-Object { -not (Test-Path -LiteralPath (Join-Path $RunEvidence $_.artifact)) } | ForEach-Object { $_.artifact })
     if ($missing.Count -gt 0) {
@@ -1676,7 +1685,12 @@ function Assert-K8RunArtifactCompleteness {
         [Parameter(Mandatory)][ValidateSet('a', 'b', 'c')][string] $Range,
         [Parameter(Mandatory)][string] $RunEvidence
     )
-    $rows = Get-K8ContractArtifacts -Range $Range
+    # Same call-site @() as the stage gate. Not reachable with today's contract
+    # -- every range requires more than one artifact (measured: a 28, b 46,
+    # c 9) -- but the two gates read the ONE selector and must not differ in
+    # how they receive it: a contract edit that left a range with one required
+    # artifact would silently log the hashtable's key count here.
+    $rows = @(Get-K8ContractArtifacts -Range $Range)
     $missing = @($rows | Where-Object { -not (Test-Path -LiteralPath (Join-Path $RunEvidence $_.artifact)) })
     if ($missing.Count -gt 0) {
         $detail = ($missing | ForEach-Object { "$($_.artifact) (owed by stage '$($_.stage)')" }) -join ', '

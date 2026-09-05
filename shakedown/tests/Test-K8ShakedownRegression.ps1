@@ -4589,6 +4589,133 @@ Assert-K8Test 'C-6: leaving a stage checks that stage, fails closed there, and t
     }
 }
 
+Assert-K8Test 'C-6: the stage gate survives zero, one and many contracted rows -- one row is not the hashtable key count' {
+    Import-Module $CommonPath -Force
+    # The selector returns @(...), but PowerShell unrolls a function's output,
+    # so the wrapper does not survive the call boundary. Measured shapes AS THE
+    # CALLER RECEIVES THEM: 0 -> $null, 1 -> Hashtable, 2+ -> Object[]. The
+    # cardinalities are derived from the contract, never restated here.
+    $byStage = @{}
+    foreach ($row in @(Get-K8ContractArtifacts -Range a)) {
+        if (-not $byStage.ContainsKey($row.stage)) { $byStage[$row.stage] = 0 }
+        $byStage[$row.stage]++
+    }
+    $oneStage  = @($byStage.Keys | Where-Object { $byStage[$_] -eq 1 } | Sort-Object)[0]
+    $manyStage = @($byStage.Keys | Where-Object { $byStage[$_] -gt 1 } | Sort-Object)[0]
+    if (-not $oneStage)  { throw 'no Range A stage owns exactly one contracted artifact, so the single-row case is untested' }
+    if (-not $manyStage) { throw 'no Range A stage owns more than one contracted artifact, so the multi-row case is untested' }
+
+    # A single row arrives as a Hashtable whose .Count is its KEY count, not 1.
+    # If that ever stops being true the test below stops discriminating, so it
+    # is asserted rather than assumed.
+    $bare = Get-K8ContractArtifacts -Range a -Stage $oneStage
+    if ($bare -isnot [hashtable]) { throw "a single contracted row no longer arrives as a bare Hashtable (got $($bare.GetType().FullName)); this test no longer proves what it claims" }
+    if ($bare.Count -eq 1) { throw 'the bare single row now reports Count 1, so the wrong-cardinality case cannot be distinguished any more' }
+
+    $root = New-K8TempDir -Prefix 'k8c6card'
+    $previous = $env:K8_SHAKEDOWN_ROOT
+    $env:K8_SHAKEDOWN_ROOT = $root
+    try {
+        $evidence = Join-Path $root 'evidence'
+        New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+        $log = Join-Path $root 'logs\shakedown.log'
+
+        foreach ($stage in @($oneStage, $manyStage)) {
+            $expected = $byStage[$stage]
+            foreach ($rel in @(Get-K8ContractArtifacts -Range a -Stage $stage | ForEach-Object { $_.artifact })) {
+                $full = Join-Path $evidence $rel
+                New-Item -ItemType Directory -Force -Path (Split-Path $full -Parent) | Out-Null
+                'x' | Set-Content -LiteralPath $full -Encoding utf8NoBOM
+            }
+            Assert-K8StageArtifacts -Range a -Stage $stage -RunEvidence $evidence
+            # The retained log line must state the number of ARTIFACTS, which
+            # for a single row is 1 -- the defect reported 4, the row's keys.
+            $line = @(Get-Content -LiteralPath $log | Where-Object { $_ -match "stage '$([regex]::Escape($stage))' completeness:" })[-1]
+            if ($line -notmatch "completeness: $expected contracted artifact\(s\) present") {
+                throw "stage '$stage' owns $expected contracted artifact(s) but the gate logged: $line"
+            }
+        }
+
+        # And the same single-row stage still fails closed when its one artifact
+        # is gone -- the fix must not have turned the gate into a no-op.
+        $only = @(Get-K8ContractArtifacts -Range a -Stage $oneStage | ForEach-Object { $_.artifact })[0]
+        Remove-Item -LiteralPath (Join-Path $evidence $only) -Force
+        $stopped = $false; $message = ''
+        try { Assert-K8StageArtifacts -Range a -Stage $oneStage -RunEvidence $evidence } catch { $stopped = $true; $message = $_.Exception.Message }
+        if (-not $stopped) { throw "the gate passed stage '$oneStage' while its only contracted artifact was missing" }
+        if ($message -notmatch [regex]::Escape($only)) { throw "the single-row failure does not name the missing artifact: $message" }
+        if ($message -notmatch "stage '$([regex]::Escape($oneStage))'") { throw "the single-row failure does not name the stage that owed it: $message" }
+    }
+    finally {
+        if ($null -eq $previous) { Remove-Item Env:\K8_SHAKEDOWN_ROOT -ErrorAction SilentlyContinue }
+        else { $env:K8_SHAKEDOWN_ROOT = $previous }
+        Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Assert-K8Test 'C-6: leaving a stage the contract does not list is not an error -- most stages own nothing' {
+    Import-Module $CommonPath -Force
+    # Derived, not restated: the stages the Range A/B runner actually sets,
+    # minus the stages the contract names. An empty difference would make this
+    # test vacuous, so it is the first thing asserted.
+    $abBody = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Invoke-K8ShakedownRangeABBody'
+    $runnerStages = @([regex]::Matches($abBody, "Set-K8ShakedownRunStage -Stage '([^']+)'") | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+    $contractStages = @(Get-K8ContractArtifacts -Range a | ForEach-Object { $_.stage } | Sort-Object -Unique)
+    $unlisted = @($runnerStages | Where-Object { $contractStages -notcontains $_ })
+    if ($runnerStages.Count -eq 0) { throw 'no stage transitions were found in the Range A/B body; the extraction is broken, not the runner' }
+    if ($unlisted.Count -eq 0) { throw 'every stage the runner sets is named by the contract, so the empty-selection case is untested' }
+
+    $root = New-K8TempDir -Prefix 'k8c6empty'
+    $previous = $env:K8_SHAKEDOWN_ROOT
+    $env:K8_SHAKEDOWN_ROOT = $root
+    try {
+        # Deliberately an EMPTY evidence tree: a stage that owes nothing must
+        # pass on one, and must not consult it at all.
+        $evidence = Join-Path $root 'evidence'
+        New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+        foreach ($stage in $unlisted) {
+            try { Assert-K8StageArtifacts -Range a -Stage $stage -RunEvidence $evidence }
+            catch { throw "leaving stage '$stage', which the contract does not list, raised: $($_.Exception.Message)" }
+        }
+    }
+    finally {
+        if ($null -eq $previous) { Remove-Item Env:\K8_SHAKEDOWN_ROOT -ErrorAction SilentlyContinue }
+        else { $env:K8_SHAKEDOWN_ROOT = $previous }
+        Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Assert-K8Test 'C-6: a run advances THROUGH a stage that owes nothing -- the transition Range A actually failed at' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $evidence = Join-Path $sb.Root 'runs\synthetic'
+        New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+
+        Set-K8ShakedownRunStage -Stage 'evidence-tree'
+        Set-K8ShakedownRunEvidence -Path $evidence | Out-Null
+        foreach ($rel in @(Get-K8ContractArtifacts -Range a -Stage 'evidence-tree' | ForEach-Object { $_.artifact })) {
+            'x' | Set-Content -LiteralPath (Join-Path $evidence $rel) -Encoding utf8NoBOM
+        }
+
+        # evidence-tree -> compose-generate was the last transition that worked:
+        # evidence-tree owns rows, so the caller received an array.
+        Set-K8ShakedownRunStage -Stage 'compose-generate'
+
+        # compose-generate -> preflight is the one that stopped the run. The
+        # gate has nothing to check here, and having nothing to check is not a
+        # failure. Asserted first that it really has nothing, so a contract
+        # edit cannot quietly turn this into a different test.
+        if (@(Get-K8ContractArtifacts -Range a -Stage 'compose-generate').Count -ne 0) {
+            throw 'compose-generate now owns contracted artifacts; this test no longer covers the empty-selection transition'
+        }
+        try { Set-K8ShakedownRunStage -Stage 'preflight' }
+        catch { throw "advancing out of a stage that owes no artifact raised: $($_.Exception.Message)" }
+    }
+}
+
 # --- C-7 -------------------------------------------------------------------
 
 Assert-K8Test 'C-7: references are TYPED; run-local paths must exist, and nothing scans prose for paths' {
