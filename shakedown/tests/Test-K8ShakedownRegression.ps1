@@ -6310,7 +6310,27 @@ Assert-K8Test 'C-9: a pin that is not an ancestor of HEAD is refused, not silent
     try {
         # The well-known empty tree, so no object has to be written first.
         $emptyTree = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
-        $orphan = (git commit-tree $emptyTree -m 'k8 c9 non-ancestor probe' 2>&1 | Out-String).Trim()
+
+        # The probe needs an author, and a test must not need the person
+        # running it to have one. Scoped to this ONE invocation with -c:
+        # nothing is written to the repository's config and nothing is read
+        # from the user's, so the check answers the same on a workstation and
+        # on a freshly provisioned VM. Measured: with only user.name set,
+        # commit-tree still fails ('Author identity unknown') because it
+        # cannot derive an address; with only user.email it succeeds by
+        # deriving a name from the system. Both are supplied rather than
+        # relying on that derivation, which is itself environment-dependent.
+        # gpgsign is pinned off so a host that signs by default does not make
+        # a parentless probe require a key.
+        #
+        # Splatted as an array: 'user.name=k8 test' contains a space and has
+        # to reach git as one argument.
+        $probeIdentity = @(
+            '-c', 'user.name=k8 test',
+            '-c', 'user.email=k8@test.local',
+            '-c', 'commit.gpgsign=false'
+        )
+        $orphan = (git @probeIdentity commit-tree $emptyTree -m 'k8 c9 non-ancestor probe' 2>&1 | Out-String).Trim()
         if ($LASTEXITCODE -ne 0 -or $orphan -notmatch '^[0-9a-f]{40}$') { throw "could not create a parentless probe commit: $orphan" }
 
         git merge-base --is-ancestor $orphan HEAD 2>$null | Out-Null
