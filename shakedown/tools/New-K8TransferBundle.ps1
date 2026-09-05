@@ -82,25 +82,41 @@ Write-K8ShakedownLog -Level STEP -Message "=== C-9 transfer bundle assembly: $Bu
 $consistency = Assert-K8BundleRunConsistency -RunIds $RunId
 Write-K8ShakedownLog -Message "run selection accepted: sequence $($consistency.SequenceId) at locked HEAD $($consistency.ToolingHead), ranges a/b/c."
 
-# 2. Copy each run's evidence tree, excluding pcap BODIES. Their hashes travel
-#    in the per-run pcap-hashes.sha256 that the run itself retained; the bodies
-#    never enter Git in this project.
+# 2. Copy each run's evidence tree, then exclude pcap BODIES -- but only after
+#    proving, per body, that its identity is already retained. The bodies never
+#    enter Git in this project; that is a reason to leave them out, not a
+#    licence to drop them without checking what the drop costs.
 New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+$boundCaptures = New-Object System.Collections.Generic.List[object]
 foreach ($row in $consistency.Runs) {
     $src = Join-Path (Get-K8ShakedownRoot) "runs\$($row.run_id)"
     if (-not (Test-Path -LiteralPath $src)) { throw "C-9: evidence tree missing for $($row.run_id) at $src." }
     $dst = Join-Path $Destination $row.run_id
     Copy-Item -LiteralPath $src -Destination $dst -Recurse -Force
+
+    # Checked on the COPY, which is the tree the exclusion actually applies to,
+    # and BEFORE the removal: after it, the body is gone and the question
+    # cannot be asked at all.
+    $bound = @(Assert-K8ExcludedCapturesAreRetained -RunEvidence $dst -Range $row.range -RunId $row.run_id)
+    foreach ($b in $bound) { $boundCaptures.Add([ordered]@{ run_id = $row.run_id; path = $b.path; sha256 = $b.sha256; manifest = $b.manifest }) }
+
     Get-ChildItem -LiteralPath $dst -Recurse -File -Filter '*.pcap' | Remove-Item -Force
-    Write-K8ShakedownLog -Message "copied $($row.run_id) (Range $($row.range)); pcap bodies excluded."
+    Write-K8ShakedownLog -Message "copied $($row.run_id) (Range $($row.range)); $($bound.Count) pcap body/bodies excluded after binding."
 }
 
 $exclusions = @(
     [ordered]@{
         pattern          = '*.pcap'
         reason           = 'pcap-body-never-in-git'
-        retained_instead = '*/pcap-hashes.sha256'
-        note             = 'Capture bodies are never committed in this project. Each run retained its own pcap-hashes.sha256 during the run, and that file is in the manifest.'
+        # The run's OWN retained integrity manifest, which is what actually
+        # covers these bodies. An earlier version named `*/pcap-hashes.sha256`,
+        # a file nothing in this repository has ever written.
+        retained_instead = '*/hashes.sha256'
+        note             = 'Capture bodies are never committed in this project. Every excluded body was checked against its own run''s retained manifest -- exact run-relative path and exact sha256 -- before removal; see bound_captures. Range A/B are covered by hashes.sha256 from the frozen finalize-evidence. Range C retains no capture body.'
+        # What the exclusion COST, itemised. A declaration that says only "pcaps
+        # were left out" leaves the consumer to take on trust that nothing was
+        # lost; this says which body, and where its identity is now.
+        bound_captures   = $boundCaptures.ToArray()
     }
 )
 
@@ -113,6 +129,20 @@ $manifestPath = Join-Path $Destination 'transfer-manifest.json'
 Write-K8AtomicFile -Path $manifestPath -Content (($manifest | ConvertTo-Json -Depth 12) + "`n")
 Write-K8ShakedownLog -Message "transfer-manifest.json written over $(@($manifest.files).Count) file(s)."
 
+# 3b. The manifests that carry the excluded bodies' identities must themselves
+#     have travelled. Checked rather than assumed: they are ordinary files in
+#     the tree and nothing else in this script would notice their absence, and
+#     a bundle whose exclusion points at a file it does not contain is the same
+#     empty promise this fix exists to remove.
+$manifestPaths = @($manifest.files | ForEach-Object { [string]$_.path })
+foreach ($row in $consistency.Runs) {
+    $carrier = "$($row.run_id)/" + (Get-K8RunIntegrityManifestName -Range $row.range)
+    if ($manifestPaths -notcontains $carrier) {
+        throw "C-9: '$carrier' is not among the bundle's data files, so the identities of $($row.run_id)'s excluded bodies did not travel with the bundle."
+    }
+}
+Write-K8ShakedownLog -Message "retained integrity manifests present in the bundle for all $(@($consistency.Runs).Count) run(s)."
+
 # 4. Report what the operator still owes, and do not author any of it.
 $withCr = @($manifest.files | Where-Object { $_.byte_class.contains_cr })
 $closed = Test-K8BundleClosedWorld -BundleRoot $Destination -Manifest $manifest
@@ -124,6 +154,7 @@ Write-Host "  sequence_id    : $($consistency.SequenceId)"
 Write-Host "  locked HEAD    : $($consistency.ToolingHead)"
 Write-Host "  data files     : $(@($manifest.files).Count)"
 Write-Host "  files with CR  : $($withCr.Count)   <- the RT-01 condition, stated as an observation"
+Write-Host "  pcaps excluded : $($boundCaptures.Count)   <- each bound to its run's retained manifest before removal"
 Write-Host "  control present: $(@($closed.PresentControlFiles) -join ', ')"
 Write-Host ''
 Write-Host 'STILL OWED BY THE OPERATOR (this tool does not author them):' -ForegroundColor Yellow

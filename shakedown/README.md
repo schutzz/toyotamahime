@@ -429,11 +429,33 @@ bytes as collected and 97 OK / 326 MISMATCH against the bytes git actually
 commits. It was closed by a person noticing and hand-adding a
 `.gitattributes`; nothing made the next transfer get checked at all.
 
-What the assembler does: copies the selected runs (pcap bodies excluded --
-their hashes travel in each run's own `pcap-hashes.sha256`), checks that the
-selection is one *completed* sequence at one locked HEAD covering a/b/c
-exactly once, and writes `transfer-manifest.json` with each file's SHA-256 and
-its **byte class** (`contains_cr`, `contains_nul`, `trailing_newline`).
+What the assembler does: copies the selected runs, checks that the selection is
+one *completed* sequence at one locked HEAD covering a/b/c exactly once, and
+writes `transfer-manifest.json` with each file's SHA-256 and its **byte class**
+(`contains_cr`, `contains_nul`, `trailing_newline`).
+
+Capture bodies do not travel. Which retained artifact holds their identity is
+worth stating exactly, because an earlier version of this section, of the
+production declaration and of the regression fixture all named a per-run
+`pcap-hashes.sha256` — a file nothing here has ever written. Three places
+agreeing with each other is not the same as any of them being right, and the
+mistake surfaced only when a real bundle was assembled.
+
+What actually holds a capture body's identity:
+
+| range | retained manifest | covers a pcap? |
+| --- | --- | --- |
+| A / B | `hashes.sha256`, written by the frozen `finalize-evidence` over the whole tree | yes — bodies included |
+| C | `shakedown-retention.sha256`, over the artifacts its C-6 contract declares | no — Range C captures nothing |
+
+Before any body is removed, the assembler proves per body that its exact
+run-relative path and its exact SHA-256 are already on a row of *its own run's*
+manifest. A missing manifest, a missing row, a right path with the wrong digest,
+a right digest filed under another path, a malformed row, or one path claimed
+twice all stop the assembly. Keeping a body instead is a human decision, not a
+fallback the tool may take. The itemised result travels in the manifest's
+`exclusions[].bound_captures`, so the consumer is told what the exclusion cost
+rather than asked to assume it cost nothing.
 
 What it deliberately does not do: write a `.gitattributes`, or tell the
 consumer what its retention policy should be. "This file contains CR" is a

@@ -2192,6 +2192,144 @@ function Assert-K8ExclusionDeclaration {
     }
 }
 
+# The integrity manifest each range actually retains. Not one name: Range A/B
+# get hashes.sha256 from the frozen finalize-evidence, and Range C -- which has
+# no frozen producer -- writes shakedown-retention.sha256 instead, deliberately
+# under a different name (see Write-K8RangeCRetentionManifest).
+$script:K8RunIntegrityManifests = @{
+    a = 'hashes.sha256'
+    b = 'hashes.sha256'
+    c = $script:K8RangeCRetentionManifest
+}
+
+function Get-K8RunIntegrityManifestName {
+    <# Which retained manifest carries a given range's file identities. #>
+    param([Parameter(Mandatory)][ValidateSet('a', 'b', 'c')][string] $Range)
+    return [string]$script:K8RunIntegrityManifests[$Range]
+}
+
+function Read-K8IntegrityManifest {
+    <#
+        Parse a retained `<digest>  <run-relative posix path>` manifest into
+        path -> @(digests).
+
+        STRUCTURED, not a substring search. "Does this digest appear somewhere
+        in the file" would accept the right hash against the WRONG path, and
+        "does this path appear" would accept the right path with the wrong
+        hash. Both are the same defect -- one string standing in for a pair --
+        and both have to be refusable, so the pair is kept as a pair.
+
+        The separator is two spaces, matching the frozen finalize-evidence
+        output and k8_scoring_input_contract.parse_manifest. Duplicate paths are
+        RETAINED as a list rather than collapsed: a path claimed twice with
+        different digests is a conflict the caller must refuse, and a dictionary
+        that silently keeps the last one would hide it.
+    #>
+    param([Parameter(Mandatory)][string] $Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "C-9: retained integrity manifest not found at $Path."
+    }
+    $entries = @{}
+    $lineNo = 0
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        $lineNo++
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $split = $line -split '  ', 2
+        if ($split.Count -ne 2) {
+            throw "C-9: unparsable line $lineNo in $Path`: '$line'. Expected '<sha256>  <path>'."
+        }
+        $digest = $split[0].Trim()
+        $rel = $split[1].Trim()
+        if ($digest -notmatch '^[0-9a-f]{64}$') {
+            throw "C-9: line $lineNo in $Path does not begin with a lowercase sha256: '$digest'."
+        }
+        if ([string]::IsNullOrWhiteSpace($rel)) {
+            throw "C-9: line $lineNo in $Path has a digest and no path."
+        }
+        $rel = $rel -replace '\\', '/'
+        if (-not $entries.ContainsKey($rel)) { $entries[$rel] = New-Object System.Collections.Generic.List[string] }
+        $entries[$rel].Add($digest)
+    }
+    return $entries
+}
+
+function Assert-K8ExcludedCapturesAreRetained {
+    <#
+        C-9. Before a capture body is dropped from a bundle, prove that its
+        identity survives the drop.
+
+        THE DEFECT THIS REPLACES. The exclusion declared that pcap hashes
+        "travel in the per-run pcap-hashes.sha256". No such file has ever been
+        written by anything in this repository: Range A/B pcaps are covered by
+        the run's own hashes.sha256, which the frozen finalize-evidence writes
+        over the whole tree, bodies included. Production, the regression fixture
+        and README all named the same fictional file, so nothing disagreed with
+        anything -- and the only regression that runs the manifest builder
+        passes -Exclusions @(), so the substitute check never executed offline.
+        It failed the first time it met a real run.
+
+        Naming the right file is not the fix. "A file matching */hashes.sha256
+        exists somewhere in the bundle" says nothing about THIS pcap: the
+        substitute check is satisfied by any run's manifest, for any content.
+        What has to hold is per-body and per-pair --
+
+            for each excluded *.pcap:
+                its run-relative POSIX path appears in ITS OWN run's retained
+                manifest, and the digest on that row equals the body's actual
+                sha256
+
+        -- so that dropping the body loses nothing that was not already written
+        down. Anything less is refused; keeping a body instead is a human
+        decision, not a fallback this function may take.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RunEvidence,
+        [Parameter(Mandatory)][ValidateSet('a', 'b', 'c')][string] $Range,
+        [Parameter(Mandatory)][string] $RunId
+    )
+    $captures = @(Get-ChildItem -LiteralPath $RunEvidence -Recurse -File -Filter '*.pcap' -Force | Sort-Object FullName)
+    $manifestName = Get-K8RunIntegrityManifestName -Range $Range
+
+    if ($captures.Count -eq 0) {
+        # Not an exception carved out for Range C. Range C simply captures
+        # nothing -- its retention domain is the C-6 contract artifact set,
+        # which contains no pcap -- so there is no body to excuse and nothing
+        # to bind. A Range C run that DID hold a pcap would fall through to the
+        # checks below and be refused there, which is the correct answer: its
+        # manifest could not bind it.
+        Write-K8ShakedownLog -Message "$RunId (Range $Range): no capture bodies to exclude."
+        return @()
+    }
+
+    $manifestPath = Join-Path $RunEvidence $manifestName
+    if (-not (Test-Path -LiteralPath $manifestPath)) {
+        throw "C-9: $RunId holds $($captures.Count) capture body/bodies but has no $manifestName. Dropping a body whose identity was never retained would destroy the only record of it."
+    }
+    $entries = Read-K8IntegrityManifest -Path $manifestPath
+
+    $bound = New-Object System.Collections.Generic.List[object]
+    foreach ($cap in $captures) {
+        $rel = ConvertTo-K8BundleRelativePath -Root $RunEvidence -FullPath $cap.FullName
+        $actual = (Get-FileHash -LiteralPath $cap.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+
+        if (-not $entries.ContainsKey($rel)) {
+            throw "C-9: $RunId`: '$rel' is not listed in $manifestName. Its sha256 is $actual; excluding a body the manifest never covered would make the exclusion a loss."
+        }
+        $rows = @($entries[$rel])
+        if ($rows.Count -ne 1) {
+            $distinct = @($rows | Sort-Object -Unique)
+            throw "C-9: $RunId`: '$rel' appears $($rows.Count) times in $manifestName with $($distinct.Count) distinct digest(s) ($($distinct -join ', ')). Which row is the identity must be decidable."
+        }
+        if ($rows[0] -ne $actual) {
+            throw "C-9: $RunId`: '$rel' is listed in $manifestName as $($rows[0]) but the body on disk is $actual. The retained identity does not describe this file."
+        }
+        $bound.Add([ordered]@{ path = $rel; sha256 = $actual; manifest = $manifestName })
+    }
+
+    Write-K8ShakedownLog -Message "$RunId (Range $Range): $($bound.Count) capture body/bodies bound to $manifestName by exact path and digest."
+    return $bound.ToArray()
+}
+
 function Assert-K8BundleRunConsistency {
     <#
         Writing each run's sequence_id and tooling_head into the manifest

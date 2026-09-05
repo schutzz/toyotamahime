@@ -5953,7 +5953,11 @@ Assert-K8Test 'C-9: bundle paths are POSIX, and the closed-world equation is pha
 
 Assert-K8Test 'C-9: exclusions are constrained, and never excuse a file that is actually present' {
     Import-Module $CommonPath -Force
-    $ok = @([ordered]@{ pattern = '*.pcap'; reason = 'pcap-body-never-in-git'; retained_instead = '*/pcap-hashes.sha256' })
+    # The substitute names a manifest the runs actually retain. This fixture
+    # previously named `*/pcap-hashes.sha256`, matching production and README,
+    # and the three agreeing with each other was the whole reason a file that
+    # has never existed went unnoticed until a real assembly.
+    $ok = @([ordered]@{ pattern = '*.pcap'; reason = 'pcap-body-never-in-git'; retained_instead = '*/hashes.sha256' })
     Assert-K8ExclusionDeclaration -Exclusions $ok
 
     $bad = @{
@@ -5966,6 +5970,255 @@ Assert-K8Test 'C-9: exclusions are constrained, and never excuse a file that is 
     }
     foreach ($case in $bad.Keys) {
         Assert-K8FailsClosed -What "declaring $case" -Because 'exclusion' -Attempt { Assert-K8ExclusionDeclaration -Exclusions $bad[$case] }
+    }
+}
+
+# --- C-9: excluded capture bodies are bound before they are dropped ---------
+#
+# The defect these cover: the exclusion declared that pcap identities travel in
+# a per-run `pcap-hashes.sha256`, a file nothing in this repository has ever
+# written. Production, the fixture above and README all named it, so nothing
+# contradicted anything -- and the only regression that ran the manifest builder
+# passed -Exclusions @(), so the substitute check never executed offline. It
+# failed the first time it met a real run, after the copy phase had already
+# succeeded.
+#
+# The fixture below derives BOTH the manifest name and every digest from
+# production helpers and from the bytes on disk. Hard-coding either would let
+# the fixture agree with a wrong implementation for the same reason the old one
+# did.
+
+function New-K8CaptureBindingFixture {
+    <#
+        A run tree with a real capture body and the retained manifest that
+        covers it. -Range picks which manifest name the production helper says
+        applies, so the fixture cannot disagree with the code under test about
+        where identities live.
+    #>
+    param(
+        [ValidateSet('a', 'b', 'c')][string] $Range = 'a',
+        [switch] $NoManifest,
+        [switch] $NoPcap
+    )
+    $root = New-K8TempDir -Prefix 'k8pcap'
+    $runId = "k8shakedown-range$Range-20260905-000000"
+    $evidence = Join-Path $root $runId
+    New-Item -ItemType Directory -Force -Path (Join-Path $evidence 'sensor-input\mirror-capture') | Out-Null
+
+    # A plain retained artifact, so the manifest is never a one-line file whose
+    # only row is the one under test.
+    [System.IO.File]::WriteAllText((Join-Path $evidence 'metadata.md'), "# run`n", (New-Object System.Text.UTF8Encoding($false)))
+
+    $rows = New-Object System.Collections.Generic.List[string]
+    $rows.Add(((Get-FileHash -LiteralPath (Join-Path $evidence 'metadata.md') -Algorithm SHA256).Hash.ToLowerInvariant() + '  metadata.md'))
+
+    $pcapRel = 'sensor-input/mirror-capture/c2-mirror-sensor.pcap'
+    if (-not $NoPcap) {
+        $pcapFull = Join-Path $evidence ($pcapRel -replace '/', '\')
+        [System.IO.File]::WriteAllBytes($pcapFull, [byte[]](0xd4, 0xc3, 0xb2, 0xa1, 1, 2, 3, 4))
+        $rows.Add(((Get-FileHash -LiteralPath $pcapFull -Algorithm SHA256).Hash.ToLowerInvariant() + "  $pcapRel"))
+    }
+
+    $manifestName = Get-K8RunIntegrityManifestName -Range $Range
+    $manifestPath = Join-Path $evidence $manifestName
+    if (-not $NoManifest) {
+        [System.IO.File]::WriteAllText($manifestPath, (($rows -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+    }
+    return [pscustomobject]@{
+        Root = $root; RunId = $runId; Evidence = $evidence; Range = $Range
+        ManifestName = $manifestName; ManifestPath = $manifestPath; PcapRel = $pcapRel
+    }
+}
+
+Assert-K8Test 'C-9: a capture body is excluded only when its exact path AND digest are already retained' {
+    Import-Module $CommonPath -Force
+    $f = New-K8CaptureBindingFixture -Range a
+    try {
+        # The fixture must be discriminating before it is used as evidence: the
+        # row has to be the body's ACTUAL digest, not a plausible-looking one.
+        $actual = (Get-FileHash -LiteralPath (Join-Path $f.Evidence ($f.PcapRel -replace '/', '\')) -Algorithm SHA256).Hash.ToLowerInvariant()
+        $entries = Read-K8IntegrityManifest -Path $f.ManifestPath
+        if (@($entries[$f.PcapRel])[0] -ne $actual) { throw 'the fixture manifest does not carry the body''s real digest; the PASS below would prove nothing' }
+
+        $bound = @(Assert-K8ExcludedCapturesAreRetained -RunEvidence $f.Evidence -Range $f.Range -RunId $f.RunId)
+        if ($bound.Count -ne 1) { throw "expected one bound capture, got $($bound.Count)" }
+        if ($bound[0].path -ne $f.PcapRel) { throw "bound the wrong path: $($bound[0].path)" }
+        if ($bound[0].sha256 -ne $actual) { throw 'the returned digest is not the body''s digest' }
+        if ($bound[0].manifest -ne $f.ManifestName) { throw "named the wrong manifest: $($bound[0].manifest)" }
+    }
+    finally { Remove-Item $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'C-9: a capture body with no retained manifest at all is refused' {
+    Import-Module $CommonPath -Force
+    $f = New-K8CaptureBindingFixture -Range a -NoManifest
+    try {
+        Assert-K8FailsClosed -What 'excluding a body from a run with no retained manifest' -Because 'has no' -Attempt {
+            Assert-K8ExcludedCapturesAreRetained -RunEvidence $f.Evidence -Range $f.Range -RunId $f.RunId
+        }
+    }
+    finally { Remove-Item $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'C-9: a capture body absent from the retained manifest is refused' {
+    Import-Module $CommonPath -Force
+    $f = New-K8CaptureBindingFixture -Range a
+    try {
+        # Manifest present and well-formed -- it simply does not cover the body.
+        $kept = @(Get-Content -LiteralPath $f.ManifestPath | Where-Object { $_ -notmatch '\.pcap' })
+        [System.IO.File]::WriteAllText($f.ManifestPath, (($kept -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+        Assert-K8FailsClosed -What 'excluding a body the manifest does not list' -Because 'is not listed in' -Attempt {
+            Assert-K8ExcludedCapturesAreRetained -RunEvidence $f.Evidence -Range $f.Range -RunId $f.RunId
+        }
+    }
+    finally { Remove-Item $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'C-9: right path with the wrong digest is refused' {
+    Import-Module $CommonPath -Force
+    $f = New-K8CaptureBindingFixture -Range a
+    try {
+        $rows = @(Get-Content -LiteralPath $f.ManifestPath) | ForEach-Object {
+            if ($_ -match '\.pcap$') { ('0' * 64) + '  ' + $f.PcapRel } else { $_ }
+        }
+        [System.IO.File]::WriteAllText($f.ManifestPath, (($rows -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+        Assert-K8FailsClosed -What 'excluding a body whose retained digest differs' -Because 'is listed in' -Attempt {
+            Assert-K8ExcludedCapturesAreRetained -RunEvidence $f.Evidence -Range $f.Range -RunId $f.RunId
+        }
+    }
+    finally { Remove-Item $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'C-9: right digest under the wrong path is refused' {
+    Import-Module $CommonPath -Force
+    $f = New-K8CaptureBindingFixture -Range a
+    try {
+        # The digest is correct and present in the file. Only the path it is
+        # bound to is wrong -- which a substring search for the hash would have
+        # accepted, and which is why the pair is checked as a pair.
+        $rows = @(Get-Content -LiteralPath $f.ManifestPath) | ForEach-Object {
+            if ($_ -match '\.pcap$') { ($_ -split '  ', 2)[0] + '  ground-truth/independent-capture/somewhere-else.pcap' } else { $_ }
+        }
+        [System.IO.File]::WriteAllText($f.ManifestPath, (($rows -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+        Assert-K8FailsClosed -What 'excluding a body whose digest is filed under another path' -Because 'is not listed in' -Attempt {
+            Assert-K8ExcludedCapturesAreRetained -RunEvidence $f.Evidence -Range $f.Range -RunId $f.RunId
+        }
+    }
+    finally { Remove-Item $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'C-9: a malformed retained-manifest row is refused rather than skipped' {
+    Import-Module $CommonPath -Force
+    foreach ($bad in 'not-a-digest  sensor-input/mirror-capture/c2-mirror-sensor.pcap',
+                     ('a' * 64),
+                     ('A' * 64) + '  sensor-input/mirror-capture/c2-mirror-sensor.pcap') {
+        $f = New-K8CaptureBindingFixture -Range a
+        try {
+            [System.IO.File]::WriteAllText($f.ManifestPath, "$bad`n", (New-Object System.Text.UTF8Encoding($false)))
+            Assert-K8FailsClosed -What "reading a manifest whose row is '$bad'" -Because 'C-9' -Attempt {
+                Assert-K8ExcludedCapturesAreRetained -RunEvidence $f.Evidence -Range $f.Range -RunId $f.RunId
+            }
+        }
+        finally { Remove-Item $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Assert-K8Test 'C-9: one path claimed twice with different digests is refused, not resolved' {
+    Import-Module $CommonPath -Force
+    $f = New-K8CaptureBindingFixture -Range a
+    try {
+        $rows = @(Get-Content -LiteralPath $f.ManifestPath)
+        $rows += (('0' * 64) + '  ' + $f.PcapRel)
+        [System.IO.File]::WriteAllText($f.ManifestPath, (($rows -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+        Assert-K8FailsClosed -What 'excluding a body its manifest describes two ways' -Because 'must be decidable' -Attempt {
+            Assert-K8ExcludedCapturesAreRetained -RunEvidence $f.Evidence -Range $f.Range -RunId $f.RunId
+        }
+    }
+    finally { Remove-Item $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'C-9: a substitute that exists but binds a DIFFERENT run does not excuse this body' {
+    Import-Module $CommonPath -Force
+    # This is what "*/hashes.sha256 matches something in the bundle" is worth on
+    # its own. Run 2 has a perfectly good manifest covering its own body; run 1
+    # has none. A bundle-wide pattern match is satisfied; the binding is not.
+    $good = New-K8CaptureBindingFixture -Range a
+    $bad  = New-K8CaptureBindingFixture -Range b -NoManifest
+    try {
+        $ok = @(Assert-K8ExcludedCapturesAreRetained -RunEvidence $good.Evidence -Range $good.Range -RunId $good.RunId)
+        if ($ok.Count -ne 1) { throw 'the run with its own manifest was not bound' }
+        Assert-K8FailsClosed -What 'excusing run 2''s body with run 1''s manifest' -Because 'has no' -Attempt {
+            Assert-K8ExcludedCapturesAreRetained -RunEvidence $bad.Evidence -Range $bad.Range -RunId $bad.RunId
+        }
+    }
+    finally {
+        Remove-Item $good.Root -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item $bad.Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Assert-K8Test 'C-9: Range C retains no capture body, and is not given a blanket exception either' {
+    Import-Module $CommonPath -Force
+    # Nothing to bind: the assertion returns empty rather than inventing a
+    # special case for the range.
+    $none = New-K8CaptureBindingFixture -Range c -NoPcap
+    try {
+        $bound = @(Assert-K8ExcludedCapturesAreRetained -RunEvidence $none.Evidence -Range $none.Range -RunId $none.RunId)
+        if ($bound.Count -ne 0) { throw "a run with no capture body reported $($bound.Count) bound captures" }
+    }
+    finally { Remove-Item $none.Root -Recurse -Force -ErrorAction SilentlyContinue }
+
+    # And if one WERE present, Range C's manifest domain is the C-6 contract
+    # artifacts, which contains no pcap -- so it is refused, not waved through.
+    $withPcap = New-K8CaptureBindingFixture -Range c
+    try {
+        $rows = @(Get-Content -LiteralPath $withPcap.ManifestPath | Where-Object { $_ -notmatch '\.pcap' })
+        [System.IO.File]::WriteAllText($withPcap.ManifestPath, (($rows -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+        Assert-K8FailsClosed -What 'excluding a Range C body its retention manifest cannot cover' -Because 'is not listed in' -Attempt {
+            Assert-K8ExcludedCapturesAreRetained -RunEvidence $withPcap.Evidence -Range $withPcap.Range -RunId $withPcap.RunId
+        }
+    }
+    finally { Remove-Item $withPcap.Root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'C-9: no production string names the fictional pcap-hashes.sha256, and both declarations name a real manifest' {
+    Import-Module $CommonPath -Force
+    $real = @('a', 'b', 'c' | ForEach-Object { Get-K8RunIntegrityManifestName -Range $_ } | Sort-Object -Unique)
+
+    # STRING LITERALS, not lines. The name may be WRITTEN ABOUT -- the comments
+    # and README explaining this defect have to keep saying it -- but it must
+    # never again be a value any code path looks for. Comments are not string
+    # literals in the AST, so the distinction is structural rather than a list
+    # of exempted lines that would need maintaining.
+    foreach ($file in (Get-ChildItem -LiteralPath (Split-Path $CommonPath -Parent) -Recurse -File -Include '*.ps1', '*.psm1' -Force)) {
+        $errors = $null; $tokens = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
+        $literals = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+                                              $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true)
+        foreach ($lit in $literals) {
+            if ($lit.Extent.Text -like '*pcap-hashes*') {
+                throw "$($file.Name):$($lit.Extent.StartLineNumber) has 'pcap-hashes' in a string literal, not just in prose: $($lit.Extent.Text)"
+            }
+        }
+    }
+
+    # Both places that DECLARE a substitute must name a manifest some range
+    # really retains. Production and the fixture are checked the same way and
+    # from the same source of truth, because the two agreeing with each other
+    # is exactly what hid this.
+    $declarations = @{
+        'New-K8TransferBundle.ps1' = (Get-Content -LiteralPath (Join-Path (Split-Path $CommonPath -Parent) 'New-K8TransferBundle.ps1') -Raw)
+        'the regression fixture'   = (Get-Content -LiteralPath $PSCommandPath -Raw)
+    }
+    foreach ($where in $declarations.Keys) {
+        $found = @([regex]::Matches($declarations[$where], "retained_instead\s*=\s*'\*/(?<name>[^']+)'") |
+            ForEach-Object { $_.Groups['name'].Value } | Sort-Object -Unique)
+        if ($found.Count -eq 0) { throw "$where no longer declares a retained_instead pattern" }
+        foreach ($name in $found) {
+            if ($real -notcontains $name) {
+                throw "$where declares the substitute '$name', which is not a manifest any range retains ($($real -join ', '))"
+            }
+        }
     }
 }
 
