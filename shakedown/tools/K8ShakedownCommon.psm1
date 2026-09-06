@@ -2398,6 +2398,50 @@ function Assert-K8BundleRunConsistency {
     return [pscustomobject]@{ Runs = $rows; SequenceId = $sequences[0]; ToolingHead = $heads[0]; Sequence = $seq }
 }
 
+function Assert-K8BundleBuilderIdentity {
+    <#
+        C-2b, applied to the code doing the assembling.
+
+        THE GAP THIS CLOSES. Assert-K8BundleRunConsistency checks the runs
+        against each other and against the sequence record: one sequence, one
+        tooling_head, that head equal to locked_head, a/b/c once each. Every one
+        of those is a statement about the RUNS. None of them is a statement
+        about the checkout that is executing the assembler right now, so a
+        bundle could be built from a sequence locked at one commit by tooling
+        sitting at another -- and was: after the pcap-retention fix, the
+        Model A sequence at ab4df34 could still be assembled by a checkout at
+        52b070f, with nothing to stop it but somebody remembering not to.
+
+        That is the same shape as U-8, one level up. C-2b made "one HEAD for the
+        whole sequence" machine-enforced for runs while bundle assembly, which
+        is where the sequence's claim actually gets published, was left on
+        discipline.
+
+        The observation is re-taken here rather than read from any record:
+        git is asked now, through the same helper the sequence gates use, so a
+        checkout between the last run and this assembly is visible. A dirty tree
+        is refused for the reason New-K8QualificationSequence refuses one -- the
+        running code is then not the commit it names.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $RepoRoot,
+        [Parameter(Mandatory)][string] $LockedHead
+    )
+    # Throws on an unresolvable HEAD or a failed git invocation, and never
+    # returns a partial answer: a builder whose identity cannot be observed is
+    # not a builder that may publish a sequence's claim.
+    $identity = Get-K8ToolingIdentity -RepoRoot $RepoRoot
+
+    if (-not $identity.TreeClean) {
+        throw "C-9: the builder worktree at $($identity.RepoRoot) is not clean, so the code assembling this bundle is not the commit it reports.`n$($identity.DirtyPaths -join "`n")"
+    }
+    if ($identity.Head -ne $LockedHead) {
+        throw "C-9: this checkout is at $($identity.Head) but the selected sequence is locked to $LockedHead. A bundle is that sequence's claim, and assembling it with different tooling would publish a claim no run in it was produced under. Assemble from the locked commit, or open a new sequence at this one -- which of those is correct is a Plan decision, not something this tool may choose."
+    }
+    Write-K8ShakedownLog -Message "builder identity verified: HEAD $($identity.Head) == sequence locked_head, worktree clean."
+    return $identity
+}
+
 function Assert-K8SourceIdentityFieldTypes {
     <#
         Fixes the JSON TYPE of each re-verified source-identity field, not just

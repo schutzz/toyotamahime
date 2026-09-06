@@ -434,6 +434,35 @@ one *completed* sequence at one locked HEAD covering a/b/c exactly once, and
 writes `transfer-manifest.json` with each file's SHA-256 and its **byte class**
 (`contains_cr`, `contains_nul`, `trailing_newline`).
 
+#### The checkout doing the assembling is checked too
+
+Those selection checks are all statements about the *runs*. None of them says
+anything about the working copy executing the assembler, so a sequence locked at
+one commit could be bundled by tooling sitting at another — which is U-8 one
+level up, and was reachable in practice: after the pcap-retention fix, the
+Model A sequence locked at `ab4df34` could still have been assembled by a
+checkout at `52b070f`, with nothing but memory preventing it.
+
+So before the destination directory is created:
+
+    this checkout's HEAD == the sequence's locked_head
+    this checkout's worktree is clean
+
+git is asked *now*, through the same `Get-K8ToolingIdentity` the sequence gates
+use — not read back from a record, because a checkout between the last run and
+the assembly is exactly what a record cannot show. An unresolvable HEAD, a
+directory that is not a clone, a dirty tree and a mismatch all stop the run.
+
+The gate runs **before** anything is written. A check placed after the copy
+would leave a partial bundle behind on every refusal, and a half-built directory
+that must not be reused is a worse outcome than a refusal.
+
+A consequence worth stating plainly: once the tooling moves on, an older
+sequence can no longer be bundled by it. Reaching that message means a choice
+has to be made — check the locked commit back out, or open a new sequence at the
+current one — and that choice is a Plan decision. The tool does not pick one,
+and there is no flag that waives the check.
+
 Capture bodies do not travel. Which retained artifact holds their identity is
 worth stating exactly, because an earlier version of this section, of the
 production declaration and of the regression fixture all named a per-run

@@ -82,6 +82,24 @@ Write-K8ShakedownLog -Level STEP -Message "=== C-9 transfer bundle assembly: $Bu
 $consistency = Assert-K8BundleRunConsistency -RunIds $RunId
 Write-K8ShakedownLog -Message "run selection accepted: sequence $($consistency.SequenceId) at locked HEAD $($consistency.ToolingHead), ranges a/b/c."
 
+# 1b. And the CODE doing the assembling has to be that same commit.
+#
+# Step 1 checks the runs against the sequence. It says nothing about this
+# checkout, so a sequence locked at one commit could be assembled by tooling at
+# another. Anchored on the sequence's own locked_head rather than on the runs'
+# tooling_head: step 1 has already proved those equal, and the lock is the thing
+# a bundle publishes a claim about.
+#
+# BEFORE the destination is created, deliberately. A gate that ran after the
+# copy would leave a partial bundle behind every time it fired, and a half-built
+# directory that must not be reused is a worse outcome than a refusal.
+$RepoRoot = Split-Path -Parent $PSScriptRoot           # .../toyotamahime/shakedown
+$RepoRoot = Split-Path -Parent $RepoRoot               # .../toyotamahime
+if (-not (Test-Path (Join-Path $RepoRoot 'Study01\README.md'))) {
+    throw "Study01/README.md not found under $RepoRoot, so this tools/ directory is not sitting in a clone of the tooling repository and its HEAD would describe something else. Run from a clone; do not copy tools/ out on its own."
+}
+$builder = Assert-K8BundleBuilderIdentity -RepoRoot $RepoRoot -LockedHead ([string]$consistency.Sequence['locked_head'])
+
 # 2. Copy each run's evidence tree, then exclude pcap BODIES -- but only after
 #    proving, per body, that its identity is already retained. The bodies never
 #    enter Git in this project; that is a reason to leave them out, not a
@@ -152,6 +170,7 @@ Write-Host "Bundle assembled: $Destination" -ForegroundColor Green
 Write-Host "  bundle_id      : $BundleId"
 Write-Host "  sequence_id    : $($consistency.SequenceId)"
 Write-Host "  locked HEAD    : $($consistency.ToolingHead)"
+Write-Host "  builder HEAD   : $($builder.Head)   <- checked equal to the lock before anything was written"
 Write-Host "  data files     : $(@($manifest.files).Count)"
 Write-Host "  files with CR  : $($withCr.Count)   <- the RT-01 condition, stated as an observation"
 Write-Host "  pcaps excluded : $($boundCaptures.Count)   <- each bound to its run's retained manifest before removal"

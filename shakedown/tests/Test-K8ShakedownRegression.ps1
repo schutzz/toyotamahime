@@ -6222,6 +6222,149 @@ Assert-K8Test 'C-9: no production string names the fictional pcap-hashes.sha256,
     }
 }
 
+# --- C-9: the builder's own HEAD is bound to the sequence lock ---------------
+#
+# Assert-K8BundleRunConsistency compares the runs with each other and with the
+# sequence record. Every one of those is a fact about the RUNS. Nothing was a
+# fact about the checkout executing the assembler, so a sequence locked at one
+# commit could be assembled by tooling at another -- U-8 one level up, with the
+# rule left to whoever remembered it.
+
+Assert-K8Test 'C-9: a clean builder standing at the sequence lock is accepted' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $identity = Assert-K8BundleBuilderIdentity -RepoRoot $sb.Repo -LockedHead $sb.Head
+        if ($identity.Head -ne $sb.Head) { throw "the gate reported HEAD $($identity.Head), not $($sb.Head)" }
+        if (-not $identity.TreeClean) { throw 'a clean sandbox worktree was reported dirty' }
+    }
+}
+
+Assert-K8Test 'C-9: a builder standing anywhere else is refused' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        # A second real commit, so this is one checkout at two different
+        # commits rather than a made-up SHA that could fail for being unknown.
+        'more' | Set-Content -Path (Join-Path $sb.Repo 'seed.txt')
+        git -C $sb.Repo commit -aqm 'second' *> $null
+        $moved = (git -C $sb.Repo rev-parse HEAD).Trim()
+        if ($moved -eq $sb.Head) { throw 'the fixture did not actually move HEAD' }
+
+        Assert-K8FailsClosed -What 'assembling a sequence locked elsewhere' -Because 'this checkout is at' -Attempt {
+            Assert-K8BundleBuilderIdentity -RepoRoot $sb.Repo -LockedHead $sb.Head
+        }
+        # And the same checkout is accepted for its OWN lock, so the refusal is
+        # about the mismatch and not about the fixture being broken.
+        [void](Assert-K8BundleBuilderIdentity -RepoRoot $sb.Repo -LockedHead $moved)
+    }
+}
+
+Assert-K8Test 'C-9: a dirty builder worktree is refused even at the right commit' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        [void](Assert-K8BundleBuilderIdentity -RepoRoot $sb.Repo -LockedHead $sb.Head)   # clean: accepted
+        'uncommitted' | Set-Content -Path (Join-Path $sb.Repo 'scratch.txt')             # untracked counts as dirty
+        Assert-K8FailsClosed -What 'assembling from a dirty checkout' -Because 'is not clean' -Attempt {
+            Assert-K8BundleBuilderIdentity -RepoRoot $sb.Repo -LockedHead $sb.Head
+        }
+    }
+}
+
+Assert-K8Test 'C-9: a builder whose HEAD cannot be resolved is refused, not assumed' {
+    Import-Module $CommonPath -Force
+    $notARepo = New-K8TempDir -Prefix 'k8norepo'
+    try {
+        Assert-K8FailsClosed -What 'assembling from a directory that is not a repository' -Because 'git' -Attempt {
+            Assert-K8BundleBuilderIdentity -RepoRoot $notARepo -LockedHead ('0' * 40)
+        }
+    }
+    finally { Remove-Item $notARepo -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'C-9: the Model A sequence at ab4df34 is refused by tooling that has moved past it' {
+    Import-Module $CommonPath -Force
+    # The concrete case this gate exists for, as a fixture rather than as a
+    # promise: a real sequence lock, a builder that has since gained commits,
+    # and no way through. Assembling it anyway is a Plan decision -- open a new
+    # sequence at the new HEAD, or check the locked commit back out -- and this
+    # asserts the tool does not make that decision by default.
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        $lockedHead = $sb.Head                     # stands for ab4df348...
+        'pcap retention fix' | Set-Content -Path (Join-Path $sb.Repo 'fix.txt')
+        git -C $sb.Repo add -A *> $null
+        git -C $sb.Repo commit -qm 'fix(shakedown): a later commit' *> $null
+        $builderHead = (git -C $sb.Repo rev-parse HEAD).Trim()   # stands for 52b070f...
+
+        $refused = $false
+        try { Assert-K8BundleBuilderIdentity -RepoRoot $sb.Repo -LockedHead $lockedHead }
+        catch {
+            $refused = $true
+            foreach ($needed in $lockedHead, $builderHead) {
+                if ($_.Exception.Message -notmatch $needed) { throw "the refusal does not name $needed, so it does not say which two commits disagreed" }
+            }
+        }
+        if (-not $refused) { throw 'a sequence locked at an earlier commit was assembled by later tooling' }
+    }
+}
+
+Assert-K8Test 'C-9: the builder identity gate runs before the destination is created' {
+    # Ordering is the whole point: a gate that fired after the copy would leave
+    # a partial bundle behind on every refusal, and a half-built directory that
+    # must not be reused is worse than a refusal. Read off the AST rather than
+    # by eye, so the ordering cannot drift back.
+    $script = Join-Path (Split-Path $CommonPath -Parent) 'New-K8TransferBundle.ps1'
+    $errors = $null; $tokens = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors)
+    $commands = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))
+
+    function Get-K8FirstCommandLine {
+        param($Commands, [string] $Name, [string] $MustMention)
+        $hit = @($Commands | Where-Object {
+            $_.GetCommandName() -eq $Name -and ($null -eq $MustMention -or '' -eq $MustMention -or $_.Extent.Text -like "*$MustMention*")
+        } | Sort-Object { $_.Extent.StartLineNumber })
+        if ($hit.Count -eq 0) { throw "New-K8TransferBundle.ps1 no longer calls $Name$(if ($MustMention) { " mentioning $MustMention" })" }
+        return $hit[0].Extent.StartLineNumber
+    }
+
+    $idLine       = Get-K8FirstCommandLine -Commands $commands -Name 'Assert-K8BundleIdUsableAsRef'
+    $selectionLine= Get-K8FirstCommandLine -Commands $commands -Name 'Assert-K8BundleRunConsistency'
+    $builderLine  = Get-K8FirstCommandLine -Commands $commands -Name 'Assert-K8BundleBuilderIdentity'
+    $createLine   = Get-K8FirstCommandLine -Commands $commands -Name 'New-Item' -MustMention 'Destination'
+    $copyLine     = Get-K8FirstCommandLine -Commands $commands -Name 'Copy-Item'
+
+    $order = [ordered]@{
+        'bundle id validation'        = $idLine
+        'run selection'               = $selectionLine
+        'builder identity'            = $builderLine
+        'destination creation'        = $createLine
+        'copy'                        = $copyLine
+    }
+    $previousName = $null; $previousLine = 0
+    foreach ($name in $order.Keys) {
+        if ($order[$name] -le $previousLine) {
+            throw "$name is at line $($order[$name]), not after $previousName at line $previousLine"
+        }
+        $previousName = $name; $previousLine = $order[$name]
+    }
+}
+
+Assert-K8Test 'C-9: the builder gate re-observes git rather than trusting a stored head' {
+    # A gate that compared two recorded values would pass while the checkout
+    # underneath had moved -- which is the failure mode it exists to catch, and
+    # the reason Assert-K8SequenceBinding re-observes too.
+    Import-Module $CommonPath -Force
+    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Assert-K8BundleBuilderIdentity'
+    if ($body -notmatch 'Get-K8ToolingIdentity') {
+        throw 'the builder gate does not call Get-K8ToolingIdentity, so it is not observing the checkout'
+    }
+    if ($body -match 'rev-parse') {
+        throw 'the builder gate calls git directly instead of going through Get-K8ToolingIdentity; that is a second, slightly different observation of the same fact'
+    }
+}
+
 Assert-K8Test 'C-9: the run selection is checked against real control-plane records, not by looking for guard names' {
     Import-Module $CommonPath -Force
     # The previous version of this check read the function body for the strings
