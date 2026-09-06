@@ -160,8 +160,13 @@ try {
     [void](Assert-K8CommandObservation -StepId 'F-35' -ExitCode $exitCode -Argv $validatorArgv `
         -Diagnostic "stdout file: $stdoutPath; stderr file: $stderrPath")
 
-    # C-4. This is the closed-world's only `direct cmd.exe` producer, and the
-    # one whose emptiness matters most: a Range C stdout of 0 bytes is the
+    # C-4. This is the closed-world's only `wrapped-static cmd.exe` producer
+    # -- it was a `direct cmd.exe` site until the exit code stopped being read
+    # from $LASTEXITCODE; the C-8 row and the inventory say wrapped-static, and
+    # this comment has to agree with them because the classification is itself
+    # audited. Same command, same single invocation.
+    #
+    # It is also the producer whose emptiness matters most: a Range C stdout of 0 bytes is the
     # EXPECTED observation (README SS5.3/SS6.1), so an empty stream must be
     # retained as a described file, never silently skipped. `file-backed`
     # semantics: cmd.exe wrote both streams itself, so the descriptors hash
