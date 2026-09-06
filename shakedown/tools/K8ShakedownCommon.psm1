@@ -3324,7 +3324,12 @@ $script:K8CommandContract = @(
        exit_note = 'The negative manifest is retained immediately after this succeeds -- the same bytes the validator then reads.' }
 
     @{ step_id = 'F-35'; class = 'F'; ranges = 'c'
-       source_file = 'Run-K8ShakedownRangeC.ps1'; producer_scope = '<script-toplevel>'; callee = 'cmd.exe'; call_ordinal = 1
+       # callee is QUOTED because the site is now a wrapped-static one: the
+       # validator is started through Invoke-K8FileRedirectedProcess, whose
+       # -FilePath names the tool, rather than by a bare `& cmd.exe`. Same
+       # command, same single invocation; what changed is that the exit code
+       # is read from the process object instead of $LASTEXITCODE.
+       source_file = 'Run-K8ShakedownRangeC.ps1'; producer_scope = '<script-toplevel>'; callee = "'cmd.exe'"; call_ordinal = 1
        governing_sources = @((New-K8GoverningSource -Path 'README.md' -Clause 'SS5.3 / SS6.1 exactly one command'))
        argv_shape = @('cmd.exe','/c','python','platform\cli.py','validate','manifests\power-grid-reference.range-c-negative.yaml')
        stream_expectation = 'file-backed'; accepted_exit_codes = @(0, 1)
@@ -4366,6 +4371,100 @@ function Invoke-K8SeparatedNativeCapture {
     # "not ready yet". Those rows declare 'poll-any' and the loop's deadline
     # is the real gate. Callers that do gate call Assert-K8CommandObservation.
     return [pscustomobject]@{ Stdout = $stdout; Stderr = $(if ($stderr) { $stderr } else { '' }); ExitCode = $exitCode; StepId = $StepId }
+}
+
+function Invoke-K8FileRedirectedProcess {
+    <#
+        One process, started and observed as ONE object.
+
+        WHY THIS EXISTS. Range C ran
+
+            & cmd.exe /c "python ... > out.txt 2> err.txt"
+            $exitCode = $LASTEXITCODE
+
+        and produced a retained observation that contradicted itself: stderr
+        held the validator's 447-byte rejection while exit_code said 0. The
+        same command, re-run three ways against the same manifest -- direct
+        python, the identical cmd.exe form, and through the module's own run
+        boundary -- exits 1 every time and writes byte-identical stderr. The
+        mechanism that produced the 0 has not been reproduced and is NOT
+        claimed here.
+
+        What can be shown without reproducing it is that the SHAPE of the
+        observation allowed the two halves to disagree. `$LASTEXITCODE` is
+        implicit global state, not a property of the invocation: nothing ties
+        the value read on one line to the process started on the line above,
+        and a stale value is indistinguishable from a fresh one. In Range C
+        another native process -- the C-60 `python --version` probe, which
+        exits 0 -- ran roughly 110 ms earlier, so 0 is exactly the value a
+        stale read would have carried.
+
+        So the fix is not "find and patch the mechanism". It is to stop
+        reading the exit code from a global at all: the process object that
+        was started is the same object the exit code is read from, and no
+        other statement can sit between them.
+
+        The streams are still redirected INSIDE cmd.exe to files, and are
+        deliberately NOT redirected here: RedirectStandardOutput/Error would
+        route the bytes through PowerShell and re-encode them, which is
+        exactly what Range C's byte-exact retention forbids. This function
+        therefore observes the exit code and lets cmd.exe own the bytes.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $FilePath,
+        [Parameter(Mandatory)][AllowEmptyString()][string] $Arguments,
+        [Parameter(Mandatory)][string] $WorkingDirectory,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]] $ExpectedStreamPaths
+    )
+    if (-not (Test-Path -LiteralPath $WorkingDirectory)) {
+        throw "C-4: working directory $WorkingDirectory does not exist; refusing to start a process whose relative paths would resolve somewhere else."
+    }
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $FilePath
+    $psi.Arguments = $Arguments
+    # An explicit working directory, not the caller's Push-Location: a .NET
+    # process does not inherit PowerShell's *location*, so the frozen command's
+    # relative paths would otherwise resolve against the shell's process cwd.
+    $psi.WorkingDirectory = (Resolve-Path -LiteralPath $WorkingDirectory).Path
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $false
+    $psi.RedirectStandardError = $false
+    $psi.CreateNoWindow = $true
+
+    $startedUtc = Get-K8UtcNow
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    if ($null -eq $proc) {
+        throw "C-4: $FilePath did not start; there is no process to observe and no exit code to record."
+    }
+    try {
+        $proc.WaitForExit()
+        if (-not $proc.HasExited) {
+            throw "C-4: WaitForExit returned while $FilePath is still running; refusing to read an exit code that does not exist yet."
+        }
+        $exitCode = $proc.ExitCode
+    }
+    finally { $proc.Dispose() }
+    $exitedUtc = Get-K8UtcNow
+
+    # The redirected files must exist. cmd.exe creates both the moment it opens
+    # the redirection, so an absent one means the command line never reached
+    # the redirection -- and an exit code without its streams is half an
+    # observation, which is the condition this function exists to prevent.
+    foreach ($p in $ExpectedStreamPaths) {
+        if (-not (Test-Path -LiteralPath $p)) {
+            throw "C-4: $FilePath exited $exitCode but the redirected stream file $p was never created. The exit code and the streams must come from the same invocation, and here they do not."
+        }
+    }
+
+    return [pscustomobject]@{
+        FilePath         = $FilePath
+        Arguments        = $Arguments
+        WorkingDirectory = $psi.WorkingDirectory
+        ExitCode         = $exitCode
+        StartedUtc       = $startedUtc
+        ExitedUtc        = $exitedUtc
+        StreamPaths      = @($ExpectedStreamPaths)
+    }
 }
 
 function Invoke-K8ContractedNative {

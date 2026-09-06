@@ -133,9 +133,24 @@ try {
     # PowerShell re-encoding happens, and the row's stream_expectation is
     # file-backed to say so. The contract is applied around the call instead.
     [void](Assert-K8CommandContract -StepId 'F-35' -Argv $validatorArgv)
-    $validatorStartedUtc = Get-K8UtcNow
-    & cmd.exe /c "python platform\cli.py validate manifests\power-grid-reference.range-c-negative.yaml > `"$stdoutPath`" 2> `"$stderrPath`""
-    $exitCode = $LASTEXITCODE
+    # ONE authoritative observation. The exit code comes from the process
+    # object that was started, not from $LASTEXITCODE -- an implicit global
+    # that nothing binds to this invocation, and which the C-60 python probe
+    # 110 ms earlier had already set to 0. Run k8shakedown-rangec-20260906-013149
+    # retained stderr = the 447-byte rejection alongside exit_code = 0; the
+    # mechanism was never reproduced, and this removes the shape that let the
+    # two halves disagree rather than guessing at it.
+    #
+    # cmd.exe still owns the redirection so the retained bytes are the
+    # validator's own -- routing them through PowerShell would re-encode them.
+    # The command line is unchanged, and is deliberately not wrapped in outer
+    # quotes: cmd.exe only applies its quote-stripping rules when the argument
+    # after /c begins with one, and only the redirect targets need quoting.
+    $validatorCommandLine = "/c python platform\cli.py validate manifests\power-grid-reference.range-c-negative.yaml > `"$stdoutPath`" 2> `"$stderrPath`""
+    $validatorProcess = Invoke-K8FileRedirectedProcess -FilePath 'cmd.exe' -Arguments $validatorCommandLine `
+        -WorkingDirectory $disposable -ExpectedStreamPaths @($stdoutPath, $stderrPath)
+    $validatorStartedUtc = $validatorProcess.StartedUtc
+    $exitCode = $validatorProcess.ExitCode
     Write-K8ShakedownLog -Message "validate exit code: $exitCode (exit 1 is the EXPECTED outcome per README SS5.3/SS6.1 -- not treated as failure)"
     # F-35 POST-OBSERVATION gate. The acceptance domain is @(0, 1) and BOTH
     # values pass: exit 1 is the frozen expected rejection, and exit 0 is the

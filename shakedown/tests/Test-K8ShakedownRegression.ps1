@@ -4519,7 +4519,9 @@ Assert-K8Test 'C-6: Range C retains the patch at manifest-derivation and the man
     $gitApply        = $source.IndexOf("'apply', '--ignore-space-change', `$derivedPatch")
     $manifestRetain  = $source.IndexOf("Copy-Item -Path `$negativeManifest -Destination")
     $validatorStage  = $source.IndexOf("Set-K8ShakedownRunStage -Stage 'validator-run'")
-    $validatorRun    = $source.IndexOf('& cmd.exe /c')
+    # The validator is started through the single-observation process helper
+    # now, not by `& cmd.exe /c`; the ORDERING this test fixes is unchanged.
+    $validatorRun    = $source.IndexOf('Invoke-K8FileRedirectedProcess')
     foreach ($pair in @(
         @{ N = 'manifest-derivation stage'; V = $derivationStage }, @{ N = 'patch retain'; V = $patchRetain }
         @{ N = 'patch-apply stage'; V = $applyStage }, @{ N = 'git apply'; V = $gitApply }
@@ -5971,6 +5973,124 @@ Assert-K8Test 'C-9: exclusions are constrained, and never excuse a file that is 
     foreach ($case in $bad.Keys) {
         Assert-K8FailsClosed -What "declaring $case" -Because 'exclusion' -Attempt { Assert-K8ExclusionDeclaration -Exclusions $bad[$case] }
     }
+}
+
+# The check above is source inspection. It says the code does not THROW on a
+# non-zero exit; it never said the exit code that reaches the retained
+# observation is the one the process actually returned. Run
+# k8shakedown-rangec-20260906-013149 retained stderr = the validator's 447-byte
+# rejection next to exit_code = 0, and this suite passed. The three below run
+# real processes.
+
+function Invoke-K8SyntheticRedirectedCommand {
+    <# A throwaway command whose exit code, stdout and stderr are all chosen by
+       the caller, run through the PRODUCTION helper and redirected by cmd.exe
+       exactly as Range C's validator is. No Docker, no VM, no Study01. #>
+    param(
+        [Parameter(Mandatory)][int] $Exit,
+        [string] $StdoutText = '',
+        [string] $StderrText = ''
+    )
+    $dir = New-K8TempDir -Prefix 'k8proc'
+    $stdoutPath = Join-Path $dir 'validate.stdout.txt'
+    $stderrPath = Join-Path $dir 'validate.stderr.txt'
+    $inner = @()
+    if ($StdoutText) { $inner += "echo $StdoutText" }
+    if ($StderrText) { $inner += "echo $StderrText 1>&2" }
+    $inner += "exit $Exit"
+    # PARENTHESISED. In cmd, `a & b > f` redirects only b, so an ungrouped
+    # chain leaves the echo writing to the console and both files empty --
+    # measured, and it made the first version of this fixture pass for the
+    # wrong reason. The group binds the redirection to the whole chain.
+    $cmd = "/c ( " + ($inner -join ' & ') + " ) > `"$stdoutPath`" 2> `"$stderrPath`""
+    $proc = Invoke-K8FileRedirectedProcess -FilePath 'cmd.exe' -Arguments $cmd `
+        -WorkingDirectory $dir -ExpectedStreamPaths @($stdoutPath, $stderrPath)
+    return [pscustomobject]@{ Dir = $dir; Stdout = $stdoutPath; Stderr = $stderrPath; Process = $proc }
+}
+
+Assert-K8Test 'Range C exit observation: a process that exits 1 with stderr is retained as exit 1, not as whatever ran before it' {
+    Import-Module $CommonPath -Force
+    # Poison $LASTEXITCODE first, with a real native command that exits 0 --
+    # the shape of the original defect, where a C-60 `python --version` probe
+    # exiting 0 ran about 110 ms before the validator. If the exit code were
+    # still read from that global, this test would record 0.
+    & cmd.exe /c "exit 0"
+    if ($LASTEXITCODE -ne 0) { throw 'the fixture failed to set $LASTEXITCODE to 0, so this test would not be discriminating' }
+
+    $r = Invoke-K8SyntheticRedirectedCommand -Exit 1 -StderrText 'rejected'
+    try {
+        if ($r.Process.ExitCode -ne 1) { throw "the helper reported exit $($r.Process.ExitCode) for a process that exited 1" }
+
+        $observation = New-K8FileBackedCommandObservation -Label 'synthetic' `
+            -Argv @('cmd.exe', '/c', 'synthetic') -ExitCode $r.Process.ExitCode -TimestampUtc $r.Process.StartedUtc `
+            -RunEvidence $r.Dir -StdoutRelativePath 'validate.stdout.txt' -StderrRelativePath 'validate.stderr.txt'
+
+        if ($observation['exit_code'] -ne 1) { throw "the retained observation says exit_code $($observation['exit_code'])" }
+        if ($observation['stdout']['empty'] -ne $true) { throw 'stdout was not recorded as empty' }
+        if ($observation['stderr']['empty'] -ne $false) { throw 'stderr was recorded as empty while the process wrote to it' }
+
+        # bytes/sha256 describe the files on disk, not something reconstructed.
+        foreach ($pair in @(@('stdout', $r.Stdout), @('stderr', $r.Stderr))) {
+            $onDisk = Get-Item -LiteralPath $pair[1]
+            $sha = (Get-FileHash -LiteralPath $pair[1] -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($observation[$pair[0]]['bytes'] -ne $onDisk.Length) { throw "$($pair[0]) bytes $($observation[$pair[0]]['bytes']) != $($onDisk.Length) on disk" }
+            if ($observation[$pair[0]]['sha256'] -ne $sha) { throw "$($pair[0]) sha256 does not match the file on disk" }
+        }
+        if ((Get-Item -LiteralPath $r.Stderr).Length -eq 0) { throw 'the fixture produced no stderr, so "stderr non-empty" proved nothing' }
+    }
+    finally { Remove-Item $r.Dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'Range C exit observation: a process that exits 0 is retained as exit 0 -- both CLI outcomes survive' {
+    Import-Module $CommonPath -Force
+    # F-35 accepts 0 and 1 for a reason: exit 1 is the frozen expected
+    # rejection, exit 0 is the scientific observation that the negative
+    # manifest was NOT rejected. A fix that made exit 0 unreachable would
+    # destroy that distinction, so it is asserted rather than assumed.
+    & cmd.exe /c "exit 1"
+    if ($LASTEXITCODE -ne 1) { throw 'the fixture failed to set $LASTEXITCODE to 1, so this test would not be discriminating' }
+
+    $r = Invoke-K8SyntheticRedirectedCommand -Exit 0 -StdoutText 'accepted'
+    try {
+        if ($r.Process.ExitCode -ne 0) { throw "the helper reported exit $($r.Process.ExitCode) for a process that exited 0" }
+        $observation = New-K8FileBackedCommandObservation -Label 'synthetic' `
+            -Argv @('cmd.exe', '/c', 'synthetic') -ExitCode $r.Process.ExitCode -TimestampUtc $r.Process.StartedUtc `
+            -RunEvidence $r.Dir -StdoutRelativePath 'validate.stdout.txt' -StderrRelativePath 'validate.stderr.txt'
+        if ($observation['exit_code'] -ne 0) { throw "the retained observation says exit_code $($observation['exit_code'])" }
+        if ($observation['stdout']['empty'] -ne $false) { throw 'stdout was recorded as empty while the process wrote to it' }
+
+        # And F-35 still accepts both, so neither outcome is a tooling STOP.
+        foreach ($code in 0, 1) {
+            [void](Assert-K8CommandObservation -StepId 'F-35' -ExitCode $code `
+                -Argv @('cmd.exe', '/c', 'python', 'platform\cli.py', 'validate', 'manifests\power-grid-reference.range-c-negative.yaml'))
+        }
+        Assert-K8FailsClosed -What 'an exit outside F-35''s domain' -Because 'exit-domain' -Attempt {
+            Assert-K8CommandObservation -StepId 'F-35' -ExitCode 2 `
+                -Argv @('cmd.exe', '/c', 'python', 'platform\cli.py', 'validate', 'manifests\power-grid-reference.range-c-negative.yaml')
+        }
+    }
+    finally { Remove-Item $r.Dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'Range C reads its exit code from the process it started, not from $LASTEXITCODE' {
+    Import-Module $CommonPath -Force
+    $src = Get-Content (Join-Path $ToolsDir 'Run-K8ShakedownRangeC.ps1') -Raw
+    if ($src -match '\$exitCode\s*=\s*\$LASTEXITCODE') {
+        throw 'the validator exit code is read from $LASTEXITCODE again -- an implicit global that nothing binds to the invocation'
+    }
+    if ($src -notmatch 'Invoke-K8FileRedirectedProcess') {
+        throw 'Run-K8ShakedownRangeC.ps1 no longer goes through the single-observation process helper'
+    }
+    # Still ONE invocation, and still cmd.exe-owned redirection: routing the
+    # streams through PowerShell would re-encode the bytes Range C retains.
+    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Invoke-K8FileRedirectedProcess'
+    foreach ($required in 'UseShellExecute', 'WaitForExit', '\$proc\.ExitCode') {
+        if ($body -notmatch $required) { throw "the process helper no longer sets/uses $required" }
+    }
+    if ($body -match 'RedirectStandardOutput\s*=\s*\$true' -or $body -match 'RedirectStandardError\s*=\s*\$true') {
+        throw 'the helper redirects a stream through PowerShell; Range C requires the bytes to be written by cmd.exe itself'
+    }
+    if ($body -match 'LASTEXITCODE') { throw 'the process helper falls back on $LASTEXITCODE' }
 }
 
 # --- C-9: excluded capture bodies are bound before they are dropped ---------

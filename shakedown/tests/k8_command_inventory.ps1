@@ -65,7 +65,15 @@ $script:InvWrappers = @(
     # Also process-starting helpers: one gates a required prerequisite while
     # retaining its version value (C-56..C-60), the other retains a runtime
     # tool identity without gating anything (I-07, I-08).
-    'Get-K8RequiredToolVersion', 'Get-K8OptionalToolObservation'
+    'Get-K8RequiredToolVersion', 'Get-K8OptionalToolObservation',
+    # Starts a process and reads ExitCode off the Process object rather than
+    # $LASTEXITCODE. Listed here for the reason stated above: a helper that
+    # starts a process and is unknown to this oracle is INVISIBLE to it, and
+    # this one starts its process through [Diagnostics.Process]::Start, which
+    # is a method call and not a CommandAst -- so the oracle could never have
+    # seen it from inside the body. The call site declares the tool in
+    # -FilePath, which is what this oracle reads.
+    'Invoke-K8FileRedirectedProcess'
 )
 # Helpers layered ON TOP of those. Their BODIES are implementations, not call
 # sites, and are excluded below so a site is not counted twice.
