@@ -177,6 +177,8 @@ $script:K8SequenceSchema           = 'k8shakedown-qualification-sequence/1'
 $script:K8ProvenanceSchema         = 'k8shakedown-run-provenance/1'
 $script:K8TerminationSchema        = 'k8shakedown-termination/1'
 $script:K8CompletionSchema         = 'k8shakedown-completion/1'
+$script:K8RangeCEnvironmentSchema  = 'k8shakedown-range-c-environment/1'
+$script:K8DeviationCandidateSchema = 'k8shakedown-deviation-candidates/1'
 $script:K8SourceIdentitySchema     = 'k8shakedown-source-identity/1'
 # criterion 4: the completion record's `stage` is ONE token in every range.
 # "the terminal stage name" is not one value -- Range A/B end at
@@ -1670,6 +1672,8 @@ $script:K8ArtifactContract = @(
     @{ artifact = 'validate.stdout.txt'; ranges = 'c'; stage = 'validator-run'; required = $true }
     @{ artifact = 'validate.stderr.txt'; ranges = 'c'; stage = 'validator-run'; required = $true }
     @{ artifact = 'validate.observation.json'; ranges = 'c'; stage = 'validator-run'; required = $true }
+    @{ artifact = 'range-c-environment.json'; ranges = 'c'; stage = 'validator-run'; required = $true }
+    @{ artifact = 'deviation-candidates.json'; ranges = 'c'; stage = 'retention'; required = $true }
     @{ artifact = 'metadata.md'; ranges = 'c'; stage = 'retention'; required = $true }
 
     # C-9 (B3B-04). Range C has no frozen finalize-evidence and therefore no
@@ -2023,6 +2027,347 @@ function Write-K8RangeCRetentionManifest {
     Write-K8AtomicFile -Path (Join-Path $RunEvidence $script:K8RangeCRetentionManifest) -Content (($lines -join "`n") + "`n")
     Write-K8ShakedownLog -Message "Range C retention manifest written over $($domain.Count) artifact(s); the manifest itself is not in its own hash domain."
     return $domain
+}
+
+function Get-K8RangeCDependencyVersions {
+    <#
+        Resolved versions of the validator's OWN dependencies, observed with the
+        SAME interpreter that is about to run the validator, from the SAME
+        working directory.
+
+        WHY THIS EXISTS AT ALL, precisely.
+
+        The frozen expected Range C package carries an environment record of
+        its own. It sits inside two of the three trees criterion 11(a)
+        byte-diffs against the immutable base, and Range C validation is
+        compared against that package; its pydantic version is 2.12.5. So the
+        comparison has two sides, and until now the run side did not exist.
+
+        (The frozen path is deliberately not spelled out here. This module
+        never resolves one, and an audit scans the source for exactly that.)
+
+        That is not hypothetical. The accepted Model A execution record section 4
+        documents a permitted Pydantic 2.12.5 -> 2.13.5 move changing the
+        byte-exact stderr by one byte, and records that `2.13.5` could NOT be
+        re-derived from the run's own evidence: the retained stderr URL reaches
+        `errors.pydantic.dev/2.13/`, the minor version, and no further. The
+        patch version rested on an out-of-band observation taken at export time.
+
+        `importlib.metadata.version` deliberately, not `pydantic.VERSION` or
+        `yaml.__version__`: those are the modules' own constants and carry no
+        guarantee of naming the installed distribution. What must be recorded is
+        which distribution the environment actually resolved.
+
+        One process, not one per package, so the closed world grows by a single
+        declared call site. `separated`, because stdout is parsed as data.
+
+        A probe FAILURE does not stop the run. Version values are retained and
+        never gated -- no frozen source pins one, and gating would invent an
+        acceptance condition. The packaging step is what fails closed on an
+        `unavailable` field, so a packaging problem can never destroy a
+        scientific observation.
+    #>
+    param([Parameter(Mandatory)][string] $WorkingDirectory)
+    $script = ConvertTo-K8PythonExecOneLiner -Script @'
+import json
+from importlib import metadata
+out = {}
+for dist in ("pydantic", "pyyaml"):
+    try:
+        out[dist] = {"value": metadata.version(dist), "status": "succeeded"}
+    except Exception as exc:
+        out[dist] = {"value": "%s: %s" % (type(exc).__name__, exc), "status": "unavailable"}
+print(json.dumps(out))
+'@
+    $argv = @('python', '-c', $script)
+    $observedUtc = Get-K8UtcNow
+    $records = @{}
+    Push-Location $WorkingDirectory
+    try {
+        $result = Invoke-K8ContractedNative -StepId 'C-68' -FilePath 'python' -ArgumentList @('-c', $script)
+        $parsed = ([string]$result.Stdout).Trim() | ConvertFrom-Json -AsHashtable
+        foreach ($dist in 'pydantic', 'pyyaml') {
+            $records[$dist] = [ordered]@{
+                name = $dist; value = [string]$parsed[$dist]['value']
+                status = [string]$parsed[$dist]['status']
+                phase = 'range-c-run'; observed_utc = $observedUtc
+                source = 'C-68'; probe_argv = @($argv)
+            }
+        }
+    }
+    catch {
+        # The probe itself did not run. Recorded as unavailable rather than
+        # omitted: an absent field and an observed failure are different facts.
+        foreach ($dist in 'pydantic', 'pyyaml') {
+            $records[$dist] = [ordered]@{
+                name = $dist; value = "probe failed: $($_.Exception.Message)"
+                status = 'unavailable'
+                phase = 'range-c-run'; observed_utc = $observedUtc
+                source = 'C-68'; probe_argv = @($argv)
+            }
+        }
+        Write-K8ShakedownLog -Level WARN -Message "Range C dependency probe did not run ($($_.Exception.Message)); recorded as unavailable. The run continues -- version values are retained, never gated."
+    }
+    finally { Pop-Location }
+    return $records
+}
+
+function Get-K8WorktreeObservation {
+    <#
+        HEAD and cleanliness of a git worktree, RETAINED rather than consumed.
+
+        Both facts were already being observed and thrown away:
+        `Assert-K8PinnedCommit` ran `git rev-parse HEAD` and discarded the value
+        after comparing it to a constant, and the Range C source check used
+        `git status --porcelain` only as an emptiness test. What is added here is
+        retention, not observation.
+
+        The observed HEAD is recorded, never the pinned constant. "The assertion
+        passed" and "the observed value is this" are different facts, and
+        rendering a configured value as an observation is exactly the
+        fabrication this tooling refuses elsewhere.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $WorktreePath,
+        [Parameter(Mandatory)][string] $HeadStepId,
+        [Parameter(Mandatory)][string] $StatusStepId
+    )
+    $observedUtc = Get-K8UtcNow
+    $head = Get-K8ContractedNativeText -StepId $HeadStepId -FilePath 'git' -ArgumentList @('-C', $WorktreePath, 'rev-parse', 'HEAD')
+    $status = Get-K8ContractedNativeText -StepId $StatusStepId -FilePath 'git' -ArgumentList @('-C', $WorktreePath, 'status', '--porcelain')
+    return [ordered]@{
+        path         = $WorktreePath
+        head         = $head
+        clean        = [bool]([string]::IsNullOrWhiteSpace($status))
+        observed_utc = $observedUtc
+    }
+}
+
+function Get-K8RangeCEnvironmentPath {
+    param([Parameter(Mandatory)][string] $RunId)
+    Join-Path (Get-K8RunRecordDir -RunId $RunId) 'range-c-environment.json'
+}
+
+function Write-K8RangeCEnvironmentRecord {
+    <#
+        The typed environment identity of the Range C validator run.
+
+        Authoritative in the CONTROL PLANE, then mirrored into the evidence tree
+        before the hash domain closes -- the pattern `run-provenance.json`
+        already uses, not a new one. The mirror matters because the formal
+        package's `environment/versions.json` is rendered from this record and
+        is hashed into the formal manifest; leaving its source outside the run's
+        own hash domain would mean the packaged bytes alone had no integrity
+        coverage.
+
+        NOT an extension of `tool-versions.<phase>.json`. That record COPIES
+        setup-time host observations into a run and says so via `capture_phase`.
+        These values are observed during the run, against the interpreter and
+        worktree the validator actually used. Merging them would make
+        `capture_phase` untrue for the record as a whole.
+
+        Every version entry carries its own `phase` and `observed_utc`, because
+        `git` is copied from the setup observation while the rest are observed
+        in the validator-run stage. One record, honest about mixed observation
+        points, beats two records that hide the mixture.
+    #>
+    param(
+        [Parameter(Mandatory)] $Run,
+        [Parameter(Mandatory)] $SourceWorktree,
+        [Parameter(Mandatory)] $DisposableWorktree,
+        [Parameter(Mandatory)] $Versions,
+        [Parameter(Mandatory)][string] $RunEvidence
+    )
+    $runId = $Run.RunId
+    $constants = Get-K8ShakedownConstants
+    $record = [ordered]@{
+        schema      = $script:K8RangeCEnvironmentSchema
+        run_id      = $runId
+        sequence_id = $Run.SequenceId
+        range       = 'c'
+        gated       = $false
+        note        = 'Version VALUES are retained and never gated: no frozen source pins a dependency version, so requiring one would invent an acceptance condition. The packaging step fails closed on an unavailable field instead, so a packaging problem cannot destroy an observation.'
+        validator_source = [ordered]@{
+            repo_url      = $constants.AmenonubocoUrl
+            pinned_tag    = $constants.RangeCTag
+            pinned_commit = $constants.RangeCCommit   # the EXPECTED value, not an observation
+        }
+        worktree = [ordered]@{
+            source     = $SourceWorktree
+            disposable = $DisposableWorktree
+        }
+        versions     = @($Versions)
+        observed_utc = (Get-K8UtcNow)
+    }
+    $path = Get-K8RangeCEnvironmentPath -RunId $runId
+    New-Item -ItemType Directory -Force -Path (Get-K8RunRecordDir -RunId $runId) | Out-Null
+    $json = ($record | ConvertTo-Json -Depth 12) + "`n"
+    Write-K8AtomicFile -Path $path -Content $json
+    # Mirror before the hash domain closes -- same point and same reason as the
+    # run-provenance mirror.
+    Set-Content -LiteralPath (Join-Path $RunEvidence 'range-c-environment.json') -Value $json -Encoding utf8NoBOM -NoNewline
+    Write-K8ShakedownLog -Message "Range C environment record retained for $runId (control plane + evidence mirror)."
+    return $record
+}
+
+function Get-K8DeviationCandidatePath {
+    param([Parameter(Mandatory)][string] $RunId)
+    Join-Path (Get-K8RunRecordDir -RunId $RunId) 'deviation-candidates.json'
+}
+
+function New-K8DeviationCandidate {
+    <#
+        One machine-observed candidate. A candidate is a FACT plus the rule that
+        surfaced it -- never a verdict.
+
+        There is deliberately no `is_deviation`, `accepted`, `no_impact`,
+        `none`, `verdict` or `disposition` field, and no empty slot for a human
+        to fill later. An unused field invites being filled; what is wanted is
+        that the capability does not exist. The judgment lives only in
+        `deviations.md`, written by a person.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $CandidateId,
+        [Parameter(Mandatory)][ValidateSet('internal-inconsistency', 'incomplete-observation',
+                                           'multi-valued-acceptance', 'repeated-attempt')][string] $Class,
+        [Parameter(Mandatory)][hashtable] $Source,
+        [Parameter(Mandatory)][string] $ObservedFact,
+        [Parameter(Mandatory)][string] $ReasonSurfaced,
+        [object[]] $RelatedArtifacts = @()
+    )
+    return [ordered]@{
+        candidate_id      = $CandidateId
+        class             = $Class
+        observed_utc      = (Get-K8UtcNow)
+        source            = [ordered]@{ record = [string]$Source['record']; field = [string]$Source['field'] }
+        observed_fact     = $ObservedFact
+        reason_surfaced   = $ReasonSurfaced
+        related_artifacts = @($RelatedArtifacts)
+    }
+}
+
+function Get-K8RangeCDeviationCandidates {
+    <#
+        Surfaces candidates from the run's OWN retained records.
+
+        `expected/` is never read -- not even to check that it exists (C3-R5 /
+        C7-R1). So "differs from the frozen expectation" is not a candidate
+        class here; that comparison is a human one, made in `deviations.md`.
+        What a machine can do without leaving the run is name internal
+        inconsistencies and incomplete observations.
+
+        The classes are closed, and each is grounded in something that has
+        actually happened or can actually happen in this run:
+
+        internal-inconsistency  -- two retained facts that cannot both hold.
+            Real: run k8shakedown-rangec-20260906-013149 retained exit_code 0
+            alongside a 447-byte rejection on stderr.
+
+        incomplete-observation  -- a typed field came back `unavailable`.
+
+        multi-valued-acceptance -- the call site declares more than one
+            accepted exit, so WHICH occurred is decision-relevant. F-35 accepts
+            @(0, 1) on purpose: 1 is the frozen expected rejection and 0 is the
+            observation that the apparatus did NOT reject the negative
+            manifest. Surfacing it says only that the site declares two; it
+            does not say either is wrong. Turning exit 0 into a STOP would
+            convert a finding into an error.
+
+        repeated-attempt        -- the same step ran more than once in this run.
+    #>
+    param(
+        [Parameter(Mandatory)] $Observation,
+        [Parameter(Mandatory)] $Environment,
+        [Parameter(Mandatory)] $AcceptedExitCodes
+    )
+    $candidates = @()
+    # A plain counter, not a scriptblock. C-8 adjudicates every dynamic
+    # invocation by hand, and id numbering is not worth spending one on.
+    $n = 0
+
+    $exit = $Observation.exit_code
+    $stderrBytes = $Observation.stderr.bytes
+    $stdoutBytes = $Observation.stdout.bytes
+
+    if ($exit -eq 0 -and $stderrBytes -gt 0) {
+        $candidates += New-K8DeviationCandidate -CandidateId ('dc-{0:d3}' -f (++$n)) -Class 'internal-inconsistency' `
+            -Source @{ record = 'validate.observation.json'; field = 'observations[0]' } `
+            -ObservedFact "exit_code = 0 was retained alongside $stderrBytes byte(s) on stderr." `
+            -ReasonSurfaced 'Two retained facts of the same observation cannot both hold: a validator that exited 0 reported no rejection, and a non-empty stderr says it did.' `
+            -RelatedArtifacts @(
+                (New-K8ArtifactReference -Kind 'run-local' -Path 'validate.observation.json'),
+                (New-K8ArtifactReference -Kind 'run-local' -Path 'validate.stderr.txt'))
+    }
+
+    if (@($AcceptedExitCodes).Count -gt 1) {
+        $candidates += New-K8DeviationCandidate -CandidateId ('dc-{0:d3}' -f (++$n)) -Class 'multi-valued-acceptance' `
+            -Source @{ record = 'validate.observation.json'; field = 'observations[0].exit_code' } `
+            -ObservedFact "The validator exited $exit; this call site declares accepted exits [$(@($AcceptedExitCodes) -join ', ')]." `
+            -ReasonSurfaced 'The call site declares more than one accepted exit code, so which one occurred is a decision-relevant fact. This states which occurred; it does not judge either.' `
+            -RelatedArtifacts @(
+                (New-K8ArtifactReference -Kind 'run-local' -Path 'validate.observation.json'),
+                (New-K8ArtifactReference -Kind 'run-local' -Path 'validate.stdout.txt'))
+    }
+
+    foreach ($entry in @($Environment['versions'])) {
+        if ([string]$entry['status'] -ne 'succeeded') {
+            $candidates += New-K8DeviationCandidate -CandidateId ('dc-{0:d3}' -f (++$n)) -Class 'incomplete-observation' `
+                -Source @{ record = 'range-c-environment.json'; field = "versions[$([string]$entry['name'])].status" } `
+                -ObservedFact "The resolved version of '$([string]$entry['name'])' was not observed: status '$([string]$entry['status'])', value '$([string]$entry['value'])'." `
+                -ReasonSurfaced 'A typed environment field this run contracted to observe came back unavailable, so the frozen expected/range-c comparison cannot be fully checked on that field.' `
+                -RelatedArtifacts @((New-K8ArtifactReference -Kind 'run-local' -Path 'range-c-environment.json'))
+        }
+    }
+
+    foreach ($which in 'source', 'disposable') {
+        $wt = $Environment['worktree'][$which]
+        if ($null -eq $wt -or [string]::IsNullOrWhiteSpace([string]$wt['head'])) {
+            $candidates += New-K8DeviationCandidate -CandidateId ('dc-{0:d3}' -f (++$n)) -Class 'incomplete-observation' `
+                -Source @{ record = 'range-c-environment.json'; field = "worktree.$which.head" } `
+                -ObservedFact "The $which validator worktree HEAD was not observed." `
+                -ReasonSurfaced 'A typed environment field this run contracted to observe is missing.' `
+                -RelatedArtifacts @((New-K8ArtifactReference -Kind 'run-local' -Path 'range-c-environment.json'))
+        }
+    }
+
+    return @($candidates)
+}
+
+function Write-K8DeviationCandidateRecord {
+    <#
+        Retains the candidate set as a typed artifact, so a reviewer can later
+        see WHAT the machine surfaced and compare it against what the human
+        decided -- rather than the candidates existing only as console output
+        that nobody can reconstruct.
+
+        Control plane authoritative, mirrored into the evidence tree before the
+        hash domain closes, so the candidate set is itself hashed and bound.
+
+        An EMPTY `candidates` array means "the machine surfaced nothing". It
+        does NOT mean "there were no deviations", and nothing here writes
+        "None" -- that declaration is a human judgment and has no machine path.
+    #>
+    param(
+        [Parameter(Mandatory)] $Run,
+        [Parameter(Mandatory)][AllowEmptyCollection()] $Candidates,
+        [Parameter(Mandatory)][string] $RunEvidence
+    )
+    $runId = $Run.RunId
+    $record = [ordered]@{
+        schema       = $script:K8DeviationCandidateSchema
+        run_id       = $runId
+        sequence_id  = $Run.SequenceId
+        range        = 'c'
+        generated_utc = (Get-K8UtcNow)
+        note         = 'Machine-surfaced candidates only. An empty array means the machine surfaced nothing; it does NOT mean there were no deviations. Whether a candidate IS a deviation, what its impact is, and any declaration of "None" are human judgments recorded in deviations.md. This schema has no field for such a judgment.'
+        candidates   = @($Candidates)
+    }
+    $json = ($record | ConvertTo-Json -Depth 12) + "`n"
+    New-Item -ItemType Directory -Force -Path (Get-K8RunRecordDir -RunId $runId) | Out-Null
+    Write-K8AtomicFile -Path (Get-K8DeviationCandidatePath -RunId $runId) -Content $json
+    Set-Content -LiteralPath (Join-Path $RunEvidence 'deviation-candidates.json') -Value $json -Encoding utf8NoBOM -NoNewline
+    Write-K8ShakedownLog -Message "deviation candidate record retained for $runId ($(@($Candidates).Count) candidate(s) surfaced; judgment is NOT recorded here)."
+    return $record
 }
 
 function Write-K8RangeCIdentitySnapshot {
@@ -3937,6 +4282,24 @@ $script:K8CommandContract = @(
     #
     #     Every acceptance domain below is MEASURED, not assumed, because each
     #     non-zero here means something specific that the run must keep apart.
+
+    @{ step_id = 'C-68'; class = 'C'; ranges = 'c'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Get-K8RangeCDependencyVersions'; callee = "'python'"; call_ordinal = 1
+       argv_shape = @('python','-c','<importlib.metadata probe>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Resolved dependency versions of the validator, observed with the SAME interpreter and working directory as F-35. Non-zero means the probe did not run; the value is then retained as unavailable and the RUN continues -- version values are never gated.' }
+
+    @{ step_id = 'C-69'; class = 'C'; ranges = 'c'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Get-K8WorktreeObservation'; callee = "'git'"; call_ordinal = 1
+       argv_shape = @('git','-C','<worktree>','rev-parse','HEAD')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'The OBSERVED head of a Range C worktree, retained rather than compared-and-discarded. Distinct from C-03, which asserts a pin.' }
+
+    @{ step_id = 'C-70'; class = 'C'; ranges = 'c'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Get-K8WorktreeObservation'; callee = "'git'"; call_ordinal = 2
+       argv_shape = @('git','-C','<worktree>','status','--porcelain')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Cleanliness of a Range C worktree AS AN OBSERVATION. Empty stdout means clean; unlike C-46 the result is retained, not used as a gate.' }
 
     @{ step_id = 'C-61'; class = 'C'; ranges = 'abc'
        source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Get-K8SourceIdentity'; callee = "'git'"; call_ordinal = 1

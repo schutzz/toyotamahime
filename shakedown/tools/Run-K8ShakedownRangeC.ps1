@@ -127,6 +127,22 @@ try {
         -Requirement 'python is required to run the pinned Range C validator'
     $pyVersion = $pyVersionRecord['value']
 
+    # Typed environment identity, observed HERE: same interpreter, same working
+    # directory, same worktree as the validator that is about to run, and well
+    # before the disposable worktree is removed. A version read anywhere else is
+    # a different environment's version.
+    #
+    # This is the side of the comparison that did not exist. The frozen
+    # Study01/expected/range-c/environment/versions.json records pydantic
+    # 2.12.5; the accepted Model A record section 4 documents a 2.12.5 -> 2.13.5
+    # move that changed the byte-exact stderr and could NOT be re-derived from
+    # run evidence, because the retained stderr URL reaches only the minor
+    # version. Retaining it here is the recurrence control for that observed
+    # failure class -- not a general precaution.
+    $depVersions = Get-K8RangeCDependencyVersions -WorkingDirectory $disposable
+    $sourceObservation = Get-K8WorktreeObservation -WorktreePath $rangeCSource -HeadStepId 'C-69' -StatusStepId 'C-70'
+    $disposableObservation = Get-K8WorktreeObservation -WorktreePath $disposable -HeadStepId 'C-69' -StatusStepId 'C-70'
+
     $validatorArgv = @('cmd.exe', '/c', 'python', 'platform\cli.py', 'validate', 'manifests\power-grid-reference.range-c-negative.yaml')
     # F-35 PRE-EXECUTION gate. Not routed through Invoke-K8ContractedNative:
     # this call redirects both streams to files inside cmd.exe precisely so no
@@ -179,6 +195,25 @@ try {
                 -Argv $validatorArgv -ExitCode $exitCode -TimestampUtc $validatorStartedUtc `
                 -RunEvidence $RunEvidence -StdoutRelativePath 'validate.stdout.txt' -StderrRelativePath 'validate.stderr.txt'
         ) | Out-Null
+
+    # `git` is COPIED from the setup observation rather than re-probed: adding a
+    # process site to re-read a value the run already holds would grow the closed
+    # world for nothing. Its `phase` says `setup` so no reader can mistake it for
+    # a run-time reading. `python` comes from the C-60 probe a few lines above --
+    # already run, previously kept only as prose in metadata.md.
+    $setupGit = @(@((Get-K8ShakedownState).tool_versions) | Where-Object { $_.step_id -eq 'C-56' })[0]
+    $versionEntries = @(
+        [ordered]@{ name = 'git'; value = $(if ($setupGit) { [string]$setupGit.value } else { 'unavailable: no setup observation' })
+                    status = $(if ($setupGit -and $setupGit.status -eq 'succeeded') { 'succeeded' } else { 'unavailable' })
+                    phase = 'setup'; observed_utc = $null; source = 'C-56'; probe_argv = @('git', '--version') }
+        [ordered]@{ name = 'python'; value = [string]$pyVersionRecord['value']
+                    status = [string]$pyVersionRecord['status']
+                    phase = 'range-c-run'; observed_utc = $validatorStartedUtc; source = 'C-60'; probe_argv = @('python', '--version') }
+        $depVersions['pydantic']
+        $depVersions['pyyaml']
+    )
+    Write-K8RangeCEnvironmentRecord -Run $Run -SourceWorktree $sourceObservation `
+        -DisposableWorktree $disposableObservation -Versions $versionEntries -RunEvidence $RunEvidence | Out-Null
 }
 finally { Pop-Location }
 
@@ -233,6 +268,15 @@ Scope note: this run satisfies the Shakedown SS5.3 execution-retention
 contract. It is NOT the frozen evidence-schema.md static-validation package
 shape (\`static-validations/\`), and nothing here claims it is.
 "@ | Set-Content -Path (Join-Path $RunEvidence 'metadata.md') -Encoding utf8NoBOM
+
+# Candidates, surfaced from THIS run's own retained records -- never by reading
+# expected/, which this tooling does not open even to check that it exists. The
+# machine names facts; whether any of them is a deviation, what it affected, and
+# any declaration of "None" are decided by a person in deviations.md.
+$cEnvironment = (Get-Content -LiteralPath (Get-K8RangeCEnvironmentPath -RunId $RunId) -Raw) | ConvertFrom-Json -AsHashtable
+$cCandidates = Get-K8RangeCDeviationCandidates -Observation $cObservation -Environment $cEnvironment `
+    -AcceptedExitCodes (Get-K8RowAcceptedExitCodes -Row (Get-K8CommandContractRow -StepId 'F-35'))
+Write-K8DeviationCandidateRecord -Run $Run -Candidates $cCandidates -RunEvidence $RunEvidence | Out-Null
 
 Remove-Item -Recurse -Force $disposable
 Write-K8ShakedownLog -Message "Disposable worktree removed after retention (README SS5.2: only the disposable worktree and generated static artifacts are removed; no Docker cleanup applies to Range C)."
