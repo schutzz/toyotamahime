@@ -5347,14 +5347,18 @@ function Get-K8ObservedSiteTable {
 Assert-K8Test 'C-8: the contract is a single data structure, and every row states a complete, non-default acceptance domain' {
     $rows = @(Get-K8CommandContract)
     # Batch 3A fixed 100 rows (F 37 / C 60 / I 3). Batch 3B adds the six C-9
-    # source-identity git call sites as C-61..C-66, so the closed world is now
-    # 106 (F 37 / C 66 / I 3). The count is asserted per class, not in total,
-    # so a row moving between classes cannot hide inside an unchanged sum.
-    if ($rows.Count -ne 107) { throw "expected 107 process-site rows, got $($rows.Count)" }
+    # source-identity git call sites as C-61..C-66. Range C environment
+    # retention adds three more: C-68 (the dependency probe) and C-69 / C-70
+    # (worktree head and status observed FOR RETENTION -- deliberately separate
+    # rows from C-03 and C-46, which run the same commands to GATE). So the
+    # closed world is 110 (F 37 / C 70 / I 3). The count is asserted per class,
+    # not in total, so a row moving between classes cannot hide in an
+    # unchanged sum.
+    if ($rows.Count -ne 110) { throw "expected 110 process-site rows, got $($rows.Count)" }
     $byClass = @{}
     foreach ($c in 'F', 'C', 'I') { $byClass[$c] = @($rows | Where-Object { $_.class -eq $c }).Count }
-    if ($byClass['F'] -ne 37 -or $byClass['C'] -ne 67 -or $byClass['I'] -ne 3) {
-        throw "class split is F=$($byClass['F']) C=$($byClass['C']) I=$($byClass['I']); Batch 3A fixes F=37 I=3 and Batch 3B raises C to 67"
+    if ($byClass['F'] -ne 37 -or $byClass['C'] -ne 70 -or $byClass['I'] -ne 3) {
+        throw "class split is F=$($byClass['F']) C=$($byClass['C']) I=$($byClass['I']); Batch 3A fixes F=37 I=3, Batch 3B raises C to 67, and Range C environment retention raises it to 70"
     }
     if (@($rows.step_id | Sort-Object -Unique).Count -ne $rows.Count) { throw 'step_id values are not unique' }
     foreach ($r in $rows) {
@@ -7188,6 +7192,312 @@ Assert-K8Test 'C-9: a pin that is not an ancestor of HEAD is refused, not silent
 
 Write-Host ''
 Restore-K8SuiteWorkspace
+$RangeCPackagePy = Join-Path $ToolsDir 'k8_rangec_formal_package.py'
+
+function New-K8RangeCPackagingFixture {
+    <# A completed Range C run's retained records, built from the SHAPES the
+       producer actually writes, so this fixture cannot silently diverge from
+       them. Values are synthetic; structure is not. #>
+    param(
+        [string] $ExitCode = '1',
+        [string] $PydanticStatus = 'succeeded',
+        [switch] $NoCandidates
+    )
+    $root = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-rcpkg-" + [guid]::NewGuid().ToString('N'))
+    $evidence = Join-Path $root 'runs\k8shakedown-rangec-test'
+    $records  = Join-Path $root 'run-records\k8shakedown-rangec-test'
+    $human    = Join-Path $root 'human'
+    foreach ($d in $evidence, $records, $human) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+
+    $stderrText = "observability_contract.required_segments requires segment 'sub_a_l2_lan'`n"
+    Set-Content -LiteralPath (Join-Path $evidence 'validate.stdout.txt') -Value '' -NoNewline -Encoding utf8NoBOM
+    Set-Content -LiteralPath (Join-Path $evidence 'validate.stderr.txt') -Value $stderrText -NoNewline -Encoding utf8NoBOM
+    Set-Content -LiteralPath (Join-Path $evidence 'power-grid-reference.range-c-negative.yaml') -Value "kind: manifest`n" -NoNewline -Encoding utf8NoBOM
+    Set-Content -LiteralPath (Join-Path $evidence 'range-c-derived.patch') -Value "--- a`n+++ b`n" -NoNewline -Encoding utf8NoBOM
+
+    $h = { param($p) (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() }
+    $obs = @{
+        schema = 'k8shakedown-command-observation/1'
+        observations = @(@{
+            argv = @('cmd.exe','/c','python','platform\cli.py','validate','manifests\power-grid-reference.range-c-negative.yaml')
+            exit_code = [int]$ExitCode
+            capture_semantics = 'file-backed'
+            stdout = @{ path='validate.stdout.txt'; bytes=0; sha256=(& $h (Join-Path $evidence 'validate.stdout.txt')); empty=$true }
+            stderr = @{ path='validate.stderr.txt'; bytes=(Get-Item (Join-Path $evidence 'validate.stderr.txt')).Length; sha256=(& $h (Join-Path $evidence 'validate.stderr.txt')); empty=$false }
+        })
+    }
+    ($obs | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath (Join-Path $evidence 'validate.observation.json') -Encoding utf8NoBOM
+
+    $head = '0378f8a32701b481e030f3db3d5f66ea471a4675'
+    $env = @{
+        schema = 'k8shakedown-range-c-environment/1'
+        run_id = 'k8shakedown-rangec-test'; sequence_id = 'k8shakedown-seq-test'; range = 'c'
+        gated = $false
+        validator_source = @{ repo_url='https://example.invalid/a'; pinned_tag='v0.13.0'; pinned_commit=$head }
+        worktree = @{
+            source     = @{ path='S'; head=$head; clean=$true;  observed_utc='2026-09-07T00:00:00.0000000Z' }
+            disposable = @{ path='D'; head=$head; clean=$false; observed_utc='2026-09-07T00:00:01.0000000Z' }
+        }
+        versions = @(
+            @{ name='git';      value='git version 2.51.0.windows.2'; status='succeeded';       phase='setup';       source='C-56' }
+            @{ name='python';   value='Python 3.10.11';               status='succeeded';       phase='range-c-run'; source='C-60' }
+            @{ name='pydantic'; value='2.12.5';                       status=$PydanticStatus;   phase='range-c-run'; source='C-68' }
+            @{ name='pyyaml';   value='6.0.3';                        status='succeeded';       phase='range-c-run'; source='C-68' }
+        )
+    }
+    ($env | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath (Join-Path $records 'range-c-environment.json') -Encoding utf8NoBOM
+
+    $cands = @()
+    if (-not $NoCandidates) {
+        $cands = @(@{
+            candidate_id='dc-001'; class='multi-valued-acceptance'
+            observed_utc='2026-09-07T00:00:02.0000000Z'
+            source=@{ record='validate.observation.json'; field='observations[0].exit_code' }
+            observed_fact="The validator exited $ExitCode; this call site declares accepted exits [0, 1]."
+            reason_surfaced='The call site declares more than one accepted exit code.'
+            related_artifacts=@()
+        })
+    }
+    (@{ schema='k8shakedown-deviation-candidates/1'; run_id='k8shakedown-rangec-test'
+        sequence_id='k8shakedown-seq-test'; range='c'; generated_utc='2026-09-07T00:00:03.0000000Z'
+        candidates=$cands } | ConvertTo-Json -Depth 12) |
+        Set-Content -LiteralPath (Join-Path $records 'deviation-candidates.json') -Encoding utf8NoBOM
+
+    Set-Content -LiteralPath (Join-Path $human 'metadata.md') -Value "# Range C validation`nScope: static validation only.`n" -Encoding utf8NoBOM
+    Set-Content -LiteralPath (Join-Path $human 'validation-command.md') -Value "# Validation Command`nByte-level substitution was used because...`n" -Encoding utf8NoBOM
+    $devText = "# Deviations`nNone affecting the validation."
+    if (-not $NoCandidates) { $devText += "`n`ndc-001: the site declares two accepted exits; exit 1 is the expected rejection." }
+    Set-Content -LiteralPath (Join-Path $human 'deviations.md') -Value ($devText + "`n") -Encoding utf8NoBOM
+
+    return [pscustomobject]@{ Root=$root; Evidence=$evidence; Records=$records; Human=$human
+                              Destination=(Join-Path $root 'out\k8s2-range-c-20260907-001') }
+}
+
+function Invoke-K8RangeCPackage {
+    param([Parameter(Mandatory)] $Fixture, [Parameter(Mandatory)][string] $Command, [string] $DestinationOverride)
+    $dest = $(if ($DestinationOverride) { $DestinationOverride } else { $Fixture.Destination })
+    $extra = @()
+    if ($Command -eq 'build') { $extra = @('--validation-id', 'k8s2-range-c-20260907-001', '--human-dir', $Fixture.Human) }
+    $out = & python $RangeCPackagePy $Command --run-evidence $Fixture.Evidence --run-records $Fixture.Records `
+        --destination $dest @extra 2>&1
+    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Text = (@($out) -join "`n") }
+}
+
+Assert-K8Test 'Range C: every environment/versions.json field is rendered from a typed source, in the K6 field shape' {
+    $f = New-K8RangeCPackagingFixture
+    try {
+        $built = Invoke-K8RangeCPackage -Fixture $f -Command 'build'
+        if ($built.ExitCode -ne 0) { throw "build failed: $($built.Text)" }
+        $v = (Get-Content -LiteralPath (Join-Path $f.Destination 'environment\versions.json') -Raw) | ConvertFrom-Json -AsHashtable
+
+        # Exactly the accepted K6 instance's shape: four top-level keys, four
+        # version keys, nothing added. The producer record carries more
+        # determinacy and it stays on the producer side.
+        $top = @($v.Keys | Sort-Object)
+        if (($top -join ',') -ne 'argv,versions,worktree_clean,worktree_head') { throw "top-level keys: $($top -join ',')" }
+        $vk = @($v['versions'].Keys | Sort-Object)
+        if (($vk -join ',') -ne 'git,pydantic,python,pyyaml') { throw "versions keys: $($vk -join ',')" }
+
+        if ($v['versions']['pydantic'] -ne '2.12.5') { throw 'pydantic was not rendered from the environment record' }
+        if ($v['versions']['pyyaml'] -ne '6.0.3') { throw 'pyyaml was not rendered from the environment record' }
+        if ($v['worktree_head'] -ne '0378f8a32701b481e030f3db3d5f66ea471a4675') { throw 'worktree_head is wrong' }
+        if ($v['worktree_clean'] -ne $false) { throw 'worktree_clean is not the observed disposable-worktree state' }
+
+        $verified = Invoke-K8RangeCPackage -Fixture $f -Command 'verify'
+        if ($verified.ExitCode -ne 0) { throw "verify failed: $($verified.Text)" }
+    }
+    finally { Remove-Item $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'Range C: an unobserved dependency version STOPS packaging -- it is never silently omitted or recovered' {
+    $f = New-K8RangeCPackagingFixture -PydanticStatus 'unavailable'
+    try {
+        $built = Invoke-K8RangeCPackage -Fixture $f -Command 'build'
+        if ($built.ExitCode -eq 0) { throw 'a package was written with no observed pydantic version' }
+        foreach ($needle in 'pydantic', 'no observed value', 'stderr URL', 'requirements.txt', 're-observing the current environment') {
+            if ($built.Text -notmatch [regex]::Escape($needle)) { throw "the STOP does not name '$needle': $($built.Text)" }
+        }
+        # The failure is PACKAGING-side: the run's own records are untouched, so
+        # the observation is never damaged by a packaging problem.
+        foreach ($kept in 'validate.observation.json') {
+            if (-not (Test-Path (Join-Path $f.Evidence $kept))) { throw "packaging destroyed $kept" }
+        }
+        if (-not (Test-Path (Join-Path $f.Records 'range-c-environment.json'))) { throw 'packaging destroyed the environment record' }
+    }
+    finally { Remove-Item $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'Range C: the packaging tool refuses the canonical formal-evidence path' {
+    $f = New-K8RangeCPackagingFixture
+    try {
+        $canonical = Join-Path $f.Root 'evidence\static-validations\range-c\k8s2-range-c-20260907-001'
+        $built = Invoke-K8RangeCPackage -Fixture $f -Command 'build' -DestinationOverride $canonical
+        if ($built.ExitCode -eq 0) { throw 'a Shakedown package was written under the canonical formal evidence path' }
+        foreach ($needle in 'NON-EVIDENTIARY', 'relabel') {
+            if ($built.Text -notmatch [regex]::Escape($needle)) { throw "the refusal does not explain '$needle': $($built.Text)" }
+        }
+        if (Test-Path $canonical) { throw 'the refused destination was created anyway' }
+    }
+    finally { Remove-Item $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'Range C: the package matches evidence-schema.md SS1 and holds no runtime stage directory' {
+    $f = New-K8RangeCPackagingFixture
+    try {
+        if ((Invoke-K8RangeCPackage -Fixture $f -Command 'build').ExitCode -ne 0) { throw 'build failed' }
+        foreach ($entry in 'metadata.md','negative-manifest','validation-command.md','validator-output','hashes.sha256','deviations.md') {
+            if (-not (Test-Path (Join-Path $f.Destination $entry))) { throw "SS1 requires $entry" }
+        }
+        foreach ($forbidden in 'ground-truth','sensor-input','collector-output','rule-output','contract-output') {
+            if (Test-Path (Join-Path $f.Destination $forbidden)) { throw "SS54: Range C must have no $forbidden directory" }
+        }
+        # hashes.sha256 covers everything except itself -- the K6 precedent.
+        $lines = @(Get-Content -LiteralPath (Join-Path $f.Destination 'hashes.sha256'))
+        if ($lines -match 'hashes\.sha256') { throw 'hashes.sha256 covers itself' }
+        $onDisk = @(Get-ChildItem -Path $f.Destination -Recurse -File | Where-Object { $_.Name -ne 'hashes.sha256' })
+        if ($lines.Count -ne $onDisk.Count) { throw "hashes.sha256 covers $($lines.Count) files, $($onDisk.Count) on disk" }
+
+        # exit-code.txt is RENDERED from the observation. The validator is never
+        # re-run: doing so would be a different observation.
+        if ((Get-Content -LiteralPath (Join-Path $f.Destination 'validator-output\exit-code.txt') -Raw).Trim() -ne '1') { throw 'exit-code.txt is wrong' }
+        $source = Get-Content -LiteralPath $RangeCPackagePy -Raw
+        foreach ($banned in 'platform/cli.py', 'subprocess') {
+            if ($source -match [regex]::Escape($banned)) { throw "the packaging tool references '$banned'; it must never re-run the validator" }
+        }
+    }
+    finally { Remove-Item $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'Range C: candidates are typed and hashed, carry no verdict field, and their ids must be cited' {
+    $f = New-K8RangeCPackagingFixture
+    try {
+        # The candidate schema has no field a machine could write a judgment into.
+        $rec = (Get-Content -LiteralPath (Join-Path $f.Records 'deviation-candidates.json') -Raw) | ConvertFrom-Json -AsHashtable
+        foreach ($c in @($rec['candidates'])) {
+            foreach ($banned in 'is_deviation','accepted','no_impact','none','verdict','disposition','impact','resolved') {
+                if ($c.Keys -contains $banned) { throw "a candidate carries the judgment field '$banned'" }
+            }
+        }
+        # ...and neither does the producer that builds one.
+        $module = Get-Content -LiteralPath $CommonPath -Raw
+        $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'New-K8DeviationCandidate'
+        foreach ($banned in 'is_deviation','no_impact','verdict','disposition') {
+            if ($body -match $banned) { throw "New-K8DeviationCandidate can emit '$banned'" }
+        }
+        # Nothing may auto-write a "no deviations" declaration.
+        if ($module -match "deviations\.md.*'None'" -or $module -match 'None affecting the validation') {
+            throw 'the module can generate a "no deviations" declaration'
+        }
+
+        if ((Invoke-K8RangeCPackage -Fixture $f -Command 'build').ExitCode -ne 0) { throw 'build failed' }
+
+        # Citation coverage: an uncited candidate id STOPS packaging.
+        $f2 = New-K8RangeCPackagingFixture
+        try {
+            Set-Content -LiteralPath (Join-Path $f2.Human 'deviations.md') -Value "# Deviations`nNone affecting the validation.`n" -Encoding utf8NoBOM
+            $bad = Invoke-K8RangeCPackage -Fixture $f2 -Command 'build'
+            if ($bad.ExitCode -eq 0) { throw 'packaging accepted a deviations.md that cites no candidate id' }
+            if ($bad.Text -notmatch 'dc-001') { throw "the STOP does not name the uncited id: $($bad.Text)" }
+            # And it says what the check does NOT prove.
+            if ($bad.Text -notmatch 'not evidence that it was answered') { throw 'the STOP does not record the limit of citation coverage' }
+        }
+        finally { Remove-Item $f2.Root -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    finally { Remove-Item $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Assert-K8Test 'Range C: the environment record retains resolved versions and BOTH worktrees, from the run itself' {
+    Import-Module $CommonPath -Force
+    # Observation points, audited structurally: the probes must sit inside the
+    # validator-run stage, before F-35, and before the worktree is removed. A
+    # version observed anywhere else describes a different environment.
+    $script = Get-Content -LiteralPath (Join-Path $ToolsDir 'Run-K8ShakedownRangeC.ps1') -Raw
+    $stage   = $script.IndexOf("Set-K8ShakedownRunStage -Stage 'validator-run'")
+    $probe   = $script.IndexOf('Get-K8RangeCDependencyVersions')
+    $wt      = $script.IndexOf('$disposableObservation = Get-K8WorktreeObservation')
+    $f35     = $script.IndexOf('Invoke-K8FileRedirectedProcess')
+    $write   = $script.IndexOf('Write-K8RangeCEnvironmentRecord')
+    $remove  = $script.IndexOf('Remove-Item -Recurse -Force $disposable')
+    foreach ($pair in @(@($stage,$probe,'the dependency probe is not inside the validator-run stage'),
+                        @($probe,$f35,'the dependency probe runs after the validator'),
+                        @($wt,$f35,'the disposable worktree is observed after the validator'),
+                        @($write,$remove,'the environment record is written after the worktree is removed'))) {
+        if ($pair[0] -lt 0 -or $pair[1] -lt 0 -or $pair[0] -gt $pair[1]) { throw $pair[2] }
+    }
+    # The probe uses the interpreter's own metadata, not a module constant.
+    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Get-K8RangeCDependencyVersions'
+    if ($body -notmatch 'importlib') { throw 'the dependency probe does not use importlib.metadata' }
+    foreach ($banned in 'pydantic.VERSION', '__version__', 'requirements.txt') {
+        if ($body -match [regex]::Escape($banned)) { throw "the probe reads '$banned' instead of the resolved distribution" }
+    }
+    # The observed head is retained, never the pinned constant.
+    $envBody = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Get-K8WorktreeObservation'
+    if ($envBody -match 'RangeCCommit') { throw 'the worktree observation renders the pinned constant instead of the observed head' }
+    # Both records are C-6 required artifacts, so a run cannot complete without them.
+    $required = @(Get-K8ContractArtifacts -Range 'c' | ForEach-Object { $_.artifact })
+    foreach ($a in 'range-c-environment.json', 'deviation-candidates.json') {
+        if ($required -notcontains $a) { throw "$a is not a required Range C artifact" }
+    }
+}
+
+Assert-K8Test 'TRUST: retention is additive -- nothing added here can delete, overwrite or relabel a retained record' {
+    Import-Module $CommonPath -Force
+
+    # No retention-writing path may delete a record it finds. Checked over the
+    # writers themselves rather than over the module as a whole, because the
+    # module legitimately removes temporary things elsewhere.
+    foreach ($fn in 'Write-K8CompletionRecord','Write-K8TerminationRecord','Write-K8OperatorCloseTermination',
+                    'Write-K8RangeCEnvironmentRecord','Write-K8DeviationCandidateRecord','New-K8DeviationCandidate') {
+        $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name $fn
+        foreach ($banned in 'Remove-Item', 'Clear-Content') {
+            if ($body -match $banned) { throw "$fn can $banned a retained record" }
+        }
+    }
+
+    # The packaging step never deletes or overwrites either, and refuses a
+    # non-empty destination rather than cleaning up a previous attempt.
+    $pkg = Get-Content -LiteralPath $RangeCPackagePy -Raw
+    foreach ($banned in 'shutil.rmtree', 'os.remove', 'unlink(') {
+        if ($pkg -match [regex]::Escape($banned)) { throw "the packaging tool can $banned" }
+    }
+    $f = New-K8RangeCPackagingFixture
+    try {
+        if ((Invoke-K8RangeCPackage -Fixture $f -Command 'build').ExitCode -ne 0) { throw 'first build failed' }
+        $before = @(Get-ChildItem -Path $f.Destination -Recurse -File | ForEach-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash }) -join ','
+        $second = Invoke-K8RangeCPackage -Fixture $f -Command 'build'
+        if ($second.ExitCode -eq 0) { throw 'a second build overwrote an existing package' }
+        if ($second.Text -notmatch 'not deleted to make a retry succeed') { throw "the refusal does not state the retention rule: $($second.Text)" }
+        $after = @(Get-ChildItem -Path $f.Destination -Recurse -File | ForEach-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash }) -join ','
+        if ($before -ne $after) { throw 'the refused second build changed the existing package' }
+    }
+    finally { Remove-Item $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
+
+    # A run ID is never reused to rescue a failed attempt.
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        try {
+            Invoke-K8ShakedownRunBoundary -Run $run -ScriptBlock {
+                Set-K8ShakedownRunStage -Stage 'provision'; throw 'simulated failure'
+            }.GetNewClosure()
+        } catch { }
+        $termBefore = (Get-FileHash -LiteralPath (Get-K8TerminationRecordPath -RunId $run.RunId) -Algorithm SHA256).Hash
+        # Assert the OUTCOME, not the wording. Measured: the refusal arrives
+        # from the sequence level first -- a terminated run ends its sequence --
+        # which is a broader guarantee than the per-run guard this test was
+        # written expecting. Pinning the message would have pinned the weaker
+        # of the two. What must hold is that nothing was rescued.
+        $rescued = $true
+        try { Complete-K8ShakedownRunInSequence -Run $run | Out-Null } catch { $rescued = $false }
+        if ($rescued) { throw 'a terminated run was completed' }
+        if ((Get-FileHash -LiteralPath (Get-K8TerminationRecordPath -RunId $run.RunId) -Algorithm SHA256).Hash -ne $termBefore) {
+            throw 'the rescue attempt modified the retained failure record'
+        }
+        if (Test-K8RunHasCompletion -RunId $run.RunId) { throw 'a failed run acquired a completion record' }
+    }
+}
+
 if ($failures.Count -gt 0) {
     Write-Host "$($failures.Count) check(s) FAILED: $($failures -join ', ')" -ForegroundColor Red
     exit 1
