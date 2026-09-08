@@ -66,11 +66,12 @@ To see the contract itself as data:
 
     python .\tools\k8_scoring_input_contract.py describe --range b
 
-If it refuses "r_obs_05": "Unresolved", that is deliberate. The token is a valid
-R-OBS-05 query outcome, but no frozen source fixes what it propagates to in
-scoring, and the tooling will not invent one. The observation is retained in the
-R-OBS-05 correlation record; the scoring value is your decision to make and to
-justify.
+"r_obs_05" accepts Pass, Fail and Unresolved. Unresolved was refused until
+AMEND-004, because no frozen source fixed what it propagated to in scoring and
+the tooling will not invent one. AMEND-004 fixes it: Runtime contract Unresolved
+-> Inconclusive experiment. Any other token is still refused for the same reason
+Unresolved once was. Which token to write is your decision to make and to
+justify -- the tooling never fills it in.
 
 If something fails partway through a Range run
 ----------------------------------------------

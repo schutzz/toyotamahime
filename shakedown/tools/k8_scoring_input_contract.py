@@ -79,6 +79,28 @@ def default_scripts_dir() -> Path:
 
 BOOL_DOMAIN = "strict-bool"
 
+# Sentinel: resolved by asking the SHIPPED frozen apparatus what it normalizes,
+# rather than by naming a constant that a pre-AMEND-004 apparatus does not have.
+R_OBS_05_DERIVED = "derived-from-frozen-scorer:r_obs_05"
+
+
+def resolve_r_obs_05_domain(semantics):
+    """Accepted `r_obs_05` tokens, derived from the shipped frozen apparatus.
+
+    `Pass` is fixed independently: the frozen Range B expected result records
+    it, and it normalizes nothing.  Everything else comes from the frozen
+    scorer's OWN normalization set, so the accepted domain and the scorer's
+    behaviour cannot drift apart.
+
+    An apparatus predating AMEND-004 has no such set and special-cases only
+    `== "Fail"`; the fallback reproduces exactly that, which is why refusing
+    `Unresolved` against such an apparatus is correct rather than stale.
+    """
+    normalized = getattr(semantics, "R_OBS_05_TO_RUNTIME_UNRESOLVED", None)
+    if normalized is None:
+        return frozenset({"Pass", "Fail"})
+    return frozenset({"Pass"}) | frozenset(normalized)
+
 
 class Field:
     """One field the frozen scorer reads, plus its Batch 2 structural rules."""
@@ -99,16 +121,27 @@ class Field:
 # (resolved at run time -- never copied here) or a literal token set whose
 # `why` names the frozen source that fixes it.
 #
-# `r_obs_05` accepts Pass and Fail ONLY.  The R-OBS-05 query contract also
-# defines an `Unresolved` OUTCOME (SS3: "A zero total ... is `Unresolved`"),
-# but that is an outcome of the QUERY OBSERVATION.  No frozen source fixes
-# what `"r_obs_05": "Unresolved"` would do to the SCORE: the frozen scorer
-# special-cases `== "Fail"` and nothing else, so such an input would look
-# structurally valid here while the scorer silently ignored it -- the exact
-# hidden-semantics class C3-R6 exists to stop.  Inventing a propagation rule
-# is equally forbidden.  It is therefore refused here with an explicit
-# message, and retained instead in the C-5 observer record, where it is an
-# observation rather than a scoring token.
+# `r_obs_05`'s domain is DERIVED FROM THE SHIPPED FROZEN APPARATUS, not listed
+# here.  See `resolve_r_obs_05_domain`.
+#
+# The rule this file must never break: it must not accept a token the scorer
+# that will actually score the input ignores.  Doing so would let an input look
+# structurally valid here while the scorer silently dropped it -- the
+# hidden-semantics class C3-R6 exists to stop.
+#
+# AMEND-004 fixed the propagation of `Unresolved` (Range B `R-OBS-05 =
+# Unresolved` -> Runtime contract `Unresolved` -> `Inconclusive experiment`).
+# But an amendment becoming normative in the study repository does not by itself
+# change the frozen apparatus SHIPPED under `Study01/`, and that shipped scorer
+# is what `study01_score.py` runs.  So the domain is read from the shipped
+# `study01.frozen.semantics` every time: while the shipped apparatus predates
+# AMEND-004 the token is refused with the reason, and it becomes accepted the
+# moment the apparatus carrying AMEND-004 is shipped.  No edit here is needed,
+# and no window exists in which this contract and the scorer disagree.
+#
+# What does not change either way: `Fail` and `Unresolved` remain DIFFERENT
+# observations (scoring.md SS20), the operator still writes the value by hand,
+# and this contract still refuses to generate, guess or default it.
 # ---------------------------------------------------------------------------
 CONTRACT = (
     Field("stages.ground_truth", "ab", True, "STAGE_VALUES",
@@ -124,10 +157,11 @@ CONTRACT = (
     Field("evidence_correlatable", "ab", True, BOOL_DOMAIN,
           "AMEND-002 Part A (5); frozen scorer reads it with a default of True, "
           "so an ABSENT field is silently a decision -- it must be written down"),
-    Field("r_obs_05", "b", True, frozenset({"Pass", "Fail"}),
-          "'Fail': contract SS4 ('R-OBS-05 is Fail') + AMEND-002 Part B (4) fix its "
-          "scoring propagation. 'Pass': the frozen Range B expected result records it. "
-          "No frozen source fixes the propagation of any other token"),
+    Field("r_obs_05", "b", True, R_OBS_05_DERIVED,
+          "'Pass': the frozen Range B expected result records it. Every other "
+          "accepted token is read from the SHIPPED frozen scorer's own "
+          "normalization set, so this contract can never accept a token that "
+          "scorer ignores. No frozen source fixes the propagation of any other token"),
     Field("target_observation_absent", "ab", False, BOOL_DOMAIN,
           "scoring.md SS2/SS3; frozen scorer reads it with `is True`"),
     Field("sensor_capture", "ab", False, frozenset({"empty"}),
@@ -145,6 +179,8 @@ DERIVATION_EXCLUDED = ("procedure_conformance", "range")
 
 
 def resolve_domain(field, semantics):
+    if field.domain == R_OBS_05_DERIVED:
+        return resolve_r_obs_05_domain(semantics)
     if isinstance(field.domain, str) and field.domain != BOOL_DOMAIN:
         return frozenset(getattr(semantics, field.domain))
     return field.domain
@@ -354,10 +390,13 @@ def validate_record(record, range_key, semantics, run_evidence: Path,
         elif value not in domain:
             extra = ""
             if field.address == "r_obs_05" and value == "Unresolved":
-                extra = (" 'Unresolved' is a valid R-OBS-05 QUERY OUTCOME (contract SS3), "
-                         "but no frozen source fixes what it propagates to in scoring: the "
-                         "frozen scorer special-cases only == 'Fail'. Retain it in the C-5 "
-                         "observer record and resolve the scoring value by hand.")
+                extra = (" 'Unresolved' is a valid R-OBS-05 QUERY OUTCOME (contract SS3), and "
+                         "AMEND-004 fixes its scoring propagation -- but the frozen apparatus "
+                         "SHIPPED here predates that amendment: its scorer special-cases only "
+                         "== 'Fail', so accepting the token would let this input carry a value "
+                         "that scorer silently drops. Retain the observation in the C-5 observer "
+                         "record. This domain is derived from the shipped apparatus and needs no "
+                         "edit here once one carrying AMEND-004 is shipped.")
             problems.append(
                 f"{field.address}: {value!r} is outside the accepted token domain "
                 f"{sorted(domain)}.{extra}")

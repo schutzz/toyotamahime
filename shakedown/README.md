@@ -302,12 +302,13 @@ the command to check your completed file. That check is **shape only**:
 Whether you read the artifact *correctly* is not checked and cannot be: that is
 the judgment README §6.2 reserves for you. The tool never opens `expected/`.
 
-One token is deliberately refused: `"r_obs_05": "Unresolved"`. It is a valid
-R-OBS-05 *query outcome*, but no frozen source fixes what it propagates to in
-scoring -- the frozen scorer special-cases only `== "Fail"` -- so accepting it
-would let a structurally valid input carry a value the scorer silently ignores.
-It is retained in the observer record instead, and the scoring value is yours
-to resolve.
+`"r_obs_05": "Unresolved"` used to be refused here, and is now accepted. The
+reason it was refused has been removed rather than overruled: it was a valid
+R-OBS-05 *query outcome* whose propagation into scoring no frozen source fixed,
+so accepting it would have let a structurally valid input carry a value the
+scorer silently ignored. **AMEND-004 fixes that propagation** (Runtime contract
+`Unresolved` -> `Inconclusive experiment`), so the token is accepted because a
+frozen source decides it. A token no frozen source decides is still refused.
 
 ## Layout
 
@@ -384,8 +385,9 @@ Even once Shakedown completes end to end, these remain manual by design (see
    "Scoring-input structural contract"), but neither supplies a value, and
    both refuse to run against `expected/`.
 2. Resolving any `r_obs_05` outcome the frozen sources do not map to a scoring
-   token. The observer record retains what was observed; the scoring value is
-   yours.
+   token. `Pass`, `Fail` and `Unresolved` are mapped (the last by AMEND-004);
+   anything else is not. The observer record retains what was observed; the
+   scoring value is yours.
 
 ## Source identity, and where a bundle goes afterwards (C-9)
 
