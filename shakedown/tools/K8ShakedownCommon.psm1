@@ -176,7 +176,15 @@ function New-K8QualificationSequenceId {
 $script:K8SequenceSchema           = 'k8shakedown-qualification-sequence/1'
 $script:K8ProvenanceSchema         = 'k8shakedown-run-provenance/1'
 $script:K8TerminationSchema        = 'k8shakedown-termination/1'
+$script:K8CompletionSchema         = 'k8shakedown-completion/1'
 $script:K8SourceIdentitySchema     = 'k8shakedown-source-identity/1'
+# criterion 4: the completion record's `stage` is ONE token in every range.
+# "the terminal stage name" is not one value -- Range A/B end at
+# 'finalize-identity-snapshot' and Range C at 'completeness-gate' -- so a field
+# criterion 4 makes always-mandatory would have been range-dependent. The token
+# is deliberately NOT a member of the run stage vocabulary; it names a terminal
+# state, not a position, and a regression audits that no stage is ever set to it.
+$script:K8CompletionStage          = 'complete'
 $script:K8LiveSequenceStatus       = @('initializing', 'open', 'ineligible')
 $script:K8TerminalSequenceStatus   = @('complete', 'closed', 'abandoned')
 $script:K8SequenceLockTimeoutSec   = 120
@@ -196,6 +204,7 @@ function Get-K8SequenceRecordPath { param([Parameter(Mandatory)][string] $Sequen
 function Get-K8RunRecordDir { param([Parameter(Mandatory)][string] $RunId) Join-Path (Get-K8RunRecordsDir) $RunId }
 function Get-K8RunProvenancePath { param([Parameter(Mandatory)][string] $RunId) Join-Path (Get-K8RunRecordDir -RunId $RunId) 'run-provenance.json' }
 function Get-K8TerminationRecordPath { param([Parameter(Mandatory)][string] $RunId) Join-Path (Get-K8RunRecordDir -RunId $RunId) 'termination.json' }
+function Get-K8CompletionRecordPath { param([Parameter(Mandatory)][string] $RunId) Join-Path (Get-K8RunRecordDir -RunId $RunId) 'completion.json' }
 function Get-K8SourceIdentityPath { param([Parameter(Mandatory)][string] $SequenceId) Join-Path (Get-K8SequenceDir) "$SequenceId.source-identity.json" }
 
 function Get-K8UtcNow { (Get-Date).ToUniversalTime().ToString('o') }
@@ -436,6 +445,35 @@ function Test-K8ActiveRunHasTermination {
     return (Test-Path -LiteralPath (Get-K8TerminationRecordPath -RunId ([string]$ActiveRun['run_id'])))
 }
 
+function Test-K8RunHasCompletion {
+    <# criterion 4: fact A of the two-fact state table. Deliberately a separate
+       predicate from membership in completed_runs (fact B) -- collapsing them
+       is what made a double completion and a crash recovery indistinguishable. #>
+    param([Parameter(Mandatory)][string] $RunId)
+    return (Test-Path -LiteralPath (Get-K8CompletionRecordPath -RunId $RunId))
+}
+
+function Assert-K8RunNotCompleted {
+    <# criterion 4 SS8.3, the reverse guard. Called by EVERY authoritative
+       termination writer. throws rather than overwriting: the existing record
+       is retained untouched, because deleting or replacing a retained record is
+       exactly the selective-retention move this project bars. #>
+    param([Parameter(Mandatory)][string] $RunId, [Parameter(Mandatory)][string] $What)
+    if (Test-Path -LiteralPath (Get-K8CompletionRecordPath -RunId $RunId)) {
+        throw "Refusing to write $What for $RunId : it already has an authoritative COMPLETION record. termination and completion are mutually exclusive. The existing record is left byte-for-byte unchanged; resolve this as an operator judgment rather than by overwriting it."
+    }
+}
+
+function Test-K8RunInCompletedRuns {
+    <# Fact B. Read from the sequence record the caller already holds, so the
+       caller decides whether it is under the control-plane lock. #>
+    param([Parameter(Mandatory)] $Record, [Parameter(Mandatory)][string] $RunId)
+    foreach ($entry in @($Record['completed_runs'])) {
+        if ($null -ne $entry -and [string]$entry['run_id'] -eq $RunId) { return $true }
+    }
+    return $false
+}
+
 function Assert-K8SequenceOperationAllowed {
     <#
         OPERATION-AWARE transition gate. A single generic "is the control plane
@@ -528,6 +566,18 @@ function Assert-K8SequenceOperationAllowed {
 
     # status = open
     if ($Operation -eq 'CloseSequence') { return }
+
+    # criterion 4, the two states where fact B (membership in completed_runs) is
+    # already true. They are checked BEFORE the active-run test, because after a
+    # successful completion active_run is null and the generic "nothing to act
+    # on" refusal would name the wrong reason for both of them.
+    if ($Operation -eq 'CompleteRun' -and $RunId -and (Test-K8RunInCompletedRuns -Record $s -RunId $RunId)) {
+        if (Test-K8RunHasCompletion -RunId $RunId) {
+            & $deny "run '$RunId' is already completed: it has a completion record AND is in completed_runs. Nothing remains in this transaction. This is refused rather than returned as a silent success, so a caller cannot read it as 'I completed it'."
+        }
+        & $deny "STOP: run '$RunId' is in sequence '$sid' completed_runs but has NO completion record. The sequence says the run completed while the run's own authoritative record is missing. This tooling does not backfill, reconstruct or repair it -- resolve it as an operator judgment."
+    }
+
     $active = $s['active_run']
 
     if ($null -eq $active) {
@@ -948,6 +998,10 @@ function Write-K8OperatorCloseTermination {
         [Parameter(Mandatory)][string] $Reason
     )
     $runId = [string]$ActiveRun['run_id']
+    # criterion 4 SS8.3. The operator-close path is an authoritative termination
+    # writer too, so it carries the same guard -- listing only the exception
+    # path would leave the second door open.
+    Assert-K8RunNotCompleted -RunId $runId -What 'an operator-close termination record'
     $provPath = Get-K8RunProvenancePath -RunId $runId
     $head = $null
     $source = $null
@@ -2836,6 +2890,11 @@ function Write-K8TerminationRecord {
     $run = $script:K8CurrentRun
     if ($null -eq $run) { return $null }
     $runId = $run.RunId
+    # criterion 4 SS8.3, the direction that did not exist before there was a
+    # completion record to defend. A completed run must not acquire a
+    # termination record afterwards; the exclusivity holds both ways or it is
+    # not exclusivity.
+    Assert-K8RunNotCompleted -RunId $runId -What 'a termination record'
     New-Item -ItemType Directory -Force -Path (Get-K8RunRecordDir -RunId $runId) | Out-Null
 
     $ex = $ErrorRecord.Exception
@@ -2885,6 +2944,99 @@ function Write-K8TerminationRecord {
     return $record
 }
 
+function Assert-K8CompletionRecordBinding {
+    <#
+        criterion 4 SS7 / SS8.1. Checks a completion record -- one about to be
+        written, or an existing one found during recovery -- against the run's
+        OWN authoritative records.
+
+        On recovery this is the check that stops a sequence being advanced on
+        the strength of some OTHER run's record. Not verifying it would let a
+        crashed run's leftover completion.json carry an unrelated run forward.
+    #>
+    param(
+        [Parameter(Mandatory)] $Record,
+        [Parameter(Mandatory)] $Run
+    )
+    $runId = $Run.RunId
+    if ([string]$Record['schema'] -ne $script:K8CompletionSchema) {
+        throw "completion record for $runId has schema '$([string]$Record['schema'])', not '$($script:K8CompletionSchema)'. Not proceeding -- this record was not written by this contract."
+    }
+    if ([string]$Record['stage'] -ne $script:K8CompletionStage) {
+        throw "completion record for $runId has stage '$([string]$Record['stage'])', not the fixed token '$($script:K8CompletionStage)'."
+    }
+    $provPath = Get-K8RunProvenancePath -RunId $runId
+    if (-not (Test-Path -LiteralPath $provPath)) {
+        throw "No run-provenance record for $runId at $provPath; a completion record is not written or trusted without one."
+    }
+    $prov = (Get-Content -LiteralPath $provPath -Raw) | ConvertFrom-Json -AsHashtable
+    foreach ($pair in @(
+        @{ Field = 'run_id';       Mine = $runId;            Prov = [string]$prov['run_id'] }
+        @{ Field = 'sequence_id';  Mine = $Run.SequenceId;   Prov = [string]$prov['sequence_id'] }
+        @{ Field = 'tooling_head'; Mine = $Run.ToolingHead;  Prov = [string]$prov['tooling_head'] }
+    )) {
+        $inRecord = [string]$Record[$pair.Field]
+        if ($inRecord -ne $pair.Mine -or $inRecord -ne $pair.Prov) {
+            throw "completion record for $runId disagrees on '$($pair.Field)': record '$inRecord', run '$($pair.Mine)', run-provenance '$($pair.Prov)'. STOP -- a sequence is never advanced on a record that belongs to a different run, and this tooling does not repair or overwrite it."
+        }
+    }
+}
+
+function Write-K8CompletionRecord {
+    <#
+        The authoritative record that a run COMPLETED. Control plane only --
+        run-records/<run_id>/completion.json -- for the same reason the
+        termination record is: a file added to the evidence tree after
+        finalize-evidence would leave that tree permanently inconsistent with
+        its own manifest.
+
+        A SEPARATE schema from termination/1, not a third failure_kind token.
+        failure_kind says where a failure came from; a completion has no failure
+        kind, and widening that vocabulary would let existing termination
+        consumers read "completed" as a species of failure -- the same
+        fabrication of meaning criterion 4 bars for command semantics.
+
+        Non-applicable fields are explicitly null, and `command` is null with no
+        argv / exit_code / stdout / stderr key anywhere: a completion is not
+        external-command-derived, so writing `exit_code: 0` would fabricate the
+        observation that a command succeeded.
+
+        NEVER overwrites. If a record already exists this verifies it and
+        returns it unchanged -- that is the crash-recovery half of the state
+        table, and rewriting would destroy the record of what the crashed
+        attempt actually wrote.
+    #>
+    param([Parameter(Mandatory)] $Run)
+    $runId = $Run.RunId
+    if (Test-Path -LiteralPath (Get-K8TerminationRecordPath -RunId $runId)) {
+        throw "Refusing to write a completion record for $runId : it has an authoritative termination record. termination and completion are mutually exclusive, and a terminated run is never promoted to completed."
+    }
+    $path = Get-K8CompletionRecordPath -RunId $runId
+    if (Test-Path -LiteralPath $path) {
+        $existing = (Get-Content -LiteralPath $path -Raw) | ConvertFrom-Json -AsHashtable
+        Assert-K8CompletionRecordBinding -Record $existing -Run $Run
+        Write-K8ShakedownLog -Message "completion record for $runId already exists and matches this run; it is NOT rewritten (crash recovery)."
+        return $existing
+    }
+    New-Item -ItemType Directory -Force -Path (Get-K8RunRecordDir -RunId $runId) | Out-Null
+    $record = [ordered]@{
+        schema       = $script:K8CompletionSchema
+        run_id       = $runId
+        sequence_id  = $Run.SequenceId
+        tooling_head = $Run.ToolingHead
+        stage        = $script:K8CompletionStage
+        failure_kind = $null
+        timestamp    = (Get-K8UtcNow)
+        message      = $null
+        exception    = $null
+        command      = $null
+    }
+    Assert-K8CompletionRecordBinding -Record $record -Run $Run
+    Write-K8AtomicFile -Path $path -Content (($record | ConvertTo-Json -Depth 12) + "`n")
+    Write-K8ShakedownLog -Message "completion record retained for $runId (stage='$($script:K8CompletionStage)')."
+    return $record
+}
+
 function Set-K8SequenceIneligible {
     <# Second half of the termination transaction. The record on disk is
        authoritative and is written first; if this half fails, the control plane
@@ -2918,6 +3070,15 @@ function Complete-K8ShakedownRunInSequence {
         if (Test-K8ActiveRunHasTermination -ActiveRun $active) {
             throw "Refusing to complete run $($Run.RunId): it has an authoritative termination record. A terminated run is never promoted to completed."
         }
+        # criterion 4. The record is written HERE -- inside the same locked
+        # transaction, before the sequence is touched -- rather than at the call
+        # site the design diagram shows. Same ordering (record first, sequence
+        # second), but no caller can skip it, and fact B cannot change between
+        # the decision and the write. The two states where B is already true are
+        # refused by the transition gate above, so reaching this line means B is
+        # false: A=0 writes the record, A=1 is crash recovery and verifies the
+        # existing bytes without rewriting them.
+        [void](Write-K8CompletionRecord -Run $Run)
         $range = [string]$active['range']
         $s['completed_runs'] = @(@($s['completed_runs']) + , ([ordered]@{
             range         = $range

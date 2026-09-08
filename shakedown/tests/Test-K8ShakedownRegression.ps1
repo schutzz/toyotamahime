@@ -3181,6 +3181,259 @@ Assert-K8Test 'Completion advances next_range and clears the active run; termina
     }
 }
 
+Assert-K8Test 'criterion 4: the completion record has exactly the criterion field set, and fabricates no command' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $runA = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        Complete-K8ShakedownRunInSequence -Run $runA | Out-Null
+
+        $path = Get-K8CompletionRecordPath -RunId $runA.RunId
+        if (-not (Test-Path $path)) { throw 'no completion record was written' }
+        $raw = Get-Content -LiteralPath $path -Raw
+        $rec = $raw | ConvertFrom-Json -AsHashtable
+
+        $expected = @('schema','run_id','sequence_id','tooling_head','stage','failure_kind','timestamp','message','exception','command')
+        $actual = @($rec.Keys)
+        $missing = @($expected | Where-Object { $_ -notin $actual })
+        $extra   = @($actual   | Where-Object { $_ -notin $expected })
+        if ($missing.Count) { throw "completion record is missing key(s): $($missing -join ', ')" }
+        if ($extra.Count)   { throw "completion record carries key(s) criterion 4 does not define: $($extra -join ', ')" }
+
+        if ($rec['schema'] -ne 'k8shakedown-completion/1') { throw "schema = $($rec['schema'])" }
+        if ($rec['stage'] -ne 'complete') { throw "stage = '$($rec['stage'])', not the fixed token 'complete'" }
+
+        # Non-applicable fields are explicitly null AND the keys are present --
+        # an absent key is a different statement from a null one.
+        foreach ($k in 'failure_kind','message','exception','command') {
+            if (-not $rec.ContainsKey($k)) { throw "$k key is absent; criterion 4 requires an explicit null" }
+            if ($null -ne $rec[$k]) { throw "$k = $($rec[$k]); expected null" }
+        }
+        # No command semantics anywhere in the record's TEXT: not an empty argv
+        # array, and above all not exit_code 0, which would fabricate the
+        # observation that a command ran and succeeded.
+        foreach ($forbidden in 'argv','exit_code','stdout','stderr') {
+            if ($raw -match [regex]::Escape('"' + $forbidden + '"')) { throw "the completion record mentions '$forbidden'; a completion is not command-derived" }
+        }
+
+        # Bound to the run's own authoritative records, and to the locked head.
+        $prov = (Get-Content -LiteralPath (Get-K8RunProvenancePath -RunId $runA.RunId) -Raw) | ConvertFrom-Json -AsHashtable
+        foreach ($f in 'run_id','sequence_id','tooling_head') {
+            if ($rec[$f] -ne $prov[$f]) { throw "completion.$f ($($rec[$f])) != run-provenance.$f ($($prov[$f]))" }
+        }
+        $seq = Get-K8QualificationSequence
+        if ($rec['tooling_head'] -ne [string]$seq['locked_head']) { throw 'completion tooling_head is not the sequence locked_head' }
+
+        # Control plane only: never inside the evidence tree.
+        if ($path -notmatch 'run-records') { throw "completion record was written outside run-records/: $path" }
+
+        # timestamp <= completed_utc, an ordering rather than an identity.
+        $entry = @(@($seq['completed_runs']) | Where-Object { [string]$_['run_id'] -eq $runA.RunId })[0]
+        if ([datetime]$rec['timestamp'] -gt [datetime]$entry['completed_utc']) {
+            throw 'completion.timestamp is AFTER completed_utc; the record must be written before the sequence mutation'
+        }
+    }
+}
+
+Assert-K8Test 'criterion 4: a completion record is written in every range, with the same stage token' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $stages = @{}
+        foreach ($range in 'a','b','c') {
+            $run = Start-K8ShakedownRun -Range $range -RepoRoot $sb.Repo
+            Complete-K8ShakedownRunInSequence -Run $run | Out-Null
+            $rec = (Get-Content -LiteralPath (Get-K8CompletionRecordPath -RunId $run.RunId) -Raw) | ConvertFrom-Json -AsHashtable
+            $stages[$range] = [string]$rec['stage']
+        }
+        $distinct = @($stages.Values | Sort-Object -Unique)
+        if ($distinct.Count -ne 1) { throw "the completion stage token differs by range: $($stages.Keys -join ',') -> $($stages.Values -join ',')" }
+        if ($distinct[0] -ne 'complete') { throw "stage token is '$($distinct[0])'" }
+    }
+}
+
+Assert-K8Test 'criterion 4: "complete" is not a run stage, so the two vocabularies cannot merge' {
+    # The token was chosen after surveying the vocabulary, and this keeps the
+    # survey true: nothing may ever set a RUN stage to 'complete'. The literal
+    # does appear elsewhere -- sequence status, state.json range_<x>_stage --
+    # and means the same thing there, which is why it was reused rather than a
+    # fourth word invented. What must not happen is a run POSITION taking it.
+    $files = @($CommonPath) + @(Get-ChildItem -Path $ToolsDir -Filter *.ps1 | ForEach-Object { $_.FullName })
+    foreach ($file in $files) {
+        $text = Get-Content -LiteralPath $file -Raw
+        if ($text -match "Set-K8ShakedownRunStage\s+-Stage\s+'complete'") {
+            throw "$file sets a run stage to 'complete'; that token is reserved for the completion record"
+        }
+    }
+}
+
+Assert-K8Test 'criterion 4: the four states of (completion record, completed_runs membership)' {
+    Import-Module $CommonPath -Force
+
+    # A=0 / B=0 -> normal completion: both appear.
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        if (Test-K8RunHasCompletion -RunId $run.RunId) { throw 'a completion record existed before completion' }
+        $seq = Complete-K8ShakedownRunInSequence -Run $run
+        if (-not (Test-K8RunHasCompletion -RunId $run.RunId)) { throw 'A=0/B=0 did not write the record' }
+        if (-not (Test-K8RunInCompletedRuns -Record $seq -RunId $run.RunId)) { throw 'A=0/B=0 did not add to completed_runs' }
+    }
+
+    # A=1 / B=0 -> crash recovery: the sequence advances and the existing
+    # record's BYTES do not change.
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        [void](Write-K8CompletionRecord -Run $run)          # first half only, as a crash would leave it
+        $path = Get-K8CompletionRecordPath -RunId $run.RunId
+        $before = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+        $seq = Complete-K8ShakedownRunInSequence -Run $run
+        $after = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+        if ($before -ne $after) { throw 'recovery rewrote the existing completion record' }
+        if (-not (Test-K8RunInCompletedRuns -Record $seq -RunId $run.RunId)) { throw 'recovery did not finish the transaction' }
+    }
+
+    # A=1 / B=1 -> duplicate completion: explicitly refused, not a silent no-op,
+    # and neither the record nor the sequence changes.
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        Complete-K8ShakedownRunInSequence -Run $run | Out-Null
+        $path = Get-K8CompletionRecordPath -RunId $run.RunId
+        $before = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+        $seqBefore = (Get-K8QualificationSequence | ConvertTo-Json -Depth 12 -Compress)
+        Assert-K8FailsClosed -What 'completing an already-completed run' -Because 'already completed' -Attempt {
+            Complete-K8ShakedownRunInSequence -Run $run
+        }
+        if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $before) { throw 'the duplicate attempt rewrote the record' }
+        if ((Get-K8QualificationSequence | ConvertTo-Json -Depth 12 -Compress) -ne $seqBefore) { throw 'the duplicate attempt mutated the sequence' }
+    }
+
+    # A=0 / B=1 -> inconsistent: STOP, and no backfill.
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        Complete-K8ShakedownRunInSequence -Run $run | Out-Null
+        Remove-Item -LiteralPath (Get-K8CompletionRecordPath -RunId $run.RunId) -Force
+        Assert-K8FailsClosed -What 'completing a run that is in completed_runs with no completion record' -Because 'does not backfill' -Attempt {
+            Complete-K8ShakedownRunInSequence -Run $run
+        }
+        if (Test-K8RunHasCompletion -RunId $run.RunId) { throw 'the tooling backfilled a completion record' }
+    }
+}
+
+Assert-K8Test 'criterion 4: recovery refuses a completion record that belongs to a different run' {
+    Import-Module $CommonPath -Force
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        [void](Write-K8CompletionRecord -Run $run)
+        $path = Get-K8CompletionRecordPath -RunId $run.RunId
+        foreach ($field in 'run_id','sequence_id','tooling_head') {
+            $rec = (Get-Content -LiteralPath $path -Raw) | ConvertFrom-Json -AsHashtable
+            $good = $rec[$field]
+            $rec[$field] = 'not-this-run'
+            Set-Content -LiteralPath $path -Value (($rec | ConvertTo-Json -Depth 12) + "`n") -Encoding utf8NoBOM
+            Assert-K8FailsClosed -What "recovering from a completion record whose $field belongs to another run" -Because 'disagrees on' -Attempt {
+                Complete-K8ShakedownRunInSequence -Run $run
+            }
+            $rec[$field] = $good
+            Set-Content -LiteralPath $path -Value (($rec | ConvertTo-Json -Depth 12) + "`n") -Encoding utf8NoBOM
+        }
+        # And a foreign schema is refused too -- the record must have been
+        # written by this contract, not merely be JSON in the right place.
+        $rec = (Get-Content -LiteralPath $path -Raw) | ConvertFrom-Json -AsHashtable
+        $rec['schema'] = 'k8shakedown-termination/1'
+        Set-Content -LiteralPath $path -Value (($rec | ConvertTo-Json -Depth 12) + "`n") -Encoding utf8NoBOM
+        Assert-K8FailsClosed -What 'recovering from a record with the termination schema' -Because 'was not written by this contract' -Attempt {
+            Complete-K8ShakedownRunInSequence -Run $run
+        }
+    }
+}
+
+Assert-K8Test 'criterion 4: termination and completion exclude each other in BOTH directions' {
+    Import-Module $CommonPath -Force
+
+    # Existing direction (non-regression): a terminated run is never completed.
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        try {
+            Invoke-K8ShakedownRunBoundary -Run $run -ScriptBlock {
+                Set-K8ShakedownRunStage -Stage 'provision'; throw 'simulated failure'
+            }.GetNewClosure()
+        } catch { }
+        if (-not (Test-Path (Get-K8TerminationRecordPath -RunId $run.RunId))) { throw 'no termination record was written' }
+        if (Test-K8RunHasCompletion -RunId $run.RunId) { throw 'a terminated run acquired a completion record' }
+        Assert-K8FailsClosed -What 'completing a terminated run' -Because 'termination record' -Attempt {
+            Write-K8CompletionRecord -Run $run
+        }
+    }
+
+    # New direction: a completed run never acquires a termination record, on
+    # EITHER authoritative writer, and the existing record is left untouched.
+    Invoke-K8SequenceSandbox -Action {
+        param($sb)
+        New-K8QualificationSequence -RepoRoot $sb.Repo | Out-Null
+        $run = Start-K8ShakedownRun -Range a -RepoRoot $sb.Repo
+        Complete-K8ShakedownRunInSequence -Run $run | Out-Null
+        $before = (Get-FileHash -LiteralPath (Get-K8CompletionRecordPath -RunId $run.RunId) -Algorithm SHA256).Hash
+
+        Assert-K8FailsClosed -What 'the shared guard, on a completed run' -Because 'COMPLETION record' -Attempt {
+            Assert-K8RunNotCompleted -RunId $run.RunId -What 'a termination record'
+        }
+
+        Assert-K8FailsClosed -What 'writing an operator-close termination for a completed run' -Because 'COMPLETION record' -Attempt {
+            Write-K8OperatorCloseTermination -Sequence (Get-K8QualificationSequence) `
+                -ActiveRun ([ordered]@{ run_id = $run.RunId; tooling_head = $run.ToolingHead }) -Reason 'operator stopped'
+        }
+
+        if (Test-Path (Get-K8TerminationRecordPath -RunId $run.RunId)) { throw 'a termination record was written for a completed run' }
+        if ((Get-FileHash -LiteralPath (Get-K8CompletionRecordPath -RunId $run.RunId) -Algorithm SHA256).Hash -ne $before) {
+            throw 'the completion record was modified by a refused termination write'
+        }
+    }
+
+    # Every authoritative termination writer carries the guard. Found by
+    # enumerating the writers rather than by listing the two we remembered.
+    $source = Get-Content -LiteralPath $CommonPath -Raw
+    $writers = @([regex]::Matches($source, 'function\s+(Write-K8[A-Za-z]*Termination[A-Za-z]*)\s*\{') | ForEach-Object { $_.Groups[1].Value })
+    if ($writers.Count -lt 2) { throw "expected at least 2 termination writers, found $($writers.Count): $($writers -join ', ')" }
+    foreach ($w in $writers) {
+        $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name $w
+        if ($body -notmatch 'Assert-K8RunNotCompleted') { throw "$w does not guard against writing a termination for a completed run" }
+    }
+}
+
+Assert-K8Test 'criterion 4: the record is written before the sequence mutation, and only after final-verify' {
+    # Ordering, audited structurally rather than by observing one happy run.
+    $body = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Complete-K8ShakedownRunInSequence'
+    $write = $body.IndexOf('Write-K8CompletionRecord')
+    $mutate = $body.IndexOf("completed_runs']")
+    if ($write -lt 0)  { throw 'Complete-K8ShakedownRunInSequence does not write a completion record' }
+    if ($mutate -lt 0) { throw 'could not locate the completed_runs mutation' }
+    if ($write -gt $mutate) { throw 'the sequence is mutated before the completion record is written' }
+
+    # And at the Range A/B call site: final-verify -> identity snapshot -> complete.
+    $ab = Get-K8CommentStrippedFunctionBody -Path $CommonPath -Name 'Complete-K8ShakedownRangeABBody'
+    $verify   = $ab.IndexOf("'final-verify'")
+    $snapshot = $ab.IndexOf('Write-K8FinalizeIdentitySnapshot')
+    $complete = $ab.IndexOf('Complete-K8ShakedownRunInSequence')
+    if ($verify -lt 0 -or $snapshot -lt 0 -or $complete -lt 0) { throw 'could not locate the Range A/B completion ordering' }
+    if (-not ($verify -lt $snapshot -and $snapshot -lt $complete)) {
+        throw 'Range A/B ordering is not final-verify -> identity snapshot -> completion'
+    }
+}
+
 Assert-K8Test 'Close then start yields a distinct sequence at the new HEAD, back at Range A' {
     Import-Module $CommonPath -Force
     Invoke-K8SequenceSandbox -Action {
@@ -3889,12 +4142,16 @@ function Invoke-K8ContractValidate {
         [Parameter(Mandatory)] $Fixture,
         [Parameter(Mandatory)][string] $Range,
         [Parameter(Mandatory)] $Record,
-        [string] $SnapshotOverride
+        [string] $SnapshotOverride,
+        [string] $ScriptsDir
     )
     $inputPath = Join-Path $Fixture.Root ('input-' + [guid]::NewGuid().ToString('N') + '.json')
     ($Record | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $inputPath -Encoding utf8NoBOM
     $snapshot = $(if ($SnapshotOverride) { $SnapshotOverride } else { $Fixture.Snapshot })
-    $output = & python $ContractPy validate --range $Range --input $inputPath `
+    # --scripts-dir is a TOP-LEVEL option and must precede the subcommand.
+    $lead = @()
+    if ($ScriptsDir) { $lead = @('--scripts-dir', $ScriptsDir) }
+    $output = & python $ContractPy @lead validate --range $Range --input $inputPath `
         --run-evidence $Fixture.Evidence --finalize-snapshot $snapshot 2>&1
     return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Text = (@($output) -join "`n") }
 }
@@ -4085,23 +4342,90 @@ Assert-K8Test 'C-3: manifest coverage, digest drift and finalize-snapshot drift 
     finally { Remove-Item $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
-Assert-K8Test 'C-3: r_obs_05 = "Unresolved" is refused with the reason, and never quietly accepted' {
+Assert-K8Test 'C-3 / AMEND-004: the r_obs_05 domain is DERIVED from the shipped frozen apparatus, never listed' {
+    # This test used to assert a flat "Unresolved is refused". That was right
+    # for the reason, but the reason was not "the token is bad" -- it was "no
+    # frozen source fixes its propagation, so the scorer would silently drop
+    # it". AMEND-004 fixes the propagation. What decides this contract is
+    # therefore not the amendment but the frozen apparatus SHIPPED under
+    # Study01/, because that scorer is the one study01_score.py runs.
+    #
+    # So the contract derives the domain from that apparatus every time, and
+    # this test pins BOTH sides of the derivation rather than a fixed answer.
     $fixture = New-K8FinalizedFixture -Artifacts @{ 'collector-output\collector-response.json' = '{"hits":{}}' }
     try {
+        $semanticsPath = Join-Path $ScriptsDir 'study01\frozen\semantics.py'
+        $semantics = Get-Content -LiteralPath $semanticsPath -Raw
+        $shippedCarriesAmend004 = $semantics -match 'R_OBS_05_TO_RUNTIME_UNRESOLVED'
+
         $record = New-K8ValidScoringInput -Fixture $fixture -Range b
         $record['r_obs_05'] = 'Unresolved'
         $record.derivation['r_obs_05'].value = 'Unresolved'
         $result = Invoke-K8ContractValidate -Fixture $fixture -Range b -Record $record
-        if ($result.ExitCode -eq 0) { throw '"Unresolved" was accepted as a scoring token; no frozen source fixes its propagation' }
-        foreach ($needle in @('Unresolved', 'no frozen source fixes', "only == 'Fail'", 'C-5')) {
-            if ($result.Text -notmatch [regex]::Escape($needle)) { throw "the refusal does not explain '$needle': $($result.Text)" }
+
+        if ($shippedCarriesAmend004) {
+            # The apparatus carrying AMEND-004 is shipped: the token must be
+            # accepted, with no edit to the contract module.
+            if ($result.ExitCode -ne 0) {
+                throw "the shipped apparatus normalizes Unresolved, but C-3 refused it: $($result.Text)"
+            }
         }
-        # And the frozen scorer really does ignore every other token -- which is
-        # exactly why accepting one here would be a hidden semantic default.
-        $scorerSource = Get-Content (Join-Path $ScriptsDir 'study01\scorer.py') -Raw
-        $mentions = @([regex]::Matches($scorerSource, 'r_obs_05'))
-        if ($mentions.Count -ne 1) { throw "the frozen scorer now mentions r_obs_05 $($mentions.Count) times; the C-3 token domain must be re-derived from it" }
-        if ($scorerSource -notmatch 'r_obs_05"\)\s*==\s*"Fail"') { throw 'the frozen scorer no longer special-cases exactly r_obs_05 == "Fail"; the C-3 token domain must be re-derived' }
+        else {
+            # The shipped apparatus predates AMEND-004. Accepting the token here
+            # would let this input carry a value that scorer drops -- exactly the
+            # hidden semantics C3-R6 exists to stop.
+            if ($result.ExitCode -eq 0) {
+                throw 'C-3 accepted "Unresolved" while the SHIPPED frozen scorer still special-cases only == "Fail"'
+            }
+            # The refusal must name the real reason, so nobody reads it as the
+            # amendment being unrecognised.
+            foreach ($needle in @('AMEND-004', 'SHIPPED here predates', 'silently drops', 'C-5')) {
+                if ($result.Text -notmatch [regex]::Escape($needle)) { throw "the refusal does not explain '$needle': $($result.Text)" }
+            }
+            # And the shipped scorer really does ignore every other token.
+            $scorer = Get-Content -LiteralPath (Join-Path $ScriptsDir 'study01\scorer.py') -Raw
+            if ($scorer -notmatch 'r_obs_05"\)\s*==\s*"Fail"') {
+                throw 'the shipped scorer no longer special-cases exactly r_obs_05 == "Fail"; re-derive the C-3 domain'
+            }
+        }
+
+        # A token NO frozen source decides is refused either way. The gate is
+        # "the shipped scorer normalizes this", not "the list grew by one".
+        $undecided = New-K8ValidScoringInput -Fixture $fixture -Range b
+        $undecided['r_obs_05'] = 'Deferred'
+        $undecided.derivation['r_obs_05'].value = 'Deferred'
+        $bad = Invoke-K8ContractValidate -Fixture $fixture -Range b -Record $undecided
+        if ($bad.ExitCode -eq 0) { throw "'Deferred' was accepted; no frozen source fixes its propagation" }
+        if ($bad.Text -notmatch 'outside the accepted token domain') { throw "the refusal does not name the domain: $($bad.Text)" }
+
+        # The derivation is real, not a literal that happens to agree: point the
+        # contract at a COPY of the apparatus carrying AMEND-004 and the same
+        # input must be accepted, with this module unchanged. This is how the
+        # propagation is proven without touching Study01/, which is frozen and
+        # is criterion 11(a)'s byte-diff subject.
+        $tempScripts = Join-Path ([System.IO.Path]::GetTempPath()) ("k8-amend004-" + [guid]::NewGuid().ToString('N'))
+        try {
+            Copy-Item -Recurse -Force -Path $ScriptsDir -Destination $tempScripts
+            $copyPath = Join-Path $tempScripts 'study01\frozen\semantics.py'
+            if (-not (Get-Content -LiteralPath $copyPath -Raw | Select-String -SimpleMatch 'R_OBS_05_TO_RUNTIME_UNRESOLVED' -Quiet)) {
+                Add-Content -LiteralPath $copyPath -Value 'R_OBS_05_TO_RUNTIME_UNRESOLVED = {"Fail", "Unresolved"}' -Encoding utf8NoBOM
+            }
+            $withAmend = Invoke-K8ContractValidate -Fixture $fixture -Range b -Record $record -ScriptsDir $tempScripts
+            if ($withAmend.ExitCode -ne 0) {
+                throw "against an apparatus carrying AMEND-004, C-3 still refused 'Unresolved': $($withAmend.Text)"
+            }
+            # ...and 'Deferred' is STILL refused against that same apparatus, so
+            # the derivation widened by exactly what the scorer normalizes.
+            $stillBad = Invoke-K8ContractValidate -Fixture $fixture -Range b -Record $undecided -ScriptsDir $tempScripts
+            if ($stillBad.ExitCode -eq 0) { throw "'Deferred' was accepted against the AMEND-004 apparatus" }
+        }
+        finally { Remove-Item -LiteralPath $tempScripts -Recurse -Force -ErrorAction SilentlyContinue }
+
+        # Finally: the domain must not be a literal in this module at all.
+        $contractSource = Get-Content -LiteralPath (Join-Path $ToolsDir 'k8_scoring_input_contract.py') -Raw
+        if ($contractSource -match 'Field\("r_obs_05".*frozenset\(') {
+            throw 'the r_obs_05 domain is a literal set in the contract module; it must be derived from the shipped apparatus'
+        }
     }
     finally { Remove-Item $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue }
 }
