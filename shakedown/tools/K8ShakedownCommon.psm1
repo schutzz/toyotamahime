@@ -708,6 +708,177 @@ function Get-K8ImmutableBase {
     }
 }
 
+function Test-K8FrozenPathIdentity {
+    <#
+        C-9 / criterion 11(a) has two subjects which must not be collapsed.
+
+        Historical commits are compared byte-for-byte with the fixed v4 base.
+        An amended candidate is different by definition, so its exact commit
+        is checked against the candidate attestation's closed delta and tree
+        bindings.  Whether the attestation is accepted remains the formal
+        candidate verifier's responsibility; this function only proves that
+        C-9 did not silently replace that verifier with a moving baseline or
+        an open-ended exception.
+
+        Candidate mode deliberately requires Revision to be a 40-hex commit.
+        A branch name or HEAD is not a candidate identity.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Repository,
+        [Parameter(Mandatory)][string] $Revision
+    )
+
+    $repo = [System.IO.Path]::GetFullPath($Repository)
+    $base = Get-K8ImmutableBase
+    if ($base.Commit -notmatch '^[0-9a-f]{40}$') {
+        throw "C-9 frozen identity: immutable historical base is not a 40-hex commit: '$($base.Commit)'."
+    }
+
+    function Invoke-IdentityGit {
+        param([Parameter(Mandatory)][string[]] $Arguments)
+        $text = (& git -C $repo @Arguments 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) {
+            throw "C-9 frozen identity: git $($Arguments -join ' ') failed (exit $LASTEXITCODE): $text"
+        }
+        return $text
+    }
+
+    $baseType = Invoke-IdentityGit @('cat-file', '-t', $base.Commit)
+    if ($baseType -ne 'commit') {
+        throw "C-9 frozen identity: immutable historical base $($base.Commit) is '$baseType', not a commit."
+    }
+    $commit = Invoke-IdentityGit @('rev-parse', '--verify', "$Revision^{commit}")
+    if ($commit -notmatch '^[0-9a-f]{40}$') {
+        throw "C-9 frozen identity: revision '$Revision' did not resolve to a 40-hex commit."
+    }
+    & git -C $repo merge-base --is-ancestor $base.Commit $commit 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "C-9 frozen identity: immutable historical base $($base.Commit) is not an ancestor of $commit."
+    }
+
+    $diffArguments = @('diff', '--name-only', $base.Commit, $commit, '--') + @($base.FrozenPaths)
+    $diffText = Invoke-IdentityGit $diffArguments
+    $observed = @($diffText -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($observed.Count -eq 0) {
+        return [ordered]@{
+            mode = 'historical-fixed-base'
+            historical_base_commit = $base.Commit
+            subject_commit = $commit
+            observed_delta = @()
+            candidate_verification = 'not-required'
+        }
+    }
+
+    if ($Revision -notmatch '^[0-9a-f]{40}$' -or $Revision -ne $commit) {
+        throw "C-9 frozen identity: amended candidate mode requires its exact 40-hex commit, not '$Revision'."
+    }
+
+    $attestationPath = 'docs/k8-study01-amended-candidate-attestation.json'
+    try {
+        $attestationText = Invoke-IdentityGit @('show', "$commit`:$attestationPath")
+        $attestation = $attestationText | ConvertFrom-Json -AsHashtable -Depth 100
+    }
+    catch {
+        throw "C-9 frozen identity: frozen paths differ from historical v4, but candidate authority is missing or malformed at $commit`:$attestationPath -- $($_.Exception.Message)"
+    }
+    if ($attestation['schema'] -ne 'study01-amended-candidate-attestation/1') {
+        throw "C-9 frozen identity: candidate attestation schema is '$($attestation['schema'])'."
+    }
+    if ($attestation['base_release_commit'] -ne $base.Commit) {
+        throw "C-9 frozen identity: candidate attestation base_release_commit is not the fixed historical base $($base.Commit)."
+    }
+    foreach ($field in 'source_kakuriyo_commit', 'subject_study01_tree') {
+        if ([string]$attestation[$field] -notmatch '^[0-9a-f]{40}$') {
+            throw "C-9 frozen identity: candidate attestation field '$field' is not a 40-hex identity."
+        }
+    }
+    $studyTree = Invoke-IdentityGit @('rev-parse', "$commit`:Study01")
+    if ($attestation['subject_study01_tree'] -ne $studyTree) {
+        throw "C-9 frozen identity: attestation subject_study01_tree does not bind $commit`:Study01."
+    }
+
+    $authority = $attestation['transcription_authority']
+    if ($authority -isnot [System.Collections.IDictionary]) {
+        throw 'C-9 frozen identity: candidate transcription_authority is missing or malformed.'
+    }
+    foreach ($field in 'review_subject_commit', 'review_record_commit', 'review_record_blob') {
+        if ([string]$authority[$field] -notmatch '^[0-9a-f]{40}$') {
+            throw "C-9 frozen identity: transcription_authority field '$field' is not a 40-hex identity."
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$authority['review_record_path'])) {
+        throw 'C-9 frozen identity: transcription_authority review_record_path is missing.'
+    }
+    $acceptedBlobs = @{}
+    foreach ($row in @($authority['accepted_blobs'])) {
+        if ($row -isnot [System.Collections.IDictionary] -or [string]::IsNullOrWhiteSpace([string]$row['path']) -or [string]$row['blob'] -notmatch '^[0-9a-f]{40}$') {
+            throw 'C-9 frozen identity: transcription_authority accepted_blobs is malformed.'
+        }
+        if ($acceptedBlobs.ContainsKey([string]$row['path'])) { throw "C-9 frozen identity: duplicate accepted blob path '$($row['path'])'." }
+        $acceptedBlobs[[string]$row['path']] = [string]$row['blob']
+    }
+    $acceptedEntries = @{}
+    foreach ($row in @($authority['accepted_amendment_entries'])) {
+        if ($row -isnot [System.Collections.IDictionary] -or [string]::IsNullOrWhiteSpace([string]$row['amendment_id']) -or [string]$row['entry_digest'] -notmatch '^[0-9a-f]{64}$') {
+            throw 'C-9 frozen identity: transcription_authority accepted_amendment_entries is malformed.'
+        }
+        $acceptedEntries[[string]$row['amendment_id']] = [string]$row['entry_digest']
+    }
+
+    $listed = @{}
+    foreach ($row in @($attestation['amendment_transcription'])) {
+        if ($row -isnot [System.Collections.IDictionary]) { throw 'C-9 frozen identity: amendment_transcription row is malformed.' }
+        $path = [string]$row['toyotamahime_path']
+        $sourcePath = [string]$row['kakuriyo_path']
+        $amendment = [string]$row['amendment_id']
+        if ([string]::IsNullOrWhiteSpace($path) -or [string]::IsNullOrWhiteSpace($sourcePath) -or -not $acceptedEntries.ContainsKey($amendment)) {
+            throw "C-9 frozen identity: amendment_transcription row '$path' is not bound to accepted amendment-entry authority."
+        }
+        if ($path -match '^Study01/studies/.+/scripts/' -and (-not $acceptedBlobs.ContainsKey($sourcePath) -or $acceptedBlobs[$sourcePath] -ne [string]$row['new_blob'])) {
+            throw "C-9 frozen identity: code-bearing candidate path '$path' is not bound to transcription_authority.accepted_blobs."
+        }
+        if ($listed.ContainsKey($path)) { throw "C-9 frozen identity: candidate delta path '$path' is listed more than once." }
+        $listed[$path] = $row
+    }
+    foreach ($row in @($attestation['publication_binding'])) {
+        if ($row -isnot [System.Collections.IDictionary] -or $row['change_class'] -ne 'publication_binding') {
+            throw 'C-9 frozen identity: publication_binding row is malformed.'
+        }
+        $path = [string]$row['toyotamahime_path']
+        if ([string]::IsNullOrWhiteSpace($path) -or $listed.ContainsKey($path)) {
+            throw "C-9 frozen identity: publication candidate path '$path' is empty or duplicated."
+        }
+        $listed[$path] = $row
+    }
+
+    $observedSet = @($observed | Sort-Object -Unique)
+    $listedSet = @($listed.Keys | Sort-Object -Unique)
+    if (@($observedSet | Where-Object { $_ -match '^Study01/(claims|expected)(/|$)' }).Count -gt 0) {
+        throw 'C-9 frozen identity: candidate changes historical Study01 claims or expected state.'
+    }
+    if (($observedSet -join "`n") -ne ($listedSet -join "`n")) {
+        throw "C-9 frozen identity: observed candidate delta is not the attestation's closed delta.`nobserved: $($observedSet -join ', ')`nlisted: $($listedSet -join ', ')"
+    }
+    foreach ($path in $listedSet) {
+        $row = $listed[$path]
+        $baseBlob = Invoke-IdentityGit @('rev-parse', "$($base.Commit)`:$path")
+        $newBlob = Invoke-IdentityGit @('rev-parse', "$commit`:$path")
+        if ($row['base_blob'] -ne $baseBlob -or $row['new_blob'] -ne $newBlob) {
+            throw "C-9 frozen identity: attested base/new blob binding does not match '$path'."
+        }
+    }
+
+    return [ordered]@{
+        mode = 'amended-candidate-delegated'
+        historical_base_commit = $base.Commit
+        subject_commit = $commit
+        subject_study01_tree = $studyTree
+        observed_delta = $observedSet
+        candidate_verification = 'required'
+    }
+}
+
 function Get-K8ProducerSourcePin {
     <#
         A COPY, for the same reason as Get-K8ImmutableBase.
@@ -4300,6 +4471,18 @@ $script:K8CommandContract = @(
        argv_shape = @('git','-C','<worktree>','status','--porcelain')
        stream_expectation = 'separated'; accepted_exit_codes = @(0)
        exit_note = 'Cleanliness of a Range C worktree AS AN OBSERVATION. Empty stdout means clean; unlike C-46 the result is retained, not used as a gate.' }
+
+    @{ step_id = 'C-71'; class = 'C'; ranges = 'abc'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-IdentityGit'; callee = 'git'; call_ordinal = 1
+       argv_shape = @('git','-C','<repo>','<identity-query>')
+       stream_expectation = 'combined'; accepted_exit_codes = @(0)
+       exit_note = 'C-9 dual-anchor identity queries. The helper accepts only exit 0 and fails closed for object resolution, diff, and attestation reads; the exact query set is constrained by Test-K8FrozenPathIdentity, not operator input.' }
+
+    @{ step_id = 'C-72'; class = 'C'; ranges = 'abc'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Test-K8FrozenPathIdentity'; callee = 'git'; call_ordinal = 1
+       argv_shape = @('git','-C','<repo>','merge-base','--is-ancestor','<historical-base>','<subject-commit>')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0, 1)
+       exit_note = '0 confirms ancestry; 1 is the observed negative and is converted into a focused C-9 STOP. Neither result changes the fixed historical base.' }
 
     @{ step_id = 'C-61'; class = 'C'; ranges = 'abc'
        source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Get-K8SourceIdentity'; callee = "'git'"; call_ordinal = 1

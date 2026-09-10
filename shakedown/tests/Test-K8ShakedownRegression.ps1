@@ -20,9 +20,10 @@
       5. Range C runner does not throw on validator exit 1 (the expected,
          not-forced outcome).
       6. Fail-closed readiness/image/finalize ordering and mechanical evidence gates.
-      7. Study01/ is byte-for-byte unmodified versus the FIXED immutable base
-         commit (C-9 / criterion 11(a)) -- not versus a moving ref, and without
-         a fetch whose failure could go unnoticed.
+      7. C-9 / criterion 11(a) keeps the historical Study01 identity bound to
+         the FIXED immutable base, while an amended candidate must supply an
+         exact commit and a closed, blob-bound attestation for delegation to
+         formal candidate verification. No moving ref or fetch is accepted.
       8. Elasticsearch application-readiness gate (the curl-exit-7 root-cause
          fix): runs before capture/trigger, shared by Range A and Range B from
          one call site, has a finite timeout, and is structurally distinct
@@ -123,6 +124,34 @@ function Reset-K8TestSourcePin {
     if ($null -ne $script:K8SavedSourcePin) {
         & (Get-Module K8ShakedownCommon) { param($p) $script:K8ProducerSourcePin = $p } $script:K8SavedSourcePin
         $script:K8SavedSourcePin = $null
+    }
+}
+
+# The immutable-base test seam follows the source-pin seam above: tests may
+# point the existing gate at a synthetic repository, but production exposes no
+# setter and retains the historical v4 pin.  The saved value is harness-side.
+$script:K8SavedImmutableBase = $null
+function Set-K8TestImmutableBase {
+    param(
+        [Parameter(Mandatory)][string] $Commit,
+        [Parameter(Mandatory)][string[]] $FrozenPaths
+    )
+    $previous = & (Get-Module K8ShakedownCommon) {
+        param($commit, $paths)
+        $prev = $script:K8ImmutableBase
+        $script:K8ImmutableBase = @{
+            Commit = $commit
+            Description = 'synthetic C-9 dual-anchor fixture'
+            FrozenPaths = @($paths)
+        }
+        $prev
+    } $Commit $FrozenPaths
+    if ($null -eq $script:K8SavedImmutableBase) { $script:K8SavedImmutableBase = $previous }
+}
+function Reset-K8TestImmutableBase {
+    if ($null -ne $script:K8SavedImmutableBase) {
+        & (Get-Module K8ShakedownCommon) { param($b) $script:K8ImmutableBase = $b } $script:K8SavedImmutableBase
+        $script:K8SavedImmutableBase = $null
     }
 }
 
@@ -5351,14 +5380,15 @@ Assert-K8Test 'C-8: the contract is a single data structure, and every row state
     # retention adds three more: C-68 (the dependency probe) and C-69 / C-70
     # (worktree head and status observed FOR RETENTION -- deliberately separate
     # rows from C-03 and C-46, which run the same commands to GATE). So the
-    # closed world is 110 (F 37 / C 70 / I 3). The count is asserted per class,
+    # C-9 dual-anchor identity adds C-71 / C-72. The closed world is therefore
+    # 112 (F 37 / C 72 / I 3). The count is asserted per class,
     # not in total, so a row moving between classes cannot hide in an
     # unchanged sum.
-    if ($rows.Count -ne 110) { throw "expected 110 process-site rows, got $($rows.Count)" }
+    if ($rows.Count -ne 112) { throw "expected 112 process-site rows, got $($rows.Count)" }
     $byClass = @{}
     foreach ($c in 'F', 'C', 'I') { $byClass[$c] = @($rows | Where-Object { $_.class -eq $c }).Count }
-    if ($byClass['F'] -ne 37 -or $byClass['C'] -ne 70 -or $byClass['I'] -ne 3) {
-        throw "class split is F=$($byClass['F']) C=$($byClass['C']) I=$($byClass['I']); Batch 3A fixes F=37 I=3, Batch 3B raises C to 67, and Range C environment retention raises it to 70"
+    if ($byClass['F'] -ne 37 -or $byClass['C'] -ne 72 -or $byClass['I'] -ne 3) {
+        throw "class split is F=$($byClass['F']) C=$($byClass['C']) I=$($byClass['I']); Batch 3A fixes F=37 I=3, Batch 3B raises C to 67, Range C environment retention raises it to 70, and C-9 dual-anchor identity raises it to 72"
     }
     if (@($rows.step_id | Sort-Object -Unique).Count -ne $rows.Count) { throw 'step_id values are not unique' }
     foreach ($r in $rows) {
@@ -7080,68 +7110,167 @@ Assert-K8Test 'C-9: bundle path membership uses a separator boundary, not a bare
     finally { Remove-Item $base -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
-Assert-K8Test 'C-9: the frozen-path comparison uses a FIXED immutable base, resolved without fetching' {
-    # criterion 11(a) names a fixed immutable base commit. The check this
-    # replaces compared against origin/main and swallowed its own fetch
-    # failure; both are recorded in the module beside the pin.
-    $base = Get-K8ImmutableBase
-    if ($base.Commit -notmatch '^[0-9a-f]{40}$') { throw "the immutable base pin is not a 40-hex commit: '$($base.Commit)'" }
-
-    Push-Location $RepoRoot
-    try {
-        # (1) The pin must be a real commit object IN THIS CLONE. A pin that
-        #     only resolves after a fetch would put the check back on the
-        #     network, which is half of what was wrong before.
-        $type = (git cat-file -t $base.Commit 2>&1 | Out-String).Trim()
-        if ($LASTEXITCODE -ne 0 -or $type -ne 'commit') { throw "immutable base $($base.Commit) does not resolve to a commit object without fetching (got '$type', exit $LASTEXITCODE)" }
-
-        # (2) It must be an ANCESTOR of HEAD. A valid-but-unrelated SHA would
-        #     otherwise compare two points that merely happen to agree.
-        git merge-base --is-ancestor $base.Commit HEAD 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "immutable base $($base.Commit) is not an ancestor of HEAD; comparing against it would not establish that the frozen paths never moved from the base this branch descends from" }
-
-        # (3) The comparison itself.
-        $diff = (git diff --stat $base.Commit -- @($base.FrozenPaths) 2>&1 | Out-String).Trim()
-        if ($diff) { throw "frozen paths differ from the immutable base $($base.Commit):`n$diff" }
-    }
-    finally { Pop-Location }
-
-    # (4) The DECIDING CODE must not have reacquired a moving ref or a fetch.
-    #     Scoped to this check's own block: prose elsewhere may legitimately
-    #     name the defect it descends from, and banning the words there would
-    #     only make the record less legible (same narrowing C-8 needed).
-    $src = Get-Content $PSCommandPath -Raw
-    $marker = "Assert-K8Test 'C-9: the frozen-path comparison uses a FIXED immutable base"
-    $start = $src.IndexOf($marker)
-    $next = $src.IndexOf("Assert-K8Test '", $start + $marker.Length)
-    if ($next -lt 0) { $next = $src.Length }
-    $body = $src.Substring($start, $next - $start)
-    # Scan the CODE, not the prose. A comment may legitimately name the defect
-    # this check descends from -- that is documentation, and banning the words
-    # there would only make the record less legible. The audit line itself also
-    # necessarily contains the literals it bans, and it is a comment-free line,
-    # so it is excluded by position.
-    $auditAt = $body.IndexOf('$auditAt')
-    if ($auditAt -gt 0) { $body = $body.Substring(0, $auditAt) }
-    $code = (($body -split "`n") | Where-Object { $_.TrimStart() -notmatch '^#' }) -join "`n"
-    foreach ($banned in 'origin/main', 'git fetch') {
-        if ($code -match [regex]::Escape($banned)) { throw "the frozen-path check's deciding code references '$banned'; criterion 11(a) requires a fixed base resolved locally" }
-    }
+function Invoke-K8DualAnchorFixtureGit {
+    param([Parameter(Mandatory)][string] $Repo, [Parameter(Mandatory)][string[]] $Arguments)
+    $text = (& git -C $Repo @Arguments 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "fixture git $($Arguments -join ' ') failed: $text" }
+    return $text
 }
 
-Assert-K8Test 'C-9: changing a frozen byte is caught by the immutable-base comparison (the check is not vacuous)' {
-    $base = Get-K8ImmutableBase
-    $victim = Join-Path $RepoRoot 'Study01\README.md'
-    $original = [System.IO.File]::ReadAllBytes($victim)
-    Push-Location $RepoRoot
-    try {
-        [System.IO.File]::WriteAllBytes($victim, ($original + [byte]0x0A))
-        $diff = (git diff --stat $base.Commit -- @($base.FrozenPaths) 2>&1 | Out-String).Trim()
-        if (-not $diff) { throw 'a modified frozen file produced no diff against the immutable base; the comparison is vacuous' }
+function New-K8DualAnchorFixture {
+    param(
+        [ValidateSet('valid','extra','claims','expected','missing','malformed','blob-mismatch')]
+        [string] $Case = 'valid'
+    )
+    $repo = Join-Path $SuiteRoot ('dual-anchor-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $repo | Out-Null
+    Invoke-K8DualAnchorFixtureGit $repo @('init', '-q') | Out-Null
+    Invoke-K8DualAnchorFixtureGit $repo @('config', 'user.name', 'k8 test') | Out-Null
+    Invoke-K8DualAnchorFixtureGit $repo @('config', 'user.email', 'k8@test.local') | Out-Null
+
+    $codePath = 'Study01/studies/study-01-negative-result/scripts/study01/frozen/semantics.py'
+    $sourcePath = 'studies/study-01-negative-result/scripts/study01/frozen/semantics.py'
+    $publicationPath = 'bootstrap/Start-Study01.ps1'
+    foreach ($path in @($codePath, $publicationPath, 'Study01/README.md', 'Study01/claims/claim.md',
+            'Study01/expected/result.json', 'bootstrap/README.md', 'docs/k8-packaging-certification.md')) {
+        $full = Join-Path $repo $path
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $full) | Out-Null
+        "historical $path" | Set-Content -LiteralPath $full -Encoding utf8NoBOM
     }
-    finally {
-        [System.IO.File]::WriteAllBytes($victim, $original)
-        Pop-Location
+    Invoke-K8DualAnchorFixtureGit $repo @('add', '--all') | Out-Null
+    Invoke-K8DualAnchorFixtureGit $repo @('commit', '-q', '-m', 'historical fixed base') | Out-Null
+    $base = Invoke-K8DualAnchorFixtureGit $repo @('rev-parse', 'HEAD')
+    $baseCodeBlob = Invoke-K8DualAnchorFixtureGit $repo @('rev-parse', "$base`:$codePath")
+    $basePublicationBlob = Invoke-K8DualAnchorFixtureGit $repo @('rev-parse', "$base`:$publicationPath")
+
+    'accepted amended semantics' | Set-Content -LiteralPath (Join-Path $repo $codePath) -Encoding utf8NoBOM
+    'candidate bootstrap binding' | Set-Content -LiteralPath (Join-Path $repo $publicationPath) -Encoding utf8NoBOM
+    switch ($Case) {
+        'extra' { 'unlisted drift' | Set-Content -LiteralPath (Join-Path $repo 'Study01/README.md') -Encoding utf8NoBOM }
+        'claims' { 'mutated claim' | Set-Content -LiteralPath (Join-Path $repo 'Study01/claims/claim.md') -Encoding utf8NoBOM }
+        'expected' { 'mutated expected' | Set-Content -LiteralPath (Join-Path $repo 'Study01/expected/result.json') -Encoding utf8NoBOM }
+    }
+    Invoke-K8DualAnchorFixtureGit $repo @('add', '--all') | Out-Null
+    $candidateTree = Invoke-K8DualAnchorFixtureGit $repo @('write-tree')
+    $studyTree = Invoke-K8DualAnchorFixtureGit $repo @('rev-parse', "$candidateTree`:Study01")
+    $newCodeBlob = Invoke-K8DualAnchorFixtureGit $repo @('rev-parse', ":$codePath")
+    $newPublicationBlob = Invoke-K8DualAnchorFixtureGit $repo @('rev-parse', ":$publicationPath")
+    if ($Case -eq 'blob-mismatch') { $newCodeBlob = '0000000000000000000000000000000000000000' }
+
+    $attestation = [ordered]@{
+        schema = 'study01-amended-candidate-attestation/1'
+        subject_study01_tree = $studyTree
+        base_release_commit = $base
+        source_kakuriyo_commit = ('1' * 40)
+        applied_amendments = @('AMEND-004')
+        not_applied_amendments = @()
+        transcription_authority = [ordered]@{
+            review_subject_commit = ('2' * 40)
+            review_record_commit = ('3' * 40)
+            review_record_path = 'synthetic/independent-review.md'
+            review_record_blob = ('4' * 40)
+            accepted_blobs = @([ordered]@{ path = $sourcePath; blob = $newCodeBlob })
+            accepted_amendment_entries = @([ordered]@{ amendment_id = 'AMEND-004'; entry_digest = ('5' * 64) })
+        }
+        amendment_transcription = @([ordered]@{
+            toyotamahime_path = $codePath
+            kakuriyo_path = $sourcePath
+            base_blob = $baseCodeBlob
+            new_blob = $newCodeBlob
+            amendment_id = 'AMEND-004'
+        })
+        publication_binding = @([ordered]@{
+            toyotamahime_path = $publicationPath
+            base_blob = $basePublicationBlob
+            new_blob = $newPublicationBlob
+            change_class = 'publication_binding'
+        })
+    }
+    $attestationPath = Join-Path $repo 'docs/k8-study01-amended-candidate-attestation.json'
+    if ($Case -eq 'malformed') { '{' | Set-Content -LiteralPath $attestationPath -Encoding utf8NoBOM }
+    elseif ($Case -ne 'missing') { $attestation | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $attestationPath -Encoding utf8NoBOM }
+    Invoke-K8DualAnchorFixtureGit $repo @('add', '--all') | Out-Null
+    Invoke-K8DualAnchorFixtureGit $repo @('commit', '-q', '-m', "candidate $Case") | Out-Null
+    $candidate = Invoke-K8DualAnchorFixtureGit $repo @('rev-parse', 'HEAD')
+    return [pscustomobject]@{ Repo = $repo; Base = $base; Candidate = $candidate }
+}
+
+Assert-K8Test 'C-9 dual-anchor: historical v4 identity remains fixed and requires no candidate authority' {
+    $f = New-K8DualAnchorFixture
+    try {
+        Set-K8TestImmutableBase -Commit $f.Base -FrozenPaths @('Study01','bootstrap','docs/k8-packaging-certification.md')
+        $result = Test-K8FrozenPathIdentity -Repository $f.Repo -Revision $f.Base
+        if ($result.mode -ne 'historical-fixed-base') { throw "historical identity resolved as '$($result.mode)'" }
+    }
+    finally { Reset-K8TestImmutableBase }
+}
+
+Assert-K8Test 'C-9 dual-anchor: a moving ref cannot replace the fixed historical base' {
+    $f = New-K8DualAnchorFixture
+    try {
+        Set-K8TestImmutableBase -Commit 'refs/heads/main' -FrozenPaths @('Study01','bootstrap')
+        Assert-K8FailsClosed -What 'using a moving historical base' -Because '40-hex' -Attempt {
+            Test-K8FrozenPathIdentity -Repository $f.Repo -Revision $f.Candidate | Out-Null
+        }
+    }
+    finally { Reset-K8TestImmutableBase }
+}
+
+Assert-K8Test 'C-9 dual-anchor: a valid attested candidate-shaped delta is delegated to formal candidate verification' {
+    $f = New-K8DualAnchorFixture
+    try {
+        Set-K8TestImmutableBase -Commit $f.Base -FrozenPaths @('Study01','bootstrap','docs/k8-packaging-certification.md')
+        $result = Test-K8FrozenPathIdentity -Repository $f.Repo -Revision $f.Candidate
+        if ($result.mode -ne 'amended-candidate-delegated' -or $result.candidate_verification -ne 'required') {
+            throw 'candidate was not explicitly delegated to formal candidate verification'
+        }
+    }
+    finally { Reset-K8TestImmutableBase }
+}
+
+foreach ($case in @(
+    @{ Name='an arbitrary extra frozen byte'; Case='extra'; Because='closed delta' },
+    @{ Name='a claims mutation'; Case='claims'; Because='claims or expected' },
+    @{ Name='an expected mutation'; Case='expected'; Because='claims or expected' },
+    @{ Name='missing candidate authority'; Case='missing'; Because='authority is missing or malformed' },
+    @{ Name='malformed candidate authority'; Case='malformed'; Because='authority is missing or malformed' },
+    @{ Name='a listed blob that does not bind the candidate byte'; Case='blob-mismatch'; Because='base/new blob binding' }
+)) {
+    Assert-K8Test "C-9 dual-anchor: $($case.Name) fails closed" {
+        $item = $case
+        $f = New-K8DualAnchorFixture -Case $item.Case
+        try {
+            Set-K8TestImmutableBase -Commit $f.Base -FrozenPaths @('Study01','bootstrap','docs/k8-packaging-certification.md')
+            Assert-K8FailsClosed -What $item.Name -Because $item.Because -Attempt {
+                Test-K8FrozenPathIdentity -Repository $f.Repo -Revision $f.Candidate | Out-Null
+            }
+        }
+        finally { Reset-K8TestImmutableBase }
+    }.GetNewClosure()
+}
+
+Assert-K8Test 'C-9 dual-anchor: candidate mode rejects a moving or unresolvable subject identity' {
+    $f = New-K8DualAnchorFixture
+    try {
+        Set-K8TestImmutableBase -Commit $f.Base -FrozenPaths @('Study01','bootstrap','docs/k8-packaging-certification.md')
+        Assert-K8FailsClosed -What 'using HEAD as candidate identity' -Because 'exact 40-hex commit' -Attempt {
+            Test-K8FrozenPathIdentity -Repository $f.Repo -Revision HEAD | Out-Null
+        }
+        Assert-K8FailsClosed -What 'using an unresolvable candidate identity' -Because 'failed' -Attempt {
+            Test-K8FrozenPathIdentity -Repository $f.Repo -Revision ('f' * 40) | Out-Null
+        }
+    }
+    finally { Reset-K8TestImmutableBase }
+}
+
+Assert-K8Test 'C-9 dual-anchor: deciding code contains no moving-ref, fetch, or candidate-truth second source' {
+    $src = Get-Content $script:CommonPath -Raw
+    $start = $src.IndexOf('function Test-K8FrozenPathIdentity')
+    $next = $src.IndexOf("`nfunction ", $start + 1)
+    if ($start -lt 0 -or $next -lt 0) { throw 'could not isolate Test-K8FrozenPathIdentity source' }
+    $body = $src.Substring($start, $next - $start)
+    foreach ($banned in 'origin/main', 'git fetch', '573b217c', 'k8s2-candidate-', 'k8-bootstrap-v5') {
+        if ($body -match [regex]::Escape($banned)) { throw "candidate identity gate embeds prohibited production truth '$banned'" }
     }
 }
 
