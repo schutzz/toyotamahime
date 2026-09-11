@@ -1,0 +1,147 @@
+{
+  "schema": "study01-amended-candidate-attestation/1",
+  "subject_study01_tree": "573b217c1368858e687799867953ab703a507526",
+  "base_study01_tree": "a30db0c6697168d1b9d92b4c0977540255530a8f",
+  "base_release": "k8-bootstrap-v4",
+  "base_release_commit": "91ba5d2f7709a8938ef00fed1bcfd10c14181c8b",
+  "source_kakuriyo_commit": "8873aeeb2837b357fa39fd4b36e3b265d8eea9d5",
+  "base_kakuriyo_commit": "f0df3e1f7ddf76e5a7e394628337f1b578801859",
+  "applied_amendments": [
+    "AMEND-001",
+    "AMEND-002",
+    "AMEND-003",
+    "AMEND-004"
+  ],
+  "not_applied_amendments": [],
+  "intended_release_tag": "k8-bootstrap-v5",
+  "transcription_authority": {
+    "review_subject_commit": "3b6d6dc63a7d65ec6a3d78d0f3cd9fc5bddc6c35",
+    "review_record_commit": "df7d3c5f27f4726fabdfea2566030f88fde4f780",
+    "review_record_path": "studies/study-01-negative-result/K8-S2-AMEND-004-SCORER-TRANSCRIPTION-EXACT-COMMIT-INDEPENDENT-REVIEW.md",
+    "review_record_blob": "2ba4f24dec7c4b691dae2b569ede294cbc2176de",
+    "regression_command": "python -m pytest studies/study-01-negative-result/scripts/tests -q",
+    "regression_result": "410 passed / 2 skipped / 40 subtests passed / exit 0",
+    "regression_observed_at": "accepted_transcription_subject 3b6d6dc63a7d65ec6a3d78d0f3cd9fc5bddc6c35 clean worktree",
+    "accepted_blobs": [
+      {
+        "path": "studies/study-01-negative-result/protocol/amendments.md",
+        "blob": "4795b864ff16571a2c112c2efdfb5e32dcbbb987"
+      },
+      {
+        "path": "studies/study-01-negative-result/scripts/study01/frozen/semantics.py",
+        "blob": "931394d66405abeb4fd13805f2fb9257999e34ac"
+      },
+      {
+        "path": "studies/study-01-negative-result/scripts/study01/scorer.py",
+        "blob": "bce3eb1bf7082a1a56ba5c79c5ded7416652e7f1"
+      },
+      {
+        "path": "studies/study-01-negative-result/scripts/tests/test_phase1.py",
+        "blob": "27210fd98d3b59c0d12204bde2d2fd552fb6cd92"
+      }
+    ],
+    "accepted_amendment_entries": [
+      {
+        "amendment_id": "AMEND-001",
+        "entry_digest": "1911f79a156307cdda3975b068443b10ceb1a62726fcec881937b305db8be1fb"
+      },
+      {
+        "amendment_id": "AMEND-002",
+        "entry_digest": "3e15d4b913356a99520b11c5e4e3589959865f259964feeeecb26299276a3419"
+      },
+      {
+        "amendment_id": "AMEND-003",
+        "entry_digest": "719473dde469b9fd6448d733a1e2c16eba02d5456c6a23f5e494a1c671310c3f"
+      },
+      {
+        "amendment_id": "AMEND-004",
+        "entry_digest": "7067337ce90f89ad6aa1dd322dbba4fafca0e8db018ce6ac52655b2d317007d6"
+      }
+    ],
+    "accepted_amendments_blob": "4795b864ff16571a2c112c2efdfb5e32dcbbb987",
+    "source_ancestry": {
+      "ancestor_commit": "3b6d6dc63a7d65ec6a3d78d0f3cd9fc5bddc6c35",
+      "descendant_commit": "8873aeeb2837b357fa39fd4b36e3b265d8eea9d5",
+      "is_ancestor": true
+    }
+  },
+  "amendment_transcription": [
+    {
+      "toyotamahime_path": "Study01/studies/study-01-negative-result/protocol/amendments.md",
+      "kakuriyo_path": "studies/study-01-negative-result/protocol/amendments.md",
+      "base_blob": "09aaae6bca0d69350e88427aee885d9681b89b9e",
+      "new_blob": "cbbb2da381262194b5fb500ae6c51f9375806c8c",
+      "base_sha256": "678e88f545c6d09d3908b1c513083529722e1bd9ce5fd1a1c11a2e4c494dcfe5",
+      "new_sha256": "0691dcd77c67152bbe968bc54b98a6dcf165cd538f9354e3669673bbf54fd881",
+      "amendment_id": "AMEND-004",
+      "transcribed_clause": "AMEND-004 normative entry and the corrected current-entry count"
+    },
+    {
+      "toyotamahime_path": "Study01/studies/study-01-negative-result/scripts/study01/frozen/semantics.py",
+      "kakuriyo_path": "studies/study-01-negative-result/scripts/study01/frozen/semantics.py",
+      "base_blob": "4ae5f1f892df83b7911c9b958d2dcf79be6ffce9",
+      "new_blob": "931394d66405abeb4fd13805f2fb9257999e34ac",
+      "base_sha256": "a3f6ccba59acc30b80cf91d10d989d44c06e7c731f31cf53a0bb3db280adc2f2",
+      "new_sha256": "33ee084ac0b4107bb64e1a1759a96907c0e34d92b24d2d3a90cd5d8af812f315",
+      "amendment_id": "AMEND-004",
+      "transcribed_clause": "Range B R-OBS-05 Fail and Unresolved observations normalize Runtime contract to Unresolved while remaining distinct observations"
+    },
+    {
+      "toyotamahime_path": "Study01/studies/study-01-negative-result/scripts/study01/scorer.py",
+      "kakuriyo_path": "studies/study-01-negative-result/scripts/study01/scorer.py",
+      "base_blob": "1a1132e6906c70dadff6f9bb590f38775f2f6733",
+      "new_blob": "bce3eb1bf7082a1a56ba5c79c5ded7416652e7f1",
+      "base_sha256": "1aa648e6126cd58c722e8e0dc4a829f2684a2754f80917813fef1b6bf88e4468",
+      "new_sha256": "464506b8c88fb0da93e29fce6155bdede3a0bc844cee49f3279079195906590c",
+      "amendment_id": "AMEND-004",
+      "transcribed_clause": "Range B R-OBS-05 Unresolved propagates to Runtime contract Unresolved and Inconclusive experiment"
+    },
+    {
+      "toyotamahime_path": "Study01/studies/study-01-negative-result/scripts/tests/test_phase1.py",
+      "kakuriyo_path": "studies/study-01-negative-result/scripts/tests/test_phase1.py",
+      "base_blob": "6c7a2e9324c28f4b42331abe491ab6548841398e",
+      "new_blob": "27210fd98d3b59c0d12204bde2d2fd552fb6cd92",
+      "base_sha256": "2d352d9a26bf9c42226f429b2204351b6854930756a680033dd264dbe9b911fe",
+      "new_sha256": "f5baf664586df5973e3101c131455417125efab345cf860f99bb8cd779ba3670",
+      "amendment_id": "AMEND-004",
+      "transcribed_clause": "Executable checks for AMEND-004 propagation, prohibited classifications, Range B scope, Pass non-regression, and amendment-log presence"
+    }
+  ],
+  "publication_binding": [
+    {
+      "toyotamahime_path": "Study01/provenance.json",
+      "base_blob": "bcb9c4c513e9de045eb2edb412c2f9fc4cefafbd",
+      "new_blob": "73926f10b74934238ac1c52406b4ec493d411d29",
+      "change_class": "publication_binding",
+      "publication_reason": "Bind all 71 exported files to the dedicated Kakuriyo export-source commit and its committed file identities"
+    },
+    {
+      "toyotamahime_path": "Study01/PROVENANCE.md",
+      "base_blob": "e74b8eaeb7d2401c39dbdc192557087386fd8370",
+      "new_blob": "9c8a6f66270ab187d9d0f9b510a6c763a6771668",
+      "change_class": "publication_binding",
+      "publication_reason": "Document the amended source identity and separate the historical claim anchor from the prospective candidate anchor"
+    },
+    {
+      "toyotamahime_path": "Study01/README.md",
+      "base_blob": "325bfbccb738600f9000e9fce91ed8ecb2f38e0a",
+      "new_blob": "6e4dd031820508a187287bc8f4a771813519ad28",
+      "change_class": "publication_binding",
+      "publication_reason": "Pin the intended k8-bootstrap-v5 fetch name and the SHA-256 of the candidate bootstrap script bytes"
+    },
+    {
+      "toyotamahime_path": "bootstrap/Start-Study01.ps1",
+      "base_blob": "f60291afbf3c86da3c1130b5198f919396acb774",
+      "new_blob": "9bd43fd23e36eeb337eecb14abe84147e13b9f03",
+      "change_class": "publication_binding",
+      "publication_reason": "Make the bootstrap default Ref and changelog describe the intended k8-bootstrap-v5 amended baseline"
+    },
+    {
+      "toyotamahime_path": "bootstrap/README.md",
+      "base_blob": "ce76d627d340a332b215185ac606c47ea88c2229",
+      "new_blob": "a63b2defc47c9ca35f9e053afcac44ce30df4959",
+      "change_class": "publication_binding",
+      "publication_reason": "Keep bootstrap documentation aligned with the intended k8-bootstrap-v5 default Ref"
+    }
+  ]
+}

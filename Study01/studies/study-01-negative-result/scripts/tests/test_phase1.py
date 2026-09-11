@@ -160,6 +160,32 @@ class Phase1Tests(unittest.TestCase):
   self.assertIsNone(score({"range":"C","static_contract":"Fail","validator_result":"REJECT"})["experiment_classification"])
  def test_4_r_obs_05_failure(self):
   r={**BASE,"range":"B","rule_output":"No alert","runtime_contract":"Fail","r_obs_05":"Fail"}; o=score(r); self.assertEqual((o["runtime_contract"],o["experiment_classification"]),("Unresolved","Inconclusive experiment"))
+ def test_4b_r_obs_05_unresolved_reaches_inconclusive(self):
+  # AMEND-004. Recorded as its own test rather than folded into test_4:
+  # Fail and Unresolved are different observations that reach the same
+  # Runtime contract value, and merging the tests would hide that.
+  r={**BASE,"range":"B","rule_output":"No alert","runtime_contract":"Pass","r_obs_05":"Unresolved"}; o=score(r)
+  self.assertEqual((o["runtime_contract"],o["experiment_classification"]),("Unresolved","Inconclusive experiment"))
+ def test_4c_r_obs_05_unresolved_never_reaches_valid_detection_result(self):
+  # The input the gap allowed before AMEND-004: every stage Pass, rule Alert,
+  # runtime_contract written as Pass. It must not classify as a detection.
+  for rule in ("Alert","No alert"):
+   r={**BASE,"range":"B","rule_output":rule,"runtime_contract":"Pass","r_obs_05":"Unresolved"}
+   self.assertNotEqual(score(r)["experiment_classification"],"Valid detection result")
+ def test_4d_r_obs_05_unresolved_is_not_invalid_negative_result_or_invalid_run(self):
+  # AMEND-004 bars both destinations explicitly. The Invalid-negative shape is
+  # the one that would otherwise fit: GT Pass, No alert, target absent.
+  r={**BASE,"range":"B","stages":{**BASE["stages"],"sensor":"Fail","collector":"Fail"},
+     "rule_output":"No alert","runtime_contract":"Fail","target_observation_absent":True,"r_obs_05":"Unresolved"}
+  self.assertEqual(score(r)["experiment_classification"],"Inconclusive experiment")
+ def test_4e_r_obs_05_unresolved_is_range_b_only(self):
+  # Range A has no R-OBS-05. The field must not normalize anything there.
+  o=score({**BASE,"range":"A","r_obs_05":"Unresolved"})
+  self.assertEqual((o["runtime_contract"],o["experiment_classification"]),("Pass","Valid detection result"))
+ def test_4f_r_obs_05_pass_is_non_regression(self):
+  # Pass normalizes nothing, before or after AMEND-004.
+  o=score({**BASE,"range":"B","r_obs_05":"Pass"})
+  self.assertEqual((o["runtime_contract"],o["experiment_classification"]),("Pass","Valid detection result"))
  def test_5_uncorrelatable_alert(self): self.assertEqual(score({**BASE,"evidence_correlatable":False})["experiment_classification"],"Inconclusive experiment")
  def test_6_range_a_empty_capture(self):
   o=score({**BASE,"sensor_capture":"empty","sensor_liveness":False}); self.assertEqual((o["stages"]["sensor"],o["experiment_classification"]),("Unresolved","Inconclusive experiment"))
@@ -171,6 +197,11 @@ class Phase1Tests(unittest.TestCase):
  def test_drift_text(self):
   protocol=ROOT.parent/"protocol"; text=(protocol/"amendments.md").read_text(encoding="utf-8")+(protocol/"scoring.md").read_text(encoding="utf-8")
   for token in ("Rule output = Error", "R-OBS-05 Fail", "Inconclusive experiment", "source_dnp3_doc_id", "Range C", "Invalid run"): self.assertIn(token,text)
+  # AMEND-004 must be transcribed, not merely implemented: the scorer is a
+  # transcription, so the entry has to exist in the normative log.
+  amendments=(protocol/"amendments.md").read_text(encoding="utf-8")
+  self.assertIn("`AMEND-004`",amendments)
+  self.assertIn("Rerun REQUIRED",amendments)
  def test_capture_procedure_frozen_anchors(self):
   procedure=(ROOT.parent/"protocol"/"c2-dnp3-capture-procedure.md").read_text(encoding="utf-8")
   inventory=(ROOT.parent/"protocol"/"c2-dnp3-image-inventory.md").read_text(encoding="utf-8")

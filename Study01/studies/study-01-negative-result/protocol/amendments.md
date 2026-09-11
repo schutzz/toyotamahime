@@ -1,7 +1,7 @@
 # Study 01 Amendment Log
 
 **Status:** Operative (K3 Protocol Freeze complete: `study-01-protocol-v1.0` / `9d57d1e63d6cf16dcc37e8f60d560d30da5f4835`)  
-**Current entries:** 3
+**Current entries:** 4
 
 ## Purpose
 
@@ -30,6 +30,17 @@ The first K4 release/commit pin is an amendment/dependency-change event even tho
 The two records have different roles and may link to each other; neither substitutes for the other.
 
 ## Amendment log
+
+### Amendment 004 — Range B `R-OBS-05 = Unresolved` scoring propagation
+
+| Field | Content |
+| --- | --- |
+| Amendment ID and date | `AMEND-004`, 2026-09-07 (JST) |
+| Prior frozen state | K3 Protocol Freeze plus AMEND-002 and AMEND-003. `scoring.md` §20 defines `Fail` (the announced criterion was evaluated and not met) and `Unresolved` (available evidence supports neither conclusion) as distinct observations. AMEND-002 Part B (4) fixed only Range B `R-OBS-05 Fail` → Runtime contract `Unresolved` → `Inconclusive experiment`. `k6-r-obs-05-collector-query-contract.md` §93 defines observation conditions under which R-OBS-05 is itself `Unresolved` (zero total, `gte` relation, total/array mismatch, total ≥ 10000), and §117 states that a missing three-rule document/frame pair makes R-OBS-05 `Fail`. **No frozen source fixes how `R-OBS-05 = Unresolved` propagates to Runtime contract or to Experiment classification.** The executable scorer normalizes `== "Fail"` only, so `{"r_obs_05": "Unresolved", "runtime_contract": "Pass"}` could reach `Valid detection result`. |
+| Change and rationale | Range B `R-OBS-05 = Unresolved` → Runtime contract `Unresolved` → `Inconclusive experiment`. **This adds a propagation rule no frozen source had fixed; it is a prospective addition to scoring semantics, not a rewriting of existing meaning.** The `Fail` / `Unresolved` distinction in `scoring.md` §20 is retained: the two remain different observations, and what this amendment states is that they reach the same downstream conclusion at this one point. The rationale is conservative consistency — if `Fail` (evaluated and not met) yields `Inconclusive experiment`, then `Unresolved` (not evaluable at all) has no ground to reach a stronger conclusion; an observation resting on less evidence does not support a stronger claim. Boundaries: it must not reach `Valid detection result`; it must not become `Invalid negative result` (the same prohibition AMEND-002 Part B (4) placed on `Fail`); and it must not become `Invalid run`, because `R-OBS-05 = Unresolved` is an evidence state, not a procedure deviation. Scope is Range B's R-OBS-05 observation only; Range A and Range C are unaffected, and other stages' `Unresolved` values are already handled by existing precedence. |
+| Affected evidence/claims | No existing evidence or claim is affected. Measured across every tracked JSON file at commit `7d3a597113ac648dd29b5c1cba07509caf6f602a`: `r_obs_05` is `"Pass"` in 7 places, `null` in 1, and **`"Unresolved"` in 0** (two further occurrences are non-scalar dict outputs in `results/main/k7/observation-normalization.json` and are not scoring fields). The accepted Main Range B run underlying the K7 claims (`k6-range-b-20260825-004`) has `r_obs_05: "Pass"` and is untouched. No frozen target selector, event, Range B fault mechanism, time window, R-OBS-05 purpose, classification precedence, or existing run classification changes, and no existing run is rescored or reinterpreted. **This amendment does add a new propagation rule that applies to future runs.** |
+| Rerun decision | **Rerun REQUIRED.** The amendment fixes classification propagation, which is the required use of `Rerun REQUIRED` below (scoring/classification changes). It is not an explanatory-only correction, so `NOT REQUIRED` does not apply. **Assessment found the affected existing run set to be EMPTY** — zero runs carry `r_obs_05 = Unresolved` at commit `7d3a597113ac648dd29b5c1cba07509caf6f602a` — so the concrete set of runs to re-execute is the empty set. **This is not recategorized as `Rerun NOT REQUIRED`**: the category states the nature of the change, the affected set states a survey result, and they are separate facts (AMEND-003 took the same form for `ASSESS / PARTIAL`). |
+| New authoritative state | The repository commit containing this entry, the [AMEND-004 proposal record](../K8-S2-PROTOCOL-AMENDMENT-004-PROPOSAL-R-OBS-05-UNRESOLVED.md), and its [accepted independent review](../K8-S2-AUTHORIZATION-BLOCKER-DESIGNS-REV3-INDEPENDENT-REVIEW.md) (`7d3a597113ac648dd29b5c1cba07509caf6f602a`). Applies to prospective Range B execution only. A subsequent executable scorer change is a transcription of this entry, not a source of semantics. |
 
 ### Amendment 003 — K6 R-OBS-05 Collector correlation query envelope
 

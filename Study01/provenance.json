@@ -220,11 +220,11 @@
       "toyotamahime": "Study01/studies/study-01-negative-result/protocol/.gitkeep"
     },
     {
-      "blob": "09aaae6bca0d69350e88427aee885d9681b89b9e",
-      "bytes": 10996,
+      "blob": "cbbb2da381262194b5fb500ae6c51f9375806c8c",
+      "bytes": 15247,
       "crlf": false,
       "kakuriyo": "studies/study-01-negative-result/protocol/amendments.md",
-      "sha256": "678e88f545c6d09d3908b1c513083529722e1bd9ce5fd1a1c11a2e4c494dcfe5",
+      "sha256": "0691dcd77c67152bbe968bc54b98a6dcf165cd538f9354e3669673bbf54fd881",
       "toyotamahime": "Study01/studies/study-01-negative-result/protocol/amendments.md"
     },
     {
@@ -484,11 +484,11 @@
       "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/frozen/apparatus.py"
     },
     {
-      "blob": "4ae5f1f892df83b7911c9b958d2dcf79be6ffce9",
-      "bytes": 555,
+      "blob": "931394d66405abeb4fd13805f2fb9257999e34ac",
+      "bytes": 1150,
       "crlf": false,
       "kakuriyo": "studies/study-01-negative-result/scripts/study01/frozen/semantics.py",
-      "sha256": "a3f6ccba59acc30b80cf91d10d989d44c06e7c731f31cf53a0bb3db280adc2f2",
+      "sha256": "33ee084ac0b4107bb64e1a1759a96907c0e34d92b24d2d3a90cd5d8af812f315",
       "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/frozen/semantics.py"
     },
     {
@@ -508,11 +508,11 @@
       "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/procedure_conformance.py"
     },
     {
-      "blob": "1a1132e6906c70dadff6f9bb590f38775f2f6733",
-      "bytes": 3414,
+      "blob": "bce3eb1bf7082a1a56ba5c79c5ded7416652e7f1",
+      "bytes": 3807,
       "crlf": false,
       "kakuriyo": "studies/study-01-negative-result/scripts/study01/scorer.py",
-      "sha256": "1aa648e6126cd58c722e8e0dc4a829f2684a2754f80917813fef1b6bf88e4468",
+      "sha256": "464506b8c88fb0da93e29fce6155bdede3a0bc844cee49f3279079195906590c",
       "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/scorer.py"
     },
     {
@@ -564,14 +564,14 @@
       "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01_sender.py"
     },
     {
-      "blob": "6c7a2e9324c28f4b42331abe491ab6548841398e",
-      "bytes": 53319,
+      "blob": "27210fd98d3b59c0d12204bde2d2fd552fb6cd92",
+      "bytes": 55648,
       "crlf": false,
       "kakuriyo": "studies/study-01-negative-result/scripts/tests/test_phase1.py",
-      "sha256": "2d352d9a26bf9c42226f429b2204351b6854930756a680033dd264dbe9b911fe",
+      "sha256": "f5baf664586df5973e3101c131455417125efab345cf860f99bb8cd779ba3670",
       "toyotamahime": "Study01/studies/study-01-negative-result/scripts/tests/test_phase1.py"
     }
   ],
-  "kakuriyo_commit": "f0df3e1f7ddf76e5a7e394628337f1b578801859",
+  "kakuriyo_commit": "8873aeeb2837b357fa39fd4b36e3b265d8eea9d5",
   "study_root": "studies/study-01-negative-result"
 }

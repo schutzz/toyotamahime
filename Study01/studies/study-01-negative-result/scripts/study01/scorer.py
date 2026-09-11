@@ -1,5 +1,6 @@
 """Pure, offline Study 01 scorer."""
-from .frozen.semantics import MANDATORY_STAGES, RANGES, RULE_VALUES, RUNTIME_VALUES, STAGE_VALUES
+from .frozen.semantics import (MANDATORY_STAGES, R_OBS_05_TO_RUNTIME_UNRESOLVED, RANGES,
+                               RULE_VALUES, RUNTIME_VALUES, STAGE_VALUES)
 from .procedure_conformance import ProcedureConformanceError, validate as validate_procedure
 
 class UncoveredSemanticState(ValueError):
@@ -35,10 +36,14 @@ def score(record):
     if rule not in RULE_VALUES or runtime not in RUNTIME_VALUES:
         raise UncoveredSemanticState("unknown rule or runtime value")
 
-    # AMEND-002 #4 and #6 normalize evidence before precedence is applied.
+    # AMEND-002 #4 and #6, and AMEND-004, normalize evidence before precedence.
     out_stages = dict(stages)
     out_runtime = runtime
-    if range_name == "B" and record.get("r_obs_05") == "Fail":
+    # AMEND-002 #4 fixed Fail; AMEND-004 fixes Unresolved. Both land on Runtime
+    # contract Unresolved, and both keep their own observation: the record still
+    # says which one was observed. Scoring them alike is what AMEND-004 states,
+    # not a claim that the two observations are the same.
+    if range_name == "B" and record.get("r_obs_05") in R_OBS_05_TO_RUNTIME_UNRESOLVED:
         out_runtime = "Unresolved"
     if range_name == "A" and record.get("sensor_capture") == "empty" and not record.get("sensor_liveness"):
         out_stages["sensor"] = "Unresolved"

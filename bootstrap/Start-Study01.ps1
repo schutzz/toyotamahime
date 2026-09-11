@@ -56,6 +56,21 @@
     same commit, mechanically, rather than relying on a maintainer to
     remember.
 
+    v5 change from k8-bootstrap-v4: v5 is the first amended Study 01
+    baseline. Accepted amendments AMEND-001 through AMEND-004 are now
+    reflected in the frozen apparatus -- `scripts/study01/frozen/semantics.py`
+    and `scripts/study01/scorer.py` carry the Range B `R-OBS-05 =
+    Unresolved` scoring propagation (AMEND-004), transcribed from
+    Kakuriyo under an independent exact-commit review and recorded in
+    that amendment's Authority Anchor Record. The kit was re-exported
+    from a dedicated Kakuriyo export-source commit, not the v4 source.
+    The K6 / K7 claims under claims/ were established on the v4
+    (historical) apparatus and are not re-asserted on this baseline --
+    see Study01/PROVENANCE.md. Per the same discipline as the v4 note,
+    the k8-bootstrap-v5 tag is created only after this exact commit
+    passes K8-S2 and a fresh certification run; until then this is a
+    candidate, tracked in docs/k8-candidates/ledger.json.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -78,7 +93,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v4` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v5` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -103,7 +118,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v4'
+    [string] $Ref = 'k8-bootstrap-v5'
 )
 
 Set-StrictMode -Version Latest
