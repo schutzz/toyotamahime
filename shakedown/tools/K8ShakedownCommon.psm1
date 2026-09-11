@@ -119,10 +119,30 @@ function New-K8ShakedownRunId {
         Shakedown run IDs are deliberately NOT k8-repro-* (that namespace is
         reserved for formal attempts) so a Shakedown run can never be mistaken
         for, or accidentally filed alongside, formal K8-3 evidence.
+
+        The timestamp has one-second granularity, and two runs of the SAME
+        range can legitimately be reserved inside the same second -- e.g. two
+        back-to-back qualification sequences opened in a test, each starting
+        at Range A. A taken ID gets a `-2`, `-3`, ... suffix: the same
+        allocate-a-fresh-unused-ID-by-probing pattern
+        New-K8QualificationSequenceId already uses below. This probes the
+        real run-record directory and picks the first name not already
+        claimed; it is deterministic and still fails closed on true
+        exhaustion, never a sleep and never a retry that just waits for the
+        clock to tick over. The authoritative collision guard stays where it
+        was, inside Start-K8ShakedownRun's locked ReserveRun mutation --
+        this only keeps that guard from being tripped by a same-second
+        allocation this function could have avoided on its own.
     #>
     param([Parameter(Mandatory)][ValidateSet('a', 'b', 'c')][string] $Range)
     $ts = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
-    return "k8shakedown-range$Range-$ts"
+    $base = "k8shakedown-range$Range-$ts"
+    if (-not (Test-Path -LiteralPath (Get-K8RunRecordDir -RunId $base))) { return $base }
+    for ($n = 2; $n -le 100; $n++) {
+        $candidate = "$base-$n"
+        if (-not (Test-Path -LiteralPath (Get-K8RunRecordDir -RunId $candidate))) { return $candidate }
+    }
+    throw "Could not allocate an unused run ID from '$base' after 100 attempts. Refusing to overwrite an existing control-plane record."
 }
 
 function New-K8QualificationSequenceId {
