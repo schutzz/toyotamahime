@@ -957,12 +957,45 @@ function Get-K8SourceIdentity {
         ancestor" with "could not observe", and C-5 exists because that merge
         loses the difference between an answer and the absence of one:
 
-            confirmed       HEAD is an ancestor of the pinned ref
-            not-an-ancestor observed, and it is not
+            confirmed       HEAD is an ancestor of the pinned ref, OR HEAD is
+                             an authorized candidate (below)
+            not-an-ancestor observed, and it is neither
             not-observed    the remote could not be observed at all
 
         All three of the last two STOP at sequence open, but they STOP saying
         different things, and the record keeps which one happened.
+
+        EXECUTION-HEAD IDENTITY (added for K8-S2 execution). An authorized
+        candidate's execution head is never an ancestor of the pinned tooling
+        ref -- it is built ON TOP of that tooling, carrying the candidate's
+        own scientific content plus (for K8-S2) an execution-head commit that
+        the accepted candidate itself does not include -- so the check above
+        alone always refuses it. This is not a looser check bolted on
+        afterward: it asks two SEPARATE questions, both by reusing existing,
+        already-accepted mechanisms, never by inventing new authority:
+
+            content       Test-K8FrozenPathIdentity (C-9 dual-anchor,
+                           unmodified) resolves HEAD as
+                           'amended-candidate-delegated' -- i.e. HEAD's frozen
+                           scientific paths are byte-identical to an attested,
+                           exact-commit-bound authorized candidate. Tooling
+                           lineage back to the canonical remote is implied
+                           structurally, not asked separately: this commit's
+                           own ancestry already includes the tooling that
+                           produced it.
+            publication   some refs/heads/k8-candidate-execution/* ref on the
+                           SAME canonical remote resolves to EXACTLY HEAD (not
+                           an ancestor -- exact, so no branch can claim a
+                           commit it does not literally point at), so a third
+                           party can still independently re-obtain the exact
+                           commit K8-S2 locks.
+
+        Both hold => confirmed. Either fails => the original not-an-ancestor
+        answer stands, unchanged. No candidate id, ref name or remote is ever
+        taken from a parameter, environment variable or caller: the
+        execution-head namespace is enumerated from the canonical remote
+        itself, exactly as the tooling ref already is, so there is nothing
+        here for an operator to select or override.
 
         WHY ls-remote BEFORE fetch: `git fetch` returns 128 for a missing ref
         AND for an unreachable host (measured), so its exit alone cannot tell
@@ -1055,6 +1088,76 @@ function Get-K8SourceIdentity {
         else {
             $record['ancestry'] = 'not-an-ancestor'
             $record['ancestry_note'] = "HEAD $($identity.Head) is NOT an ancestor of $($pin.CanonicalRef) ($oid); this commit is not published there"
+
+            # Execution-head identity (K8-S2 pre-execution integration fix).
+            # HEAD is never an ancestor of the tooling ref for an authorized
+            # candidate's execution head, because it is built ON TOP of that
+            # tooling -- what changed is the candidate's scientific content,
+            # not the tooling lineage. Two SEPARATE claims close this, both
+            # reusing existing, already-accepted mechanisms rather than
+            # inventing new ones:
+            #
+            #   content      Test-K8FrozenPathIdentity (C-9 dual-anchor,
+            #                unmodified) says HEAD's frozen scientific paths
+            #                (Study01 / bootstrap / the packaging-
+            #                certification doc) are byte-identical to an
+            #                attested, exact-commit-bound authorized
+            #                candidate. This is the SAME check that already
+            #                gates candidate acceptance; it is not
+            #                re-implemented here. Tooling lineage back to the
+            #                canonical remote is implied structurally: this
+            #                commit's own ancestry already includes the
+            #                tooling that produced it, and fetching it fetches
+            #                that ancestry too.
+            #   publication  HEAD is itself published EXACTLY (not merely an
+            #                ancestor) under the execution-head namespace on
+            #                the SAME canonical remote, so a third party can
+            #                still independently re-obtain the precise commit
+            #                K8-S2 locks -- the one guarantee this whole check
+            #                exists to make.
+            #
+            # Neither claim takes a candidate id, ref name or remote from a
+            # parameter, environment variable or caller. Test-K8FrozenPathIdentity
+            # reads its subject from the exact commit's own committed
+            # attestation; the execution-head namespace is enumerated from the
+            # canonical remote itself, exactly as the tooling ref already is.
+            $contentConfirmed = $false
+            try {
+                $frozenIdentity = Test-K8FrozenPathIdentity -Repository $repo -Revision $identity.Head
+                $contentConfirmed = ([string]$frozenIdentity['mode'] -eq 'amended-candidate-delegated')
+            }
+            catch {
+                # Not attested, or the attestation is malformed or mismatched
+                # -- exactly what Test-K8FrozenPathIdentity already fails
+                # closed on. This function does not re-decide any of that; it
+                # only asks the existing answer.
+                $contentConfirmed = $false
+            }
+
+            if ($contentConfirmed) {
+                $execCapture = Invoke-K8SeparatedNativeCapture -StepId 'C-73' -FilePath 'git' -ArgumentList @('-C', $repo, 'ls-remote', '--exit-code', $RemoteName, 'refs/heads/k8-candidate-execution/*')
+                if ($execCapture.ExitCode -eq 0) {
+                    $executionRefs = @(
+                        @($execCapture.Stdout) | ForEach-Object {
+                            $line = $_.Trim()
+                            if ($line -match '^([0-9a-f]{40})\s+(refs/heads/k8-candidate-execution/\S+)$' -and $Matches[1] -eq $identity.Head) {
+                                $Matches[2]
+                            }
+                        }
+                    )
+                    if ($executionRefs.Count -gt 0) {
+                        $record['ancestry'] = 'confirmed'
+                        $record['execution_head_ref'] = @($executionRefs | Sort-Object -Unique) -join ', '
+                        $record['ancestry_note'] = "HEAD $($identity.Head) is not an ancestor of $($pin.CanonicalRef) ($oid), but Test-K8FrozenPathIdentity confirms it is an authorized candidate's execution head, and it is published exactly at $($record['execution_head_ref']) on $($record['remote_url']) -- confirmed"
+                    }
+                    else {
+                        $record['ancestry_note'] = "$($record['ancestry_note']); Test-K8FrozenPathIdentity confirms HEAD is an authorized candidate's execution head, but it is not published exactly under refs/heads/k8-candidate-execution/* on $($record['remote_url'])"
+                    }
+                }
+                # A transport failure or genuine absence here leaves the
+                # primary not-an-ancestor answer exactly as it was -- never
+                # upgraded, never silently re-labelled not-observed.
+            }
         }
     }
     finally {
@@ -4534,8 +4637,14 @@ $script:K8CommandContract = @(
        stream_expectation = 'separated'; accepted_exit_codes = @(0, 1)
        exit_note = 'Measured: 0 = ancestor, 1 = not an ancestor. BOTH are successful observations; 1 is not a failure of the command. Treating non-zero as failure here is the exact mistake C-8 removed the module-wide @(0) default to prevent.' }
 
-    @{ step_id = 'C-66'; class = 'C'; ranges = 'abc'
+    @{ step_id = 'C-73'; class = 'C'; ranges = 'abc'
        source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Get-K8SourceIdentity'; callee = "'git'"; call_ordinal = 6
+       argv_shape = @('git','-C','<repo>','ls-remote','--exit-code','<remote>','refs/heads/k8-candidate-execution/*')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0, 2)
+       exit_note = 'Execution-head publication probe (K8-S2 pre-execution integration fix), only reached after the primary tooling-ref ancestry check answered not-an-ancestor AND Test-K8FrozenPathIdentity already confirmed HEAD as an authorized candidate. 0 lists execution-head refs; 2 means none are published, a real answer, not a failure to observe. Any other exit leaves the primary not-an-ancestor answer standing.' }
+
+    @{ step_id = 'C-66'; class = 'C'; ranges = 'abc'
+       source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Get-K8SourceIdentity'; callee = "'git'"; call_ordinal = 7
        argv_shape = @('git','-C','<repo>','update-ref','-d','<ref>')
        stream_expectation = 'separated'; accepted_exit_codes = @(0)
        exit_note = 'Cleanup of the ancestry temp ref, in a finally block. Leaving it behind would let a LATER run that failed to fetch resolve a stale OID -- the confusion the explicit temp ref exists to remove.' }
