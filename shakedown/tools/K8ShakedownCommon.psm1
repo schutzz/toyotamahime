@@ -4136,14 +4136,14 @@ $script:K8CommandContract = @(
        exit_note = 'exit 1 = the frozen EXPECTED outcome (the negative manifest was rejected). exit 0 = a SCIENTIFIC observation that the apparatus did not reject it -- recorded, never converted into a tooling STOP. exit >=2 = argparse/interpreter execution failure. This row is why accepted_exit_codes has no default: @(0) would STOP every correct Range C run, and would also convert the exit-0 finding into a tooling error.' }
 
     @{ step_id = 'F-36'; class = 'F'; ranges = 'abc'
-       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'docker'"; call_ordinal = 3
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'docker'"; call_ordinal = 4
        governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-image-inventory.md' -Clause 'SS1 pinned digest'))
        argv_shape = @('docker','pull','<pinned-digest-ref>')
        stream_expectation = 'separated'; accepted_exit_codes = @(0)
        exit_note = 'Pulls by digest, never by mutable tag.' }
 
     @{ step_id = 'F-37'; class = 'F'; ranges = 'abc'
-       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'docker'"; call_ordinal = 4
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'docker'"; call_ordinal = 5
        governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-image-inventory.md' -Clause 'SS1 pinned digest'))
        argv_shape = @('docker','inspect','--format','{{index .RepoDigests 0}}','<image-ref>')
        stream_expectation = 'separated'; accepted_exit_codes = @(0)
@@ -4555,6 +4555,12 @@ $script:K8CommandContract = @(
        stream_expectation = 'separated'; accepted_exit_codes = @(0)
        availability_policy = 'required'; informational_value = $true
        exit_note = 'Prerequisite gate plus retained version value. Client-side only; it does not require the daemon.' }
+
+    @{ step_id = 'C-74'; class = 'C'; ranges = 'abc'
+       source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'docker'"; call_ordinal = 3
+       argv_shape = @('docker','info','--format','{{.ServerVersion}}')
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'Engine readiness, distinct from C-58/C-59 which are client-side only. Non-zero (daemon unreachable) is caught at the call site and rethrown as a specific "Docker Engine is not ready" STOP; no retry, no wait loop, no auto-start.' }
 
     @{ step_id = 'C-59'; class = 'C'; ranges = 'abc'
        source_file = 'Start-K8Shakedown.ps1'; producer_scope = '<script-toplevel>'; callee = "'docker'"; call_ordinal = 2
