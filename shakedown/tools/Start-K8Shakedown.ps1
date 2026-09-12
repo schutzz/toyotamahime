@@ -75,6 +75,21 @@ $composeVersion = Get-K8RequiredToolVersion -StepId 'C-59' -FilePath 'docker' -A
     -Requirement "'docker compose' (v2, not the v1 docker-compose binary) is required"
 $prereqs['docker compose'] = $composeVersion['value']; $toolVersions += $composeVersion
 
+# C-58/C-59 above are client-side only -- `docker --version` and
+# `docker compose version` both succeed with the daemon stopped. This is the
+# separate hard gate on the ENGINE actually answering, so Setup fails here
+# rather than several stages later inside a Range A/B provision step with a
+# less legible cause. No retry, no wait loop, no auto-start: Docker Desktop
+# is a human-launched application, and starting it silently would hide
+# exactly the condition this gate exists to surface.
+try {
+    [void](Invoke-K8ContractedNative -StepId 'C-74' -FilePath 'docker' -ArgumentList @('info', '--format', '{{.ServerVersion}}'))
+}
+catch {
+    throw "Docker Engine is not ready. Start Docker Desktop and rerun Start-K8Shakedown.ps1.`n($($_.Exception.Message))"
+}
+Write-K8ShakedownLog -Message 'prereq docker engine -> ready'
+
 # I-05, the only cross-boundary process site in the contract. Start-K8Shakedown
 # calls the FROZEN Study01 export Get-K8WslField, which reaches
 # System.Diagnostics.Process.Start inside Study01/tools/K8AttemptCommon.psm1.

@@ -5386,15 +5386,18 @@ Assert-K8Test 'C-8: the contract is a single data structure, and every row state
     # answered not-an-ancestor AND Test-K8FrozenPathIdentity (C-71/C-72,
     # unmodified) already confirmed HEAD as an authorized candidate; the fix
     # adds no second git call because tooling lineage is implied structurally
-    # by HEAD's own ancestry rather than asked separately. The closed world is
-    # therefore 113 (F 37 / C 73 / I 3). The count is asserted per class, not
-    # in total, so a row moving between classes cannot hide in an unchanged
-    # sum.
-    if ($rows.Count -ne 113) { throw "expected 113 process-site rows, got $($rows.Count)" }
+    # by HEAD's own ancestry rather than asked separately. Start-K8Shakedown's
+    # Docker Engine readiness gate (`docker info`, distinct from C-58/C-59's
+    # client-side-only version checks) adds C-74, which shifts F-36/F-37
+    # (the pinned-image pull/inspect later in the same script scope) from
+    # call_ordinal 3/4 to 4/5. The closed world is therefore 114
+    # (F 37 / C 74 / I 3). The count is asserted per class, not in total, so a
+    # row moving between classes cannot hide in an unchanged sum.
+    if ($rows.Count -ne 114) { throw "expected 114 process-site rows, got $($rows.Count)" }
     $byClass = @{}
     foreach ($c in 'F', 'C', 'I') { $byClass[$c] = @($rows | Where-Object { $_.class -eq $c }).Count }
-    if ($byClass['F'] -ne 37 -or $byClass['C'] -ne 73 -or $byClass['I'] -ne 3) {
-        throw "class split is F=$($byClass['F']) C=$($byClass['C']) I=$($byClass['I']); Batch 3A fixes F=37 I=3, Batch 3B raises C to 67, Range C environment retention raises it to 70, C-9 dual-anchor identity raises it to 72, and the K8-S2 pre-execution integration fix raises it to 73"
+    if ($byClass['F'] -ne 37 -or $byClass['C'] -ne 74 -or $byClass['I'] -ne 3) {
+        throw "class split is F=$($byClass['F']) C=$($byClass['C']) I=$($byClass['I']); Batch 3A fixes F=37 I=3, Batch 3B raises C to 67, Range C environment retention raises it to 70, C-9 dual-anchor identity raises it to 72, the K8-S2 pre-execution integration fix raises it to 73, and the Docker Engine readiness gate raises it to 74"
     }
     if (@($rows.step_id | Sort-Object -Unique).Count -ne $rows.Count) { throw 'step_id values are not unique' }
     foreach ($r in $rows) {
