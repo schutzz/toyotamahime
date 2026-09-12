@@ -225,8 +225,8 @@ Assert-K8Test 'Install-K8RangeCDependencies sets and restores PYTHONUTF8 around 
 Assert-K8Test 'Pinned Amenonuboco/tcpdump values match Study01/README.md' {
     $readme = Get-Content (Join-Path $Study01 'README.md') -Raw
     $common = Get-Content (Join-Path $ToolsDir 'K8ShakedownCommon.psm1') -Raw
+    # These three stay copied verbatim from Study01/README.md, as before.
     $pins = @(
-        '3d8ca2dc7d5a7547e97633154b14bda75fa793e3',
         '0378f8a32701b481e030f3db3d5f66ea471a4675',
         'v0.13.0',
         'sha256:3006b3bd9f041bf73f21e626b97cca5e78fd6ce271549ca95b8e6a508165512b'
@@ -235,6 +235,23 @@ Assert-K8Test 'Pinned Amenonuboco/tcpdump values match Study01/README.md' {
         if ($readme -notlike "*$pin*") { throw "pin '$pin' not found in Study01/README.md -- test's own pin list is stale" }
         if ($common -notlike "*$pin*") { throw "pin '$pin' is in Study01/README.md but missing from K8ShakedownCommon.psm1 -- drift" }
     }
+}
+
+Assert-K8Test 'RangeGenCommit is a declared K8-S2 execution-only override, distinct from Study01/README.md candidate pin' {
+    # Study01/ is the frozen/candidate scientific tree (K8-S2 delegated source
+    # identity) and must not be re-copied here just because the Shakedown
+    # execution tooling's own Amenonuboco runtime dependency moved -- see the
+    # note above $script:K8Shakedown in K8ShakedownCommon.psm1. This test
+    # checks the two pins are recorded EXACTLY where each is expected, rather
+    # than requiring them to be equal or silently allowing either to drift
+    # unnoticed.
+    $readme = Get-Content (Join-Path $Study01 'README.md') -Raw
+    $common = Get-Content (Join-Path $ToolsDir 'K8ShakedownCommon.psm1') -Raw
+    $candidatePin = '78fc17746b5d663fafec9dffe563d79fe9ea02b7'
+    $executionOverridePin = '3d8ca2dc7d5a7547e97633154b14bda75fa793e3'
+    if ($readme -notlike "*$candidatePin*") { throw "candidate range-gen pin '$candidatePin' not found in Study01/README.md" }
+    if ($common -notlike "*$executionOverridePin*") { throw "K8-S2 execution-only override pin '$executionOverridePin' not found in K8ShakedownCommon.psm1's RangeGenCommit" }
+    if ($common -like "*$candidatePin*") { throw "K8ShakedownCommon.psm1 still carries the candidate pin '$candidatePin' -- RangeGenCommit override was not applied" }
 }
 
 Assert-K8Test 'Pinned sender asset SHA-256 matches c2-dnp3-sender-procedure.md' {

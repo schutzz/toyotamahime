@@ -169,14 +169,14 @@ This must print `PACKAGE CERTIFICATION: PASS` and exit `0`, on the commit you ar
 
 Two different pinned commits of the same public repository, `https://github.com/schutzz/ot-range-amenonuboco`.
 
-**Range generation** (Ranges A and B), pinned to `3d8ca2dc7d5a7547e97633154b14bda75fa793e3`:
+**Range generation** (Ranges A and B), pinned to `78fc17746b5d663fafec9dffe563d79fe9ea02b7`:
 
 <!-- k8-test:id=amenonuboco-range-gen-clone mode=parse cwd=repo-root -->
 ```powershell
 git init amenonuboco-gen
 cd amenonuboco-gen
 git remote add origin https://github.com/schutzz/ot-range-amenonuboco
-git fetch --depth=1 origin 3d8ca2dc7d5a7547e97633154b14bda75fa793e3
+git fetch --depth=1 origin 78fc17746b5d663fafec9dffe563d79fe9ea02b7
 git checkout FETCH_HEAD
 cd ..
 ```
