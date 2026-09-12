@@ -3832,7 +3832,7 @@ $script:K8CommandContractSchema = 'k8shakedown-command-contract/1'
 # the identity. Paths are Study01-relative; the resolver joins them to the
 # packaged Study01 root, never to an absolute path (C-9 lesson, kept here too).
 $script:K8FrozenSourceIdentity = @{
-    'README.md'                                                              = '6ae837628ec3bae80813d19efe6af35529a52ec1a494cac7f73da13eee061a00'
+    'README.md'                                                              = '7ce29248f1124071a3db3e7a142cb986bc2286cfe23c2911ae43ea38ce526a66'
     'studies/study-01-negative-result/protocol/freeze-decision-table.md'     = 'f90e687275dc0098e4de11377fe7f2ce46eadb494bcc1e1e913a8daf0977801d'
     'studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md'  = 'ded5e1ea4019e800567b7de3b13215be9f80be5e15e83da83cc6715be24a8fe2'
     'studies/study-01-negative-result/protocol/c2-dnp3-step4-range-b-fault-pilot.md' = '563e664ddde408a2136019b8dffe0ca911f5f144e2407aa1dbc15188a4e70d0c'
