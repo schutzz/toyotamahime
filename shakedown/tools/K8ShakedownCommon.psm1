@@ -52,7 +52,7 @@ if (Test-Path $script:K8AttemptCommonPath) {
 
 $script:K8Shakedown = @{
     AmenonubocoUrl              = 'https://github.com/schutzz/ot-range-amenonuboco'
-    RangeGenCommit               = '78fc17746b5d663fafec9dffe563d79fe9ea02b7'   # Range A/B generator (v0.12.0)
+    RangeGenCommit               = '3d8ca2dc7d5a7547e97633154b14bda75fa793e3'   # Range A/B generator (v0.12.0 + bullseye snapshot apt fix)
     RangeCTag                    = 'v0.13.0'
     RangeCCommit                 = '0378f8a32701b481e030f3db3d5f66ea471a4675'   # Range C validator
     TcpdumpImage                 = 'corfr/tcpdump'
@@ -3832,7 +3832,7 @@ $script:K8CommandContractSchema = 'k8shakedown-command-contract/1'
 # the identity. Paths are Study01-relative; the resolver joins them to the
 # packaged Study01 root, never to an absolute path (C-9 lesson, kept here too).
 $script:K8FrozenSourceIdentity = @{
-    'README.md'                                                              = '7ce29248f1124071a3db3e7a142cb986bc2286cfe23c2911ae43ea38ce526a66'
+    'README.md'                                                              = 'c5f71e887c02b3a2b17653d0451be83ef35d7cf218ab7ca7182d85731da3a3d1'
     'studies/study-01-negative-result/protocol/freeze-decision-table.md'     = 'f90e687275dc0098e4de11377fe7f2ce46eadb494bcc1e1e913a8daf0977801d'
     'studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md'  = 'ded5e1ea4019e800567b7de3b13215be9f80be5e15e83da83cc6715be24a8fe2'
     'studies/study-01-negative-result/protocol/c2-dnp3-step4-range-b-fault-pilot.md' = '563e664ddde408a2136019b8dffe0ca911f5f144e2407aa1dbc15188a4e70d0c'

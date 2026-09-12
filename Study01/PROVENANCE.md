@@ -49,7 +49,7 @@ A reader who checks a shipped blob id against a value quoted in `claims/` — fo
 
 | Pin | Value | How to obtain it |
 | --- | --- | --- |
-| Amenonuboco, range generation | `78fc17746b5d663fafec9dffe563d79fe9ea02b7` | fetchable by SHA from the public repository; see `README.md` §4.1 |
+| Amenonuboco, range generation | `3d8ca2dc7d5a7547e97633154b14bda75fa793e3` | fetchable by SHA from the public repository; see `README.md` §4.1 |
 | Amenonuboco, contract validator | `v0.13.0` = `0378f8a32701b481e030f3db3d5f66ea471a4675` | public tag |
 | Capture helper image | `corfr/tcpdump@sha256:3006b3bd9f041bf73f21e626b97cca5e78fd6ce271549ca95b8e6a508165512b` | pull by digest |
 | Sender asset | SHA-256 `093FEFD5F1F36D715AAE4D7AB91DBAD2D7A93BFE212705D721C95B356A7C053B` | shipped; the preflight checks it |
