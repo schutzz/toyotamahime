@@ -5379,16 +5379,22 @@ Assert-K8Test 'C-8: the contract is a single data structure, and every row state
     # source-identity git call sites as C-61..C-66. Range C environment
     # retention adds three more: C-68 (the dependency probe) and C-69 / C-70
     # (worktree head and status observed FOR RETENTION -- deliberately separate
-    # rows from C-03 and C-46, which run the same commands to GATE). So the
-    # C-9 dual-anchor identity adds C-71 / C-72. The closed world is therefore
-    # 112 (F 37 / C 72 / I 3). The count is asserted per class,
-    # not in total, so a row moving between classes cannot hide in an
-    # unchanged sum.
-    if ($rows.Count -ne 112) { throw "expected 112 process-site rows, got $($rows.Count)" }
+    # rows from C-03 and C-46, which run the same commands to GATE). The C-9
+    # dual-anchor identity adds C-71 / C-72. The K8-S2 pre-execution
+    # integration fix adds C-73 -- Get-K8SourceIdentity's execution-head
+    # publication probe, reached only after the primary ancestry check already
+    # answered not-an-ancestor AND Test-K8FrozenPathIdentity (C-71/C-72,
+    # unmodified) already confirmed HEAD as an authorized candidate; the fix
+    # adds no second git call because tooling lineage is implied structurally
+    # by HEAD's own ancestry rather than asked separately. The closed world is
+    # therefore 113 (F 37 / C 73 / I 3). The count is asserted per class, not
+    # in total, so a row moving between classes cannot hide in an unchanged
+    # sum.
+    if ($rows.Count -ne 113) { throw "expected 113 process-site rows, got $($rows.Count)" }
     $byClass = @{}
     foreach ($c in 'F', 'C', 'I') { $byClass[$c] = @($rows | Where-Object { $_.class -eq $c }).Count }
-    if ($byClass['F'] -ne 37 -or $byClass['C'] -ne 72 -or $byClass['I'] -ne 3) {
-        throw "class split is F=$($byClass['F']) C=$($byClass['C']) I=$($byClass['I']); Batch 3A fixes F=37 I=3, Batch 3B raises C to 67, Range C environment retention raises it to 70, and C-9 dual-anchor identity raises it to 72"
+    if ($byClass['F'] -ne 37 -or $byClass['C'] -ne 73 -or $byClass['I'] -ne 3) {
+        throw "class split is F=$($byClass['F']) C=$($byClass['C']) I=$($byClass['I']); Batch 3A fixes F=37 I=3, Batch 3B raises C to 67, Range C environment retention raises it to 70, C-9 dual-anchor identity raises it to 72, and the K8-S2 pre-execution integration fix raises it to 73"
     }
     if (@($rows.step_id | Sort-Object -Unique).Count -ne $rows.Count) { throw 'step_id values are not unique' }
     foreach ($r in $rows) {
@@ -6126,6 +6132,131 @@ Assert-K8Test 'C-9: the gate has no override, and a not-an-ancestor HEAD cannot 
         Publish-K8SandboxHead -Sandbox $sb
         $seq = New-K8QualificationSequence -RepoRoot $sb.Repo
         if (-not $seq.sequence_id) { throw 'publishing the HEAD did not make the sequence openable' }
+    }
+}
+
+function New-K8CandidateExecutionHeadFixture {
+    <#
+        A minimal, self-contained fixture for the K8-S2 pre-execution
+        integration fix: a bare "canonical remote" holding a historical
+        immutable base and an attested candidate execution head built on top
+        of it, wired for BOTH Get-K8SourceIdentity (remote + pin) and
+        Test-K8FrozenPathIdentity (immutable base + frozen paths +
+        attestation) against the SAME repo/remote pair.
+    #>
+    param([switch] $PublishExecutionHead)
+    $repo = Join-Path ([System.IO.Path]::GetTempPath()) ('k8execid-' + [guid]::NewGuid().ToString('N'))
+    $bare = Join-Path ([System.IO.Path]::GetTempPath()) ('k8execidbare-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $repo | Out-Null
+    git init -q $repo | Out-Null
+    git -C $repo config user.name 'k8 test' | Out-Null
+    git -C $repo config user.email 'k8@test.local' | Out-Null
+    git -C $repo config commit.gpgsign false | Out-Null
+
+    $codePath = 'Study01/studies/study-01-negative-result/scripts/study01/frozen/semantics.py'
+    foreach ($path in @($codePath, 'bootstrap/Start-Study01.ps1', 'Study01/claims/claim.md', 'Study01/expected/result.json', 'docs/k8-packaging-certification.md', 'shakedown/tools/placeholder.ps1')) {
+        $full = Join-Path $repo $path
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $full) | Out-Null
+        "historical $path" | Set-Content -LiteralPath $full -Encoding utf8NoBOM
+    }
+    git -C $repo add -A | Out-Null
+    git -C $repo commit -q -m 'historical fixed base' | Out-Null
+    $base = (git -C $repo rev-parse HEAD).Trim()
+    $baseCodeBlob = (git -C $repo rev-parse "${base}:${codePath}").Trim()
+
+    'amended semantics' | Set-Content -LiteralPath (Join-Path $repo $codePath) -Encoding utf8NoBOM
+    git -C $repo add -A | Out-Null
+    $candidateTree = (git -C $repo write-tree).Trim()
+    $studyTree = (git -C $repo rev-parse "${candidateTree}:Study01").Trim()
+    $newCodeBlob = (git -C $repo rev-parse ":${codePath}").Trim()
+
+    $attestation = [ordered]@{
+        schema = 'study01-amended-candidate-attestation/1'
+        subject_study01_tree = $studyTree
+        base_release_commit = $base
+        source_kakuriyo_commit = ('1' * 40)
+        applied_amendments = @('AMEND-004')
+        not_applied_amendments = @()
+        transcription_authority = [ordered]@{
+            review_subject_commit = ('2' * 40)
+            review_record_commit = ('3' * 40)
+            review_record_path = 'synthetic/independent-review.md'
+            review_record_blob = ('4' * 40)
+            accepted_blobs = @(@{ path = 'studies/study-01-negative-result/scripts/study01/frozen/semantics.py'; blob = $newCodeBlob })
+            accepted_amendment_entries = @(@{ amendment_id = 'AMEND-004'; entry_digest = ('5' * 64) })
+        }
+        amendment_transcription = @(@{
+            toyotamahime_path = $codePath
+            kakuriyo_path = 'studies/study-01-negative-result/scripts/study01/frozen/semantics.py'
+            base_blob = $baseCodeBlob
+            new_blob = $newCodeBlob
+            amendment_id = 'AMEND-004'
+        })
+        publication_binding = @()
+    }
+    $attestation | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $repo 'docs/k8-study01-amended-candidate-attestation.json') -Encoding utf8NoBOM
+    git -C $repo add -A | Out-Null
+    git -C $repo commit -q -m 'candidate execution head' | Out-Null
+    $candidate = (git -C $repo rev-parse HEAD).Trim()
+
+    git init -q --bare $bare | Out-Null
+    git -C $repo remote add origin $bare | Out-Null
+    git -C $repo push -q origin "${base}:refs/heads/main" | Out-Null
+    if ($PublishExecutionHead) {
+        git -C $repo push -q origin "${candidate}:refs/heads/k8-candidate-execution/test-exec-001" | Out-Null
+    }
+    git -C $repo checkout -q $candidate | Out-Null
+    return [pscustomobject]@{ Repo = $repo; Bare = $bare; Base = $base; Candidate = $candidate }
+}
+
+Assert-K8Test 'K8-S2 pre-execution integration fix: an attested execution head published under the execution-head namespace is confirmed' {
+    Import-Module $CommonPath -Force
+    $f = New-K8CandidateExecutionHeadFixture -PublishExecutionHead
+    try {
+        Set-K8TestSourcePin -CanonicalRemoteUrls @($f.Bare) -CanonicalRef 'refs/heads/main'
+        Set-K8TestImmutableBase -Commit $f.Base -FrozenPaths @('Study01', 'bootstrap', 'docs/k8-packaging-certification.md')
+        $record = Get-K8SourceIdentity -RepoRoot $f.Repo
+        if ($record.ancestry -ne 'confirmed') { throw "attested, published execution head was not confirmed: $($record.ancestry) / $($record.ancestry_note)" }
+        if ($record.execution_head_ref -notmatch 'refs/heads/k8-candidate-execution/test-exec-001') { throw "confirmed record does not name the execution-head ref that matched: $($record | ConvertTo-Json -Compress)" }
+        [void](Assert-K8SourceIdentityPublished -SourceIdentity $record)
+    }
+    finally {
+        Reset-K8TestImmutableBase
+        Remove-Item $f.Repo, $f.Bare -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Assert-K8Test 'K8-S2 pre-execution integration fix: an attested but UNPUBLISHED execution head still fails closed' {
+    Import-Module $CommonPath -Force
+    # Content is attested exactly as the positive case -- only publication
+    # differs. Confirms content alone is not sufficient: a candidate that only
+    # exists on disk still cannot open a sequence.
+    $f = New-K8CandidateExecutionHeadFixture
+    try {
+        Set-K8TestSourcePin -CanonicalRemoteUrls @($f.Bare) -CanonicalRef 'refs/heads/main'
+        Set-K8TestImmutableBase -Commit $f.Base -FrozenPaths @('Study01', 'bootstrap', 'docs/k8-packaging-certification.md')
+        $record = Get-K8SourceIdentity -RepoRoot $f.Repo
+        if ($record.ancestry -ne 'not-an-ancestor') { throw "an unpublished execution head was confirmed: $($record.ancestry) / $($record.ancestry_note)" }
+        $stopped = $false; $message = ''
+        try { Assert-K8SourceIdentityPublished -SourceIdentity $record } catch { $stopped = $true; $message = $_.Exception.Message }
+        if (-not $stopped) { throw 'an unpublished execution head opened the sequence-open gate' }
+    }
+    finally {
+        Reset-K8TestImmutableBase
+        Remove-Item $f.Repo, $f.Bare -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Assert-K8Test 'K8-S2 pre-execution integration fix: no parameter lets an operator name a candidate id, ref or remote' {
+    # The execution-head namespace is enumerated from the canonical remote
+    # itself; nothing about it is caller-supplied. If a -CandidateId/
+    # -ExecutionHeadRef parameter ever appears, that is exactly the override
+    # this design refuses to offer.
+    foreach ($fn in 'Get-K8SourceIdentity', 'New-K8QualificationSequence') {
+        $params = (Get-Command $fn).Parameters.Keys
+        foreach ($p in $params) {
+            if ($p -match 'Candidate|ExecutionHead') { throw "$fn exposes -$p; execution-head identity must be discovered, never selected by the caller" }
+        }
     }
 }
 
