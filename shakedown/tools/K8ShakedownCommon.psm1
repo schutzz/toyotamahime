@@ -60,7 +60,7 @@ if (Test-Path $script:K8AttemptCommonPath) {
 
 $script:K8Shakedown = @{
     AmenonubocoUrl              = 'https://github.com/schutzz/ot-range-amenonuboco'
-    RangeGenCommit               = '3d8ca2dc7d5a7547e97633154b14bda75fa793e3'   # K8-S2 execution-only runtime override (v0.12.0 + bullseye snapshot apt fix); intentionally NOT copied from Study01/README.md, see note above
+    RangeGenCommit               = '16ec5a00d99efd26ddddfbbdb47712866861386f'   # K8-S2 execution-only runtime override (v0.12.0 + bullseye snapshot apt fix + tap_observer quote-collision fix); intentionally NOT copied from Study01/README.md, see note above
     RangeCTag                    = 'v0.13.0'
     RangeCCommit                 = '0378f8a32701b481e030f3db3d5f66ea471a4675'   # Range C validator
     TcpdumpImage                 = 'corfr/tcpdump'
@@ -7678,7 +7678,7 @@ function Test-K8ScoringInputArtifactCompleteness {
 #   - exactly 13 checks ran and the summary line reports exactly 12 PASS
 #   - exactly 1 check reports FAIL, and its name is 'worktree git usable'
 #   - that check's own reported worktree HEAD equals the one commit this
-#     override is authorized for (3d8ca2dc7d5a7547e97633154b14bda75fa793e3)
+#     override is authorized for (16ec5a00d99efd26ddddfbbdb47712866861386f)
 #   - that check's own reported frozen baseline equals Study01/README.md's
 #     OWN candidate RangeGen pin -- read fresh from the document on every
 #     call, never duplicated here as a second unpinned literal
@@ -7774,7 +7774,7 @@ function Assert-K8ExecutionOverridePreflightAcceptance {
     # literal from $C.RangeGenCommit below, not read from it: a future
     # RangeGenCommit change must not silently widen what this narrow
     # acceptance path accepts.
-    $authorizedOverrideCommit = '3d8ca2dc7d5a7547e97633154b14bda75fa793e3'
+    $authorizedOverrideCommit = '16ec5a00d99efd26ddddfbbdb47712866861386f'
 
     $C = Get-K8ShakedownConstants
     $parsed = ConvertFrom-K8PreflightCheckLines -Lines @($CommandResult.Output)

@@ -248,7 +248,7 @@ Assert-K8Test 'RangeGenCommit is a declared K8-S2 execution-only override, disti
     $readme = Get-Content (Join-Path $Study01 'README.md') -Raw
     $common = Get-Content (Join-Path $ToolsDir 'K8ShakedownCommon.psm1') -Raw
     $candidatePin = '78fc17746b5d663fafec9dffe563d79fe9ea02b7'
-    $executionOverridePin = '3d8ca2dc7d5a7547e97633154b14bda75fa793e3'
+    $executionOverridePin = '16ec5a00d99efd26ddddfbbdb47712866861386f'
     if ($readme -notlike "*$candidatePin*") { throw "candidate range-gen pin '$candidatePin' not found in Study01/README.md" }
     if ($common -notlike "*$executionOverridePin*") { throw "K8-S2 execution-only override pin '$executionOverridePin' not found in K8ShakedownCommon.psm1's RangeGenCommit" }
     if ($common -like "*$candidatePin*") { throw "K8ShakedownCommon.psm1 still carries the candidate pin '$candidatePin' -- RangeGenCommit override was not applied" }
@@ -275,7 +275,7 @@ function New-K8SyntheticPreflightLines {
        'worktree git usable' line and its PASS/FAIL swappable for each test. #>
     param(
         [bool] $WorktreeOk = $false,
-        [string] $WorktreeDetail = 'worktree is at 3d8ca2dc7d5a7547e97633154b14bda75fa793e3, frozen baseline is 78fc17746b5d663fafec9dffe563d79fe9ea02b7'
+        [string] $WorktreeDetail = 'worktree is at 16ec5a00d99efd26ddddfbbdb47712866861386f, frozen baseline is 78fc17746b5d663fafec9dffe563d79fe9ea02b7'
     )
     $names = @(
         'canonical shell', 'container path probes', 'worktree git usable', 'run workspace placement',
@@ -315,7 +315,7 @@ Assert-K8Test 'Assert-K8ExecutionOverridePreflightAcceptance: the REAL K8-S2 ove
     if (-not (Test-Path -LiteralPath $recordPath)) { throw 'no override-acceptance control-plane record was written' }
     $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
     if ($record.failed_check_name -ne 'worktree git usable') { throw "record failed_check_name = '$($record.failed_check_name)'" }
-    if ($record.observed_worktree_head -ne '3d8ca2dc7d5a7547e97633154b14bda75fa793e3') { throw "record observed_worktree_head = '$($record.observed_worktree_head)'" }
+    if ($record.observed_worktree_head -ne '16ec5a00d99efd26ddddfbbdb47712866861386f') { throw "record observed_worktree_head = '$($record.observed_worktree_head)'" }
     if ($record.frozen_candidate_pin -ne '78fc17746b5d663fafec9dffe563d79fe9ea02b7') { throw "record frozen_candidate_pin = '$($record.frozen_candidate_pin)'" }
     if ($record.total_checks -ne 13 -or $record.pass_count -ne 12) { throw "record total_checks/pass_count = $($record.total_checks)/$($record.pass_count)" }
     if ($record.schema -ne 'k8shakedown-execution-override-acceptance/1') { throw "unexpected schema '$($record.schema)'" }
@@ -369,7 +369,7 @@ Assert-K8Test 'Assert-K8ExecutionOverridePreflightAcceptance: worktree HEAD not 
 
 Assert-K8Test 'Assert-K8ExecutionOverridePreflightAcceptance: a frozen baseline that does not match Study01/README.md''s own candidate pin is fail-closed' {
     $run = New-K8TestRun
-    $result = [pscustomobject]@{ ExitCode = 1; Output = (New-K8SyntheticPreflightLines -WorktreeOk $false -WorktreeDetail 'worktree is at 3d8ca2dc7d5a7547e97633154b14bda75fa793e3, frozen baseline is 2222222222222222222222222222222222222222') }
+    $result = [pscustomobject]@{ ExitCode = 1; Output = (New-K8SyntheticPreflightLines -WorktreeOk $false -WorktreeDetail 'worktree is at 16ec5a00d99efd26ddddfbbdb47712866861386f, frozen baseline is 2222222222222222222222222222222222222222') }
     $threw = $false
     try { Assert-K8ExecutionOverridePreflightAcceptance -Run $run -Argv @('python') -CommandResult $result }
     catch { $threw = $true; if ($_.Exception.Message -notmatch "does not equal Study01/README.md's own candidate RangeGen pin") { throw "wrong rejection reason: $($_.Exception.Message)" } }
