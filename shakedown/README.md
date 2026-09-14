@@ -527,3 +527,18 @@ release/tag has been cut from this branch, and `k8-bootstrap-v4` (the current
 formal, certified bootstrap) is untouched. Promotion of anything here into the
 formal reproduction package is a separate, later decision made after
 independent review of a completed Shakedown run.
+
+**2026-09-14 update — Range C formal packaging promoted.** K8-S2's second full
+Shakedown (sequence `k8shakedown-seq-20260913-125102`, locked HEAD
+`128115bc79f43257ee92f6c13a63643b6884585c`; Range A `k8shakedown-rangea-20260913-125118`,
+Range B `k8shakedown-rangeb-20260913-132701`, Range C
+`k8shakedown-rangec-20260914-091954`) completed, and an independent
+qualification review against `K8-SHAKEDOWN-RETROSPECTIVE.md` §7 criteria 1-13
+found ALL PASS. This is the "independent review of a completed Shakedown run"
+the paragraph above anticipated. Per that review (recorded in Kakuriyo
+`studies/study-01-negative-result/K8-S2-AUTHORIZATION-BLOCKER-RESOLUTION.md`,
+2026-09-14 correction), `tools/k8_rangec_formal_package.py` is now promoted as
+the Range C formal static-validation packaging mechanism for K8-3 formal
+reproduction. This promotes the *mechanism* only: it does not reclassify any
+existing Shakedown-retained artifact as formal evidence, and the tool was not
+executed as part of this promotion decision.
