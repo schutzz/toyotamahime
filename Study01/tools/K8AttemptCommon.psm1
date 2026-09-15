@@ -617,6 +617,42 @@ function Invoke-K8Step {
         -ExpectedExitCode for a step the protocol itself expects to be
         non-zero (for example the Range C validator) so that existing
         protocol semantics are not broken by this wrapper.
+
+        Transcript continuity across process boundaries. The attempt's
+        transcript is opened once, in the bootstrap process
+        (Initialize-K8AttemptDirectory). PowerShell's Start-Transcript is
+        bound to the process that calls it, so a later step run from a
+        fresh process -- README-documented harness use, for any
+        operator: human, AI, or CI; Resolve-K8AttemptDir already treats
+        a fresh session/process as the normal case for resolving the
+        current attempt -- would otherwise leave transcript.txt missing
+        every step after bootstrap, even though steps.jsonl (append-only,
+        process-independent) records them completely. Each call here
+        re-attaches to the SAME transcript file with -Append and closes
+        it again before returning, so the ordered log stays complete
+        regardless of which process each step runs in.
+
+        Empirically confirmed on this repository's target PowerShell 7
+        runtime: Start-Transcript on a file that is already being
+        transcribed in the current process, and Stop-Transcript when no
+        transcript is active, are both no-ops rather than errors, and a
+        Stop-Transcript / Start-Transcript -Append cycle on the same
+        path within one process produces two ordered, non-overlapping
+        transcript sessions in that one file with no content loss. Both
+        calls are still wrapped defensively below in case a different
+        PowerShell build throws instead of no-op-ing; a transcript
+        bookkeeping failure must never fail the step itself.
+
+        This assumes the harness's current sequential, single-active-run
+        design (see EXE-01 / C-2b in docs/k8-experiment-constitution.md):
+        nothing calls Invoke-K8Step from inside a still-open outer
+        transcript in the same process that the outer caller still needs
+        open afterwards (Start-Study01.ps1 always stops its own
+        transcript before returning control -- see its own
+        Stop-Transcript call), and steps are never run concurrently
+        against the same attempt. Get-K8WslField, the one function
+        Shakedown imports from this module, is untouched by this
+        function and is not called from here.
     #>
     param(
         [Parameter(Mandatory)] $Paths,
@@ -628,57 +664,73 @@ function Invoke-K8Step {
 
     Assert-K8AttemptOpen -Paths $Paths -Operation 'record a new step'
 
-    $Start =
-        Get-Date
-
-    Write-Host ''
-    Write-Host "=== K8 STEP: $Description ===" -ForegroundColor Cyan
-    Write-Host "Command: $Command"
-
-    $global:LASTEXITCODE =
-        0
-
-    & $Command 2>&1 |
-        ForEach-Object { Write-Host $_ }
-
-    $ExitCode =
-        $LASTEXITCODE
-
-    $Passed =
-        $ExpectedExitCode -contains $ExitCode
-
-    $Record =
-        [ordered]@{
-            timestamp    = $Start.ToUniversalTime().ToString('o')
-            description  = $Description
-            command      = $Command.ToString().Trim()
-            exit_code    = $ExitCode
-            expected     = $ExpectedExitCode
-            passed       = $Passed
-        }
-
-    ($Record | ConvertTo-Json -Compress) |
-        Add-Content -Path $Paths.StepsLog -Encoding utf8
-
-    if ($Passed) {
-        Write-Host "=== STEP OK (exit $ExitCode) ===" -ForegroundColor Green
+    try {
+        Start-Transcript -Path $Paths.Transcript -Append -ErrorAction Stop |
+            Out-Null
     }
-    else {
-        Write-Host (
-            "=== STEP FAILED (exit $ExitCode, expected " +
-            "$($ExpectedExitCode -join ',')) ==="
-        ) -ForegroundColor Red
-        Write-Host (
-            'Do not work around this from memory. Close this attempt: ' +
-            "Stop-K8.ps1 `"<why>`""
-        ) -ForegroundColor Yellow
-
-        if (-not $ContinueOnFailure) {
-            throw "K8 step failed: $Description (exit $ExitCode)"
-        }
+    catch {
+        # Already active in this process (the common in-process-lifecycle
+        # case, e.g. certification's synthetic runbook script), or a
+        # PowerShell build where re-starting errors instead of no-op-ing.
+        # Either way, transcript bookkeeping must not fail the step.
     }
 
-    return $Record
+    try {
+        $Start =
+            Get-Date
+
+        Write-Host ''
+        Write-Host "=== K8 STEP: $Description ===" -ForegroundColor Cyan
+        Write-Host "Command: $Command"
+
+        $global:LASTEXITCODE =
+            0
+
+        & $Command 2>&1 |
+            ForEach-Object { Write-Host $_ }
+
+        $ExitCode =
+            $LASTEXITCODE
+
+        $Passed =
+            $ExpectedExitCode -contains $ExitCode
+
+        $Record =
+            [ordered]@{
+                timestamp    = $Start.ToUniversalTime().ToString('o')
+                description  = $Description
+                command      = $Command.ToString().Trim()
+                exit_code    = $ExitCode
+                expected     = $ExpectedExitCode
+                passed       = $Passed
+            }
+
+        ($Record | ConvertTo-Json -Compress) |
+            Add-Content -Path $Paths.StepsLog -Encoding utf8
+
+        if ($Passed) {
+            Write-Host "=== STEP OK (exit $ExitCode) ===" -ForegroundColor Green
+        }
+        else {
+            Write-Host (
+                "=== STEP FAILED (exit $ExitCode, expected " +
+                "$($ExpectedExitCode -join ',')) ==="
+            ) -ForegroundColor Red
+            Write-Host (
+                'Do not work around this from memory. Close this attempt: ' +
+                "Stop-K8.ps1 `"<why>`""
+            ) -ForegroundColor Yellow
+
+            if (-not $ContinueOnFailure) {
+                throw "K8 step failed: $Description (exit $ExitCode)"
+            }
+        }
+
+        return $Record
+    }
+    finally {
+        try { Stop-Transcript | Out-Null } catch { }
+    }
 }
 
 function Get-K8LastStep {
