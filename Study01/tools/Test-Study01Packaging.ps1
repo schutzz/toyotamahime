@@ -211,6 +211,106 @@ function Assert {
     if (-not $Condition) { throw $Message }
 }
 
+function ConvertFrom-K8PytestSummary {
+    <#
+        Parses a pytest `-q` run's own summary line into structured
+        per-status counts, instead of assuming any single status word
+        (e.g. "passed") sits immediately before " in Ns" -- that
+        assumption breaks the moment any other status (failed, skipped,
+        xfailed, xpassed, deselected, error(s)) is interposed between
+        "passed" and "in", which a whole-string regex anchored on
+        "passed ... in" cannot see coming.
+
+        pytest's summary line is a comma-separated list of "<count>
+        <label>" segments immediately followed by " in <N>s" (optionally
+        with a longer duration annotation in parens for slow runs), in
+        whatever order and combination pytest chooses to print them.
+        Anchoring on that trailing "in <N>s" marker -- not on any one
+        label -- finds the line regardless of which segments are
+        present, then splits and classifies each segment independently.
+
+        Recognizes: passed, failed, error/errors, skipped, xfailed,
+        xpassed, deselected, and the two-word "subtests passed" (a
+        pytest-subtests plugin annotation, kept as a separate informational
+        count and never folded into `passed`).
+
+        Returns $null (not a thrown error) if no line matches the
+        trailing "in <N>s" shape at all -- e.g. a bare collection error
+        with no per-status summary. Returns an object whose
+        `Unrecognized` list is non-empty if the matched line's body
+        contains a segment this function does not recognize, so the
+        caller can refuse to guess rather than silently drop it.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Text
+    )
+
+    $SummaryLinePattern =
+        '^(?<body>.+?)\s+in\s+[\d.]+s(?:\s*\([^)]*\))?\s*$'
+
+    $MatchedBody = $null
+    foreach ($Line in ($Text -split "`r?`n")) {
+        $LineMatch = [regex]::Match($Line.Trim(), $SummaryLinePattern)
+        if ($LineMatch.Success) {
+            # Last matching line wins: pytest prints exactly one such
+            # line per invocation, but if more than one line ever
+            # matches this shape, the final one is the real summary.
+            $MatchedBody = $LineMatch.Groups['body'].Value
+        }
+    }
+
+    if ($null -eq $MatchedBody) {
+        return $null
+    }
+
+    $Counts =
+        [ordered]@{
+            passed          = 0
+            failed          = 0
+            errors          = 0
+            skipped         = 0
+            xfailed         = 0
+            xpassed         = 0
+            deselected      = 0
+            subtests_passed = 0
+        }
+    $Unrecognized =
+        [System.Collections.Generic.List[string]]::new()
+
+    foreach ($RawSegment in ($MatchedBody -split ',')) {
+        $Segment = $RawSegment.Trim()
+        if (-not $Segment) { continue }
+
+        $SegmentMatch = [regex]::Match($Segment, '^(?<n>\d+)\s+(?<label>.+)$')
+        if (-not $SegmentMatch.Success) {
+            $Unrecognized.Add($Segment)
+            continue
+        }
+
+        $N     = [int] $SegmentMatch.Groups['n'].Value
+        $Label = $SegmentMatch.Groups['label'].Value.Trim().ToLowerInvariant()
+
+        switch ($Label) {
+            'passed'          { $Counts.passed          = $N }
+            'failed'          { $Counts.failed           = $N }
+            'error'           { $Counts.errors           = $N }
+            'errors'          { $Counts.errors           = $N }
+            'skipped'         { $Counts.skipped           = $N }
+            'xfailed'         { $Counts.xfailed           = $N }
+            'xpassed'         { $Counts.xpassed           = $N }
+            'deselected'      { $Counts.deselected         = $N }
+            'subtests passed' { $Counts.subtests_passed    = $N }
+            default           { $Unrecognized.Add($Segment) }
+        }
+    }
+
+    return [pscustomobject]@{
+        Counts       = $Counts
+        Unrecognized = $Unrecognized
+        RawBody      = $MatchedBody
+    }
+}
+
 # ======================================================================
 # Layer A -- Unit
 # ======================================================================
@@ -766,6 +866,21 @@ if (-not $SkipRunbook) {
             Assert ($Final.failing_command -match 'certification-injected failure') 'failing_command not auto-populated from last step'
         }
 
+        Invoke-Check -Layer 'Runbook' -Check 'failure lifecycle: steps.jsonl step_index/raw_output evidence complete and process-independent of transcript.txt' -Body {
+            $Dir = $FailureAttemptDirForAssertions
+            $Steps =
+                Get-Content -Path (Join-Path $Dir 'steps.jsonl') |
+                    Where-Object { $_.Trim() } |
+                    ForEach-Object { $_ | ConvertFrom-Json }
+            Assert ($Steps.Count -ge 1) 'steps.jsonl has no entries'
+            for ($i = 0; $i -lt $Steps.Count; $i++) {
+                Assert ($Steps[$i].step_index -eq $i) "step $i has step_index $($Steps[$i].step_index), expected $i"
+                Assert ([bool] $Steps[$i].raw_output) "step $i ($($Steps[$i].description)) has no raw_output field"
+                $RawPath = Join-Path $Dir $Steps[$i].raw_output
+                Assert (Test-Path $RawPath) "step $i ($($Steps[$i].description)) raw_output artifact missing: $RawPath"
+            }
+        }
+
         Invoke-Check -Layer 'Runbook' -Check 'failure lifecycle: manifest + archive + archive SHA-256 all correct' -Body {
             $Dir = $FailureAttemptDirForAssertions
             $Manifest = Join-Path $Dir 'manifest.sha256'
@@ -830,6 +945,21 @@ Set-Location (Join-Path '$Dir' 'toyotamahime\Study01')
     }
 
     if ($SuccessAttemptDirForAssertions) {
+        Invoke-Check -Layer 'Runbook' -Check 'success lifecycle: steps.jsonl step_index/raw_output evidence complete and process-independent of transcript.txt' -Body {
+            $Dir = $SuccessAttemptDirForAssertions
+            $Steps =
+                Get-Content -Path (Join-Path $Dir 'steps.jsonl') |
+                    Where-Object { $_.Trim() } |
+                    ForEach-Object { $_ | ConvertFrom-Json }
+            Assert ($Steps.Count -ge 1) 'steps.jsonl has no entries'
+            for ($i = 0; $i -lt $Steps.Count; $i++) {
+                Assert ($Steps[$i].step_index -eq $i) "step $i has step_index $($Steps[$i].step_index), expected $i"
+                Assert ([bool] $Steps[$i].raw_output) "step $i ($($Steps[$i].description)) has no raw_output field"
+                $RawPath = Join-Path $Dir $Steps[$i].raw_output
+                Assert (Test-Path $RawPath) "step $i ($($Steps[$i].description)) raw_output artifact missing: $RawPath"
+            }
+        }
+
         Invoke-Check -Layer 'Runbook' -Check 'success lifecycle: transcript closed, final-status Success, archive + SHA-256 correct' -Body {
             $Dir = $SuccessAttemptDirForAssertions
             Assert (Test-Path (Join-Path $Dir 'transcript.txt')) 'transcript.txt missing'
@@ -859,7 +989,7 @@ Set-Location (Join-Path '$Dir' 'toyotamahime\Study01')
             Assert ($ManifestBefore -eq $ManifestAfter) 'manifest.sha256 changed after a refused second close'
         }
 
-        Invoke-Check -Layer 'Runbook' -Check 'apparatus-integrity gate: README §3.1 documented test count matches the actual collected/passed count' -Body {
+        Invoke-Check -Layer 'Runbook' -Check 'apparatus-integrity gate: README §3.1 documented test count matches the actual collected/passed count, with zero failed/skipped/xfailed/xpassed/deselected/errors' -Body {
             <#
                 Closes the class of defect independently reviewed in
                 Kakuriyo evidence/reproduction/k8-repro-20260914-001/:
@@ -873,9 +1003,24 @@ Set-Location (Join-Path '$Dir' 'toyotamahime\Study01')
                 already executed against this repository's own current
                 working tree (New-K8PackagingFixtureRepo mirrors it, not
                 a stale snapshot) -- and cross-checks pytest's own actual
-                summary count against the number README §3.1 states, so
-                a future test-count change cannot ship without this
-                paragraph being updated in the same commit.
+                summary counts, via ConvertFrom-K8PytestSummary's
+                structural per-status parse (not a single regex assuming
+                "passed" sits next to "in Ns" -- see that function's own
+                comment for why an independent review found that
+                assumption unsafe), against the number README §3.1
+                states, so a future test-count change cannot ship
+                without this paragraph being updated in the same commit.
+
+                No repository-normative source found (in the K8-3
+                reproduction plan, README, or K8-4 §7.2's list of
+                legitimately-differing Range A/B/C properties) that
+                licenses any failed/skipped/xfailed/xpassed/deselected/
+                error test in this specific gate, so this check requires
+                all of them to be zero rather than inventing a new
+                tolerance for them; `subtests_passed` is tracked
+                separately as informational only, per README's own text,
+                and is never folded into the primary passed-count
+                comparison.
 
                 Deliberately not a bare whole-file string match: the
                 expected count is read only from the README prose lying
@@ -884,19 +1029,42 @@ Set-Location (Join-Path '$Dir' 'toyotamahime\Study01')
                 LineNumber field), so an unrelated future "NN tests"
                 phrase elsewhere in the document cannot be matched by
                 accident.
+
+                Reads the apparatus-integrity step's own per-step raw
+                artifact (steps.jsonl's `raw_output`), not transcript.txt
+                -- the same process-independent evidence Invoke-K8Step
+                now writes regardless of PowerShell transcript session
+                shape, so this check's own correctness does not inherit
+                a dependency this remediation exists to remove elsewhere.
             #>
             $Dir = $SuccessAttemptDirForAssertions
-            $TranscriptText = Get-Content -Path (Join-Path $Dir 'transcript.txt') -Raw
+            $Steps =
+                Get-Content -Path (Join-Path $Dir 'steps.jsonl') |
+                    Where-Object { $_.Trim() } |
+                    ForEach-Object { $_ | ConvertFrom-Json }
+            $ApparatusStep =
+                $Steps | Where-Object { $_.description -eq 'apparatus integrity test' } |
+                    Select-Object -Last 1
+            Assert ($null -ne $ApparatusStep) (
+                "no steps.jsonl entry with description 'apparatus integrity test' found " +
+                'in the success-lifecycle attempt -- cannot verify the apparatus-integrity count'
+            )
+            $RawOutputPath = Join-Path $Dir $ApparatusStep.raw_output
+            Assert (Test-Path $RawOutputPath) (
+                "apparatus-integrity step's raw_output artifact is missing: $RawOutputPath"
+            )
+            $StepOutputText = Get-Content -Path $RawOutputPath -Raw
 
-            $SummaryMatch = [regex]::Match(
-                $TranscriptText,
-                '(?<passed>\d+)\s+passed(?:,\s*(?<subtests>\d+)\s+subtests\s+passed)?\s+in\s'
+            $Summary = ConvertFrom-K8PytestSummary -Text $StepOutputText
+            Assert ($null -ne $Summary) (
+                'could not find a pytest summary line ("... in Ns") in the success-' +
+                'lifecycle transcript -- cannot verify the apparatus-integrity count'
             )
-            Assert $SummaryMatch.Success (
-                'could not find a pytest summary line ("NN passed ... in Ns") in the ' +
-                'success-lifecycle transcript -- cannot verify the apparatus-integrity count'
+            Assert ($Summary.Unrecognized.Count -eq 0) (
+                'pytest summary line contained segment(s) this check does not ' +
+                "recognize, refusing to guess at their meaning: $($Summary.Unrecognized -join '; ') " +
+                "(full summary line body: '$($Summary.RawBody)')"
             )
-            $ActualPassed = [int] $SummaryMatch.Groups['passed'].Value
 
             $CheckBlock   = Get-K8ReadmeBlockById -Blocks $Blocks -Id 'apparatus-check'
             $HarnessBlock = Get-K8ReadmeBlockById -Blocks $Blocks -Id 'apparatus-check-via-harness'
@@ -911,12 +1079,20 @@ Set-Location (Join-Path '$Dir' 'toyotamahime\Study01')
             )
             $ExpectedFromReadme = [int] $ReadmeMatch.Groups['n'].Value
 
-            Assert ($ActualPassed -eq $ExpectedFromReadme) (
+            $C = $Summary.Counts
+            Assert ($C.passed -eq $ExpectedFromReadme) (
                 "Study01/README.md section 3.1 says '$ExpectedFromReadme tests should pass', " +
-                "but the apparatus-integrity check actually collected/passed $ActualPassed on " +
-                "this repository's own shipped test suite. Update the README wording to match " +
-                'the shipped apparatus before releasing a bootstrap tag.'
+                "but the apparatus-integrity check actually collected/passed $($C.passed) on " +
+                "this repository's own shipped test suite (full summary: '$($Summary.RawBody)'). " +
+                'Update the README wording to match the shipped apparatus before releasing a ' +
+                'bootstrap tag.'
             )
+            Assert ($C.failed -eq 0)     "apparatus-integrity run reported $($C.failed) failed test(s): '$($Summary.RawBody)'"
+            Assert ($C.errors -eq 0)     "apparatus-integrity run reported $($C.errors) error(s): '$($Summary.RawBody)'"
+            Assert ($C.skipped -eq 0)    "apparatus-integrity run reported $($C.skipped) skipped test(s): '$($Summary.RawBody)'"
+            Assert ($C.xfailed -eq 0)    "apparatus-integrity run reported $($C.xfailed) xfailed test(s): '$($Summary.RawBody)'"
+            Assert ($C.xpassed -eq 0)    "apparatus-integrity run reported $($C.xpassed) xpassed test(s): '$($Summary.RawBody)'"
+            Assert ($C.deselected -eq 0) "apparatus-integrity run reported $($C.deselected) deselected test(s): '$($Summary.RawBody)'"
         }
     }
 }

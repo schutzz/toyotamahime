@@ -131,6 +131,13 @@ function Get-K8AttemptPaths {
         RepositoryJson      = Join-Path $Dir 'repository.json'
         EnvironmentJson     = Join-Path $Dir 'environment.json'
         StepsLog            = Join-Path $Dir 'steps.jsonl'
+        # Per-step raw stdout/stderr artifacts -- see Invoke-K8Step. Named
+        # steps-raw/, not transcript/, to keep it visually distinct from
+        # transcript.txt: this directory is the process-independent
+        # formal evidence; transcript.txt remains a retained,
+        # best-effort human-readable aggregate (see Invoke-K8Step's own
+        # doc comment for the evidence-authority split).
+        StepsRawDir         = Join-Path $Dir 'steps-raw'
         KnowledgeLeakMd     = Join-Path $Dir 'knowledge-leak-log.md'
         KnowledgeLeakJsonl  = Join-Path $Dir 'knowledge-leak-log.jsonl'
         StopReasonTxt       = Join-Path $Dir 'stop-reason.txt'
@@ -609,8 +616,8 @@ function Initialize-K8AttemptEnvironment {
 function Invoke-K8Step {
     <#
         Runs one reproduction command with structured, exit-code-aware
-        capture, so a transcript reviewer never has to guess whether a
-        step passed. Records every step (pass or fail) to steps.jsonl.
+        capture, so a reviewer never has to guess whether a step passed.
+        Records every step (pass or fail) to steps.jsonl.
 
         This does NOT retry, does NOT remediate, and by default treats
         any exit code other than 0 as a failure and throws. Pass
@@ -618,41 +625,54 @@ function Invoke-K8Step {
         non-zero (for example the Range C validator) so that existing
         protocol semantics are not broken by this wrapper.
 
-        Transcript continuity across process boundaries. The attempt's
-        transcript is opened once, in the bootstrap process
-        (Initialize-K8AttemptDirectory). PowerShell's Start-Transcript is
-        bound to the process that calls it, so a later step run from a
-        fresh process -- README-documented harness use, for any
-        operator: human, AI, or CI; Resolve-K8AttemptDir already treats
-        a fresh session/process as the normal case for resolving the
-        current attempt -- would otherwise leave transcript.txt missing
-        every step after bootstrap, even though steps.jsonl (append-only,
-        process-independent) records them completely. Each call here
-        re-attaches to the SAME transcript file with -Append and closes
-        it again before returning, so the ordered log stays complete
-        regardless of which process each step runs in.
+        Formal evidence authority -- process-independent by construction,
+        not by observed PowerShell behaviour. An earlier revision of this
+        function additionally re-attached to transcript.txt with
+        Start-Transcript -Append across process boundaries, and an
+        independent review confirmed that specific fix worked on this
+        repository's PowerShell 7.6.6 test runtime -- but its correctness
+        rested on Start-/Stop-Transcript's nested-session/reference-
+        counting behaviour, which is not part of PowerShell's documented
+        Stop-Transcript contract and was not verified on 7.6.2 (the
+        version the original failed formal attempt,
+        k8-repro-20260914-001, actually ran). That dependency is removed
+        here, not merely re-verified: every step's combined stdout/stderr
+        is now written, line by line, straight to its own per-step raw
+        artifact under Paths.StepsRawDir via Add-Content -- the exact
+        same process-independent file-append primitive steps.jsonl has
+        always used, with no PowerShell transcription API involved at
+        all. steps.jsonl gains `step_index` (this attempt's step count at
+        entry, read fresh from disk so it is correct regardless of which
+        process ran each prior step -- steps.jsonl's own append order,
+        not wall-clock, is this schema's canonical ordering authority)
+        and `raw_output` (the artifact's path, relative to AttemptDir).
+        Existing manifest generation (Complete-K8Attempt) already walks
+        AttemptDir recursively, so steps-raw/*.log is picked up
+        automatically with no change needed there.
 
-        Empirically confirmed on this repository's target PowerShell 7
-        runtime: Start-Transcript on a file that is already being
-        transcribed in the current process, and Stop-Transcript when no
-        transcript is active, are both no-ops rather than errors, and a
-        Stop-Transcript / Start-Transcript -Append cycle on the same
-        path within one process produces two ordered, non-overlapping
-        transcript sessions in that one file with no content loss. Both
-        calls are still wrapped defensively below in case a different
-        PowerShell build throws instead of no-op-ing; a transcript
-        bookkeeping failure must never fail the step itself.
+        transcript.txt is still opened once, in the bootstrap process
+        (Initialize-K8AttemptDirectory), and this function still
+        defensively tries to re-attach to it with -Append here so it
+        stays a useful, best-effort, human-readable aggregate when the
+        operator's session shape happens to support it -- but nothing
+        about step-evidence *completeness* depends on that succeeding
+        any more. A build, version, or session shape where
+        Start-Transcript silently fails or behaves unexpectedly can no
+        longer cause a gap in the formal record; only the per-step raw
+        artifacts and steps.jsonl are load-bearing. transcript.txt
+        remains a retained artifact (the K8-3 evidence list in
+        docs/k8-independent-reproduction-plan.md names "transcript"
+        explicitly), it is simply no longer where step-level
+        completeness is proven from.
 
-        This assumes the harness's current sequential, single-active-run
-        design (see EXE-01 / C-2b in docs/k8-experiment-constitution.md):
-        nothing calls Invoke-K8Step from inside a still-open outer
-        transcript in the same process that the outer caller still needs
-        open afterwards (Start-Study01.ps1 always stops its own
-        transcript before returning control -- see its own
-        Stop-Transcript call), and steps are never run concurrently
-        against the same attempt. Get-K8WslField, the one function
-        Shakedown imports from this module, is untouched by this
-        function and is not called from here.
+        This has no PowerShell-version-specific assumption beyond
+        #requires -Version 7.0 at the top of this file: Add-Content,
+        Get-Content, the pipeline, and 2>&1 redirection are unchanged
+        since PowerShell Core 6.0 and Windows PowerShell 5.1 alike.
+
+        Get-K8WslField, the one function Shakedown imports from this
+        module, is untouched by this function and is not called from
+        here.
     #>
     param(
         [Parameter(Mandatory)] $Paths,
@@ -664,15 +684,33 @@ function Invoke-K8Step {
 
     Assert-K8AttemptOpen -Paths $Paths -Operation 'record a new step'
 
+    # steps.jsonl's own line count, read fresh from disk, is this
+    # attempt's step identity/ordering authority -- correct regardless
+    # of which process ran each prior step. Steps are never run
+    # concurrently against one attempt (EXE-01 / C-2b in
+    # docs/k8-experiment-constitution.md), so no locking is needed to
+    # make this read-then-use safe.
+    $StepIndex = 0
+    if (Test-Path $Paths.StepsLog) {
+        $StepIndex =
+            @(Get-Content -Path $Paths.StepsLog | Where-Object { $_.Trim() }).Count
+    }
+
+    New-Item -ItemType Directory -Force -Path $Paths.StepsRawDir |
+        Out-Null
+    $RawOutputPath =
+        Join-Path $Paths.StepsRawDir ('{0:D4}.log' -f $StepIndex)
+    $RawOutputRelativePath =
+        "steps-raw/{0:D4}.log" -f $StepIndex
+
+    # Best-effort convenience only from here on -- see the doc comment
+    # above. A failure here must never fail the step, and nothing below
+    # checks whether it actually succeeded.
     try {
         Start-Transcript -Path $Paths.Transcript -Append -ErrorAction Stop |
             Out-Null
     }
     catch {
-        # Already active in this process (the common in-process-lifecycle
-        # case, e.g. certification's synthetic runbook script), or a
-        # PowerShell build where re-starting errors instead of no-op-ing.
-        # Either way, transcript bookkeeping must not fail the step.
     }
 
     try {
@@ -686,8 +724,26 @@ function Invoke-K8Step {
         $global:LASTEXITCODE =
             0
 
+        # Formal, process-independent evidence: every combined
+        # stdout/stderr line is both shown to the operator (Write-Host,
+        # same as before) and appended to this step's own raw artifact
+        # file, line by line, as it arrives -- not buffered in memory
+        # and written once at the end, so a step that is killed mid-run
+        # still leaves whatever output it produced on disk.
         & $Command 2>&1 |
-            ForEach-Object { Write-Host $_ }
+            ForEach-Object {
+                $Line = $_.ToString()
+                Write-Host $Line
+                Add-Content -Path $RawOutputPath -Value $Line -Encoding utf8
+            }
+
+        if (-not (Test-Path $RawOutputPath)) {
+            # The command produced no output at all -- retain an empty,
+            # present file rather than no file, so "no output" and "step
+            # never ran" stay distinguishable on disk (same discipline
+            # EVD-03 already requires of other empty-output evidence).
+            New-Item -ItemType File -Path $RawOutputPath -Force | Out-Null
+        }
 
         $ExitCode =
             $LASTEXITCODE
@@ -697,12 +753,14 @@ function Invoke-K8Step {
 
         $Record =
             [ordered]@{
+                step_index   = $StepIndex
                 timestamp    = $Start.ToUniversalTime().ToString('o')
                 description  = $Description
                 command      = $Command.ToString().Trim()
                 exit_code    = $ExitCode
                 expected     = $ExpectedExitCode
                 passed       = $Passed
+                raw_output   = $RawOutputRelativePath
             }
 
         ($Record | ConvertTo-Json -Compress) |

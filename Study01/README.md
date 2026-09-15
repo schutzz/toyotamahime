@@ -111,11 +111,15 @@ The tag `k8-bootstrap-v5` points at a specific commit in this repository's histo
 
 ```text
 C:\K8\attempts\k8-repro-YYYYMMDD-NNN\
-  transcript.txt             one ordered log, from before the clone onward
+  transcript.txt             best-effort, human-readable aggregate log, from before the
+                              clone onward -- retained, but not what step-level evidence
+                              completeness is proven from; see steps.jsonl / steps-raw/
   attempt.json                \
   repository.json              small, machine-readable identity records
   environment.json            /
-  steps.jsonl                 one line per Invoke-K8Step.ps1 call, with exit codes
+  steps.jsonl                 one line per Invoke-K8Step.ps1 call: step_index, exit code,
+                               and a raw_output path into steps-raw/, process-independent
+  steps-raw\NNNN.log          this step's own combined stdout/stderr, in step_index order
   knowledge-leak-log.md        \  Sec6.2 knowledge-leak log, human + machine forms
   knowledge-leak-log.jsonl     /
   stop-reason.txt             written by Stop-K8.ps1
