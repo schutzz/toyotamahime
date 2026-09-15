@@ -53,26 +53,26 @@ Study01/
 | Shell | **PowerShell 7**. The apparatus rejects other shells at preflight — Git Bash / MSYS rewrites bare in-container paths, which silently breaks capture and sender steps. This is enforced, not advisory. |
 | OS | Windows with Docker Desktop. The original runs used Windows 11. |
 | Docker | Docker Engine with Compose v2 (`docker compose`, not `docker-compose`). |
-| Python | 3.10 or later. `pytest` is required — §3.1's apparatus-integrity check is mandatory, not optional, before you use the apparatus. Range C additionally needs `pydantic` 2.x and `PyYAML`; §4.1 installs them from the validator's own declared requirements. |
+| Python | 3.10 or later. `pytest` is required, pinned to the exact version in [`studies/study-01-negative-result/scripts/tests/requirements.txt`](./studies/study-01-negative-result/scripts/tests/requirements.txt) — §3.1's apparatus-integrity check is mandatory, not optional, before you use the apparatus, and its pass/fail wording below assumes that pinned version. Range C additionally needs `pydantic` 2.x and `PyYAML`; §4.1 installs them from the validator's own declared requirements. |
 | `git` | any recent version |
 
 Record your own versions before you start; the original runs used Python 3.10.11, pydantic 2.12.5, PyYAML 6.0.3.
 
-Install `pytest`, then confirm the apparatus is intact before using it. **You are already at `Study01/`** per §2 — do not prefix any path below with `Study01/` again; that includes the repo-local tools in §3.2, which live at `.\tools\...` from here, not `.\Study01\tools\...`. `Push-Location`/`Pop-Location` below returns you to `Study01/` when it's done, rather than leaving you three directories deeper — important if you continue on to §3.2's tools next, which need to be run from `Study01/`:
+Install pytest from the pinned requirements file, then confirm the apparatus is intact before using it. **You are already at `Study01/`** per §2 — do not prefix any path below with `Study01/` again; that includes the repo-local tools in §3.2, which live at `.\tools\...` from here, not `.\Study01\tools\...`. `Push-Location`/`Pop-Location` below returns you to `Study01/` when it's done, rather than leaving you three directories deeper — important if you continue on to §3.2's tools next, which need to be run from `Study01/`:
 
 <!-- k8-test:id=apparatus-check mode=exec cwd=Study01 -->
 ```powershell
-python -m pip install pytest
+python -m pip install -r studies/study-01-negative-result/scripts/tests/requirements.txt
 Push-Location studies/study-01-negative-result/scripts
 python -m pytest tests -q
 Pop-Location
 ```
 
-69 tests should pass. If they do not, stop and record the failure; do not continue. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (69 passed):
+74 tests should pass. If they do not, stop and record the failure; do not continue. This exact count is machine-checked, not just documented here: `Study01/tools/Test-Study01Packaging.ps1`'s packaging certification runs this same check against this repository's own shipped test suite before every bootstrap release and fails certification if the actual collected/passed count and this paragraph's stated count disagree, so a future apparatus change that adds or removes tests cannot ship without this paragraph being updated in the same commit. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (74 passed):
 
 <!-- k8-test:id=apparatus-check-via-harness mode=exec cwd=Study01 -->
 ```powershell
-.\tools\Invoke-K8Step.ps1 -Description 'install pytest' -Command { python -m pip install pytest }
+.\tools\Invoke-K8Step.ps1 -Description 'install pytest' -Command { python -m pip install -r studies/study-01-negative-result/scripts/tests/requirements.txt }
 .\tools\Invoke-K8Step.ps1 -Description 'apparatus integrity test' -Command { python -m pytest studies/study-01-negative-result/scripts/tests -q }
 ```
 

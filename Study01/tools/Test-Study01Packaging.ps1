@@ -26,12 +26,16 @@
     What gets mocked: GitHub network (a local git fixture stands in for
     it) and, by not executing them, Docker runtime, Amenonuboco remote,
     and range runtime. pip/PyPI network is NOT mocked -- Layer C's
-    apparatus-check blocks genuinely `pip install pytest` and run the
-    real 69-test suite; a machine with no route to PyPI correctly fails
-    Layer C, the same way a clean VM without one would. Everything else
-    (git, PowerShell process/scope boundaries, cwd, environment-variable
-    handoff, CLI parameter parsing, transcript open/close, archive/hash)
-    is the real thing.
+    apparatus-check blocks genuinely `pip install` the pinned pytest
+    from studies/study-01-negative-result/scripts/tests/requirements.txt
+    and run the real test suite (currently 74 tests; a Runbook-layer
+    check cross-checks that live count against README §3.1's own stated
+    number on every run, so the two cannot silently drift apart again);
+    a machine with no route to PyPI correctly fails Layer C, the same
+    way a clean VM without one would. Everything else (git, PowerShell
+    process/scope boundaries, cwd, environment-variable handoff, CLI
+    parameter parsing, transcript open/close, archive/hash) is the real
+    thing.
 
     Does not remediate anything it finds broken, and never will --
     fixture/test setup here is not the same thing as production-attempt
@@ -853,6 +857,66 @@ Set-Location (Join-Path '$Dir' 'toyotamahime\Study01')
 
             $ManifestAfter = (Get-FileHash -Path (Join-Path $Dir 'manifest.sha256') -Algorithm SHA256).Hash
             Assert ($ManifestBefore -eq $ManifestAfter) 'manifest.sha256 changed after a refused second close'
+        }
+
+        Invoke-Check -Layer 'Runbook' -Check 'apparatus-integrity gate: README §3.1 documented test count matches the actual collected/passed count' -Body {
+            <#
+                Closes the class of defect independently reviewed in
+                Kakuriyo evidence/reproduction/k8-repro-20260914-001/:
+                README §3.1 said "69 tests should pass" after an accepted
+                amendment (AMEND-004) had already added 5 tests to the
+                shipped suite (69 -> 74), and nothing caught the drift
+                before a bootstrap tag shipped it. This check runs the
+                real apparatus-integrity command -- via the same
+                README-sourced apparatus-check / apparatus-check-via-
+                harness k8-test blocks the success-lifecycle pass above
+                already executed against this repository's own current
+                working tree (New-K8PackagingFixtureRepo mirrors it, not
+                a stale snapshot) -- and cross-checks pytest's own actual
+                summary count against the number README §3.1 states, so
+                a future test-count change cannot ship without this
+                paragraph being updated in the same commit.
+
+                Deliberately not a bare whole-file string match: the
+                expected count is read only from the README prose lying
+                between the apparatus-check and apparatus-check-via-
+                harness k8-test markers (via Get-K8ReadmeBlocks' own
+                LineNumber field), so an unrelated future "NN tests"
+                phrase elsewhere in the document cannot be matched by
+                accident.
+            #>
+            $Dir = $SuccessAttemptDirForAssertions
+            $TranscriptText = Get-Content -Path (Join-Path $Dir 'transcript.txt') -Raw
+
+            $SummaryMatch = [regex]::Match(
+                $TranscriptText,
+                '(?<passed>\d+)\s+passed(?:,\s*(?<subtests>\d+)\s+subtests\s+passed)?\s+in\s'
+            )
+            Assert $SummaryMatch.Success (
+                'could not find a pytest summary line ("NN passed ... in Ns") in the ' +
+                'success-lifecycle transcript -- cannot verify the apparatus-integrity count'
+            )
+            $ActualPassed = [int] $SummaryMatch.Groups['passed'].Value
+
+            $CheckBlock   = Get-K8ReadmeBlockById -Blocks $Blocks -Id 'apparatus-check'
+            $HarnessBlock = Get-K8ReadmeBlockById -Blocks $Blocks -Id 'apparatus-check-via-harness'
+            $ReadmeLines  = Get-Content -Path $ReadmePath
+            $BetweenText  =
+                ($ReadmeLines[($CheckBlock.LineNumber - 1)..($HarnessBlock.LineNumber - 2)]) -join "`n"
+
+            $ReadmeMatch = [regex]::Match($BetweenText, '(?<n>\d+)\s+tests should pass')
+            Assert $ReadmeMatch.Success (
+                'could not find the "NN tests should pass" sentence between the ' +
+                'apparatus-check and apparatus-check-via-harness blocks in Study01/README.md'
+            )
+            $ExpectedFromReadme = [int] $ReadmeMatch.Groups['n'].Value
+
+            Assert ($ActualPassed -eq $ExpectedFromReadme) (
+                "Study01/README.md section 3.1 says '$ExpectedFromReadme tests should pass', " +
+                "but the apparatus-integrity check actually collected/passed $ActualPassed on " +
+                "this repository's own shipped test suite. Update the README wording to match " +
+                'the shipped apparatus before releasing a bootstrap tag.'
+            )
         }
     }
 }

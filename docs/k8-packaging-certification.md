@@ -48,6 +48,8 @@ This is deliberately **not** "call the module functions in the same process" —
 
 Layer C runs the full lifecycle twice — once ending in `Stop-K8.ps1 -Success`, once ending in `Stop-K8.ps1` (Failed) — asserting in both cases that the transcript closed, `final-status.json` is correct, `manifest.sha256` exists, and the archive's SHA-256 matches its actual bytes.
 
+**Apparatus-integrity count self-consistency.** After the success-lifecycle pass, a further Runbook-layer check reads the real `python -m pytest` summary line from that pass's own `transcript.txt` and cross-checks the actual collected/passed count against the number `Study01/README.md` §3.1 states in its "NN tests should pass" sentence (read only from the prose between the `apparatus-check` and `apparatus-check-via-harness` markers, not a whole-file string match). A future change to the shipped test suite that adds or removes tests without updating that sentence in the same commit fails certification here, instead of surfacing only during a formal K8-3 attempt — which is exactly how this drifted from 69 to 74 tests unnoticed once (`AMEND-004` added 5 tests; see `evidence/reproduction/k8-repro-20260914-001/` in Kakuriyo for the independent review that found it).
+
 ## What is mocked, and what never is
 
 Mocked (external dependencies a clean VM still has to prove for itself, and that this certification does not claim to):
@@ -57,7 +59,7 @@ Mocked (external dependencies a clean VM still has to prove for itself, and that
 - The Amenonuboco remote (§4.1's clones are `parse`-only)
 - Range A/B/C runtime execution (out of scope for this certification entirely — it governs K8-3 packaging, not Amenonuboco-provisioned range behavior)
 
-**Not mocked, and worth calling out because it is easy to assume otherwise:** pip/PyPI network access. `apparatus-check` genuinely runs `pip install pytest` against whatever package index the certifying machine is configured for, and then runs the real 69-test suite. A machine with no route to PyPI fails Layer C for that reason — correctly, since a clean VM without one would fail identically.
+**Not mocked, and worth calling out because it is easy to assume otherwise:** pip/PyPI network access. `apparatus-check` genuinely runs `pip install -r studies/study-01-negative-result/scripts/tests/requirements.txt` (a pinned `pytest` version, not a bare `pip install pytest`) against whatever package index the certifying machine is configured for, and then runs the real test suite. A machine with no route to PyPI fails Layer C for that reason — correctly, since a clean VM without one would fail identically.
 
 Never mocked, per the original defect classes this exists to catch:
 
@@ -135,5 +137,6 @@ Adding a new README-documented harness command or a new reproduction-critical co
 ## Known limitations
 
 - Layer A's WSL check is skipped (not failed) on a certifying machine without `wsl.exe` present at all; it does not fabricate a pass.
-- pip network access is not mocked — Layer C's `apparatus-check` blocks genuinely `pip install pytest` and run the real 69-test suite against the fixture's copy of the frozen apparatus. A certifying machine without Python/pip/network to PyPI will fail Layer C for that reason, correctly, since a clean VM needs exactly the same thing to succeed.
+- pip network access is not mocked — Layer C's `apparatus-check` blocks genuinely `pip install` the pinned `pytest` version and run the real test suite against the fixture's copy of the frozen apparatus. A certifying machine without Python/pip/network to PyPI will fail Layer C for that reason, correctly, since a clean VM needs exactly the same thing to succeed.
+- The apparatus-integrity count self-consistency check (see "Layer C") only verifies that README §3.1's stated count matches the *actual* collected/passed count on the certifying machine's own pytest resolution; it does not itself pin or verify the pytest version (`requirements.txt` does that separately) and does not verify the "NN subtests passed" portion of the summary line.
 - This certification governs K8-3 **packaging** — bootstrap, harness, README interface, documentation consistency. It does not and cannot certify Range A/B/C scientific behavior, which requires Amenonuboco and Docker and is explicitly out of scope (see "What is mocked" above).
