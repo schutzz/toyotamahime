@@ -123,7 +123,9 @@ C:\K8\attempts\k8-repro-YYYYMMDD-NNN\
   knowledge-leak-log.md        \  Sec6.2 knowledge-leak log, human + machine forms
   knowledge-leak-log.jsonl     /
   stop-reason.txt             written by Stop-K8.ps1
-  final-status.json           outcome, reason, final HEAD/status -- not a Gate K8 verdict
+  final-status.json           outcome, reason, final HEAD/status, and transcript_complete
+                               (whether transcript.txt actually covers every step recorded
+                               in steps.jsonl) -- not a Gate K8 verdict
   manifest.sha256             sha256 of every file above, before archiving
 
 C:\K8\attempts\k8-repro-YYYYMMDD-NNN.zip           the attempt directory, archived

@@ -230,9 +230,18 @@ function ConvertFrom-K8PytestSummary {
         present, then splits and classifies each segment independently.
 
         Recognizes: passed, failed, error/errors, skipped, xfailed,
-        xpassed, deselected, and the two-word "subtests passed" (a
+        xpassed, deselected, the two-word "subtests passed" (a
         pytest-subtests plugin annotation, kept as a separate informational
-        count and never folded into `passed`).
+        count and never folded into `passed`), and warning/warnings (pytest's
+        own warnings-captured count -- not a test outcome at all, so it is
+        tracked the same informational way as subtests_passed: never folded
+        into `passed`, and never treated as an unrecognized/refuse-to-guess
+        segment on its own. A real pytest run with zero test failures can
+        still emit "N warning(s)" in this exact summary line -- confirmed
+        against a live pytest run during independent review -- so without
+        this, a healthy all-tests-passed run would be misreported as
+        containing an unrecognized segment and fail this gate for a reason
+        that has nothing to do with the 74-tests-should-pass requirement.
 
         Returns $null (not a thrown error) if no line matches the
         trailing "in <N>s" shape at all -- e.g. a bare collection error
@@ -273,6 +282,7 @@ function ConvertFrom-K8PytestSummary {
             xpassed         = 0
             deselected      = 0
             subtests_passed = 0
+            warnings        = 0
         }
     $Unrecognized =
         [System.Collections.Generic.List[string]]::new()
@@ -300,6 +310,8 @@ function ConvertFrom-K8PytestSummary {
             'xpassed'         { $Counts.xpassed           = $N }
             'deselected'      { $Counts.deselected         = $N }
             'subtests passed' { $Counts.subtests_passed    = $N }
+            'warning'         { $Counts.warnings           = $N }
+            'warnings'        { $Counts.warnings           = $N }
             default           { $Unrecognized.Add($Segment) }
         }
     }
@@ -491,6 +503,73 @@ if (-not $SkipUnit) {
             Assert (-not $Env.wsl_status.Contains([char]0)) 'wsl_status has embedded NUL'
             $RawJson = Get-Content $Paths.EnvironmentJson -Raw
             Assert (-not $RawJson.Contains([char]0)) 'environment.json file contains a raw NUL byte'
+        }
+
+        Invoke-Check -Layer 'Unit' -Check 'ConvertFrom-K8PytestSummary: warning/warnings tracked separately, never folded into passed, never unrecognized' -Body {
+            # Regresses the independent-review finding that a real pytest run
+            # with zero failures can still emit "N warning(s)" in its summary
+            # line, and that this parser did not recognize that segment --
+            # confirmed against a live pytest run before this fix.
+            $NoWarn = ConvertFrom-K8PytestSummary -Text '74 passed in 3.29s'
+            Assert ($NoWarn.Counts.passed -eq 74) 'baseline passed count wrong'
+            Assert ($NoWarn.Counts.warnings -eq 0) 'baseline warnings should be 0'
+            Assert ($NoWarn.Unrecognized.Count -eq 0) 'baseline should have no unrecognized segments'
+
+            $OneWarn = ConvertFrom-K8PytestSummary -Text '74 passed, 1 warning in 3.29s'
+            Assert ($OneWarn.Counts.passed -eq 74) 'passed count wrong with 1 warning present'
+            Assert ($OneWarn.Counts.warnings -eq 1) 'singular "1 warning" not recognized'
+            Assert ($OneWarn.Unrecognized.Count -eq 0) 'a single real pytest warning must not be treated as unrecognized -- this is exactly the independent-review finding this check regresses'
+
+            $TwoWarn = ConvertFrom-K8PytestSummary -Text '70 passed, 2 warnings in 1.10s'
+            Assert ($TwoWarn.Counts.passed -eq 70) 'passed count wrong with 2 warnings present'
+            Assert ($TwoWarn.Counts.warnings -eq 2) 'plural "2 warnings" not recognized'
+            Assert ($TwoWarn.Unrecognized.Count -eq 0) 'plural warnings must not be treated as unrecognized'
+
+            $FailedWithWarn = ConvertFrom-K8PytestSummary -Text '1 failed, 73 passed, 1 warning in 3.31s'
+            Assert ($FailedWithWarn.Counts.failed -eq 1) 'failed count wrong alongside a warning segment'
+            Assert ($FailedWithWarn.Counts.passed -eq 73) 'passed count wrong alongside a warning segment'
+            Assert ($FailedWithWarn.Counts.warnings -eq 1) 'warning count wrong alongside a real failure'
+            Assert ($FailedWithWarn.Unrecognized.Count -eq 0) 'warning segment must not itself be unrecognized even when a real failure is also present -- the real failure is what must gate this, not the warning'
+
+            $StillUnknown = ConvertFrom-K8PytestSummary -Text '74 banana in 3.10s'
+            Assert ($StillUnknown.Unrecognized.Count -eq 1) 'a genuinely unknown token must still be refused, not silently accepted -- adding warning/warnings must not weaken fail-closed behaviour for anything else'
+            Assert ($StillUnknown.Unrecognized[0] -eq '74 banana') 'unrecognized segment text mismatch'
+        }
+
+        Invoke-Check -Layer 'Unit' -Check 'Complete-K8Attempt: transcript_complete is true and explicit when transcript genuinely covers every step' -Body {
+            $Paths = Initialize-K8AttemptDirectory -AttemptRoot (Join-Path $UnitRoot 'a17') -AttemptId 'k8-repro-19700101-001' -RepoUrl 'unit-test'
+            Invoke-K8Step -Paths $Paths -Description 'ok step 1' -Command { & cmd.exe /c "exit 0" } | Out-Null
+            Invoke-K8Step -Paths $Paths -Description 'ok step 2' -Command { & cmd.exe /c "exit 0" } | Out-Null
+            Complete-K8Attempt -Paths $Paths -Outcome 'Success' -Reason 'transcript coverage unit test'
+            $Final = Get-Content $Paths.FinalStatusJson -Raw | ConvertFrom-Json
+            Assert ($Final.transcript_complete -eq $true) "expected transcript_complete true, got $($Final.transcript_complete) ($($Final.transcript_completeness_reason))"
+            Assert ($Final.transcript_expected_steps -eq 2) "expected 2 steps recorded, got $($Final.transcript_expected_steps)"
+            Assert ($Final.transcript_step_markers -ge 2) "expected at least 2 transcript step markers, got $($Final.transcript_step_markers)"
+        }
+
+        Invoke-Check -Layer 'Unit' -Check 'Complete-K8Attempt: transcript becoming unavailable mid-attempt is recorded explicitly as transcript_complete=false, never silently passed' -Body {
+            $Paths = Initialize-K8AttemptDirectory -AttemptRoot (Join-Path $UnitRoot 'a18') -AttemptId 'k8-repro-19700101-001' -RepoUrl 'unit-test'
+            try { Stop-Transcript | Out-Null } catch {}
+            Invoke-K8Step -Paths $Paths -Description 'ok before loss' -Command { & cmd.exe /c "exit 0" } | Out-Null
+            # Simulate transcript becoming unavailable partway through the
+            # attempt (the scenario an independent review found undetectable):
+            # point Transcript at a target that cannot be opened, so every
+            # subsequent Start-Transcript -Append in Invoke-K8Step fails and
+            # is silently swallowed by that function's own design.
+            $Paths.Transcript = 'Z:\does-not-exist\transcript.txt'
+            Invoke-K8Step -Paths $Paths -Description 'step after transcript loss' -Command { & cmd.exe /c "exit 0" } | Out-Null
+            Complete-K8Attempt -Paths $Paths -Outcome 'Success' -Reason 'transcript coverage unit test (loss case)'
+            $Final = Get-Content $Paths.FinalStatusJson -Raw | ConvertFrom-Json
+            Assert ($Final.transcript_complete -eq $false) 'a transcript that stopped covering steps partway through must be recorded as transcript_complete=false, not true and not silently absent'
+            Assert ([bool] $Final.transcript_completeness_reason) 'transcript_completeness_reason must explain why, not be empty'
+            # Formal step evidence itself must be completely unaffected --
+            # this is the whole point of steps.jsonl / steps-raw/ being the
+            # separate, process-independent evidence authority.
+            $Steps = Get-Content $Paths.StepsLog | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json }
+            Assert ($Steps.Count -eq 2) "expected 2 steps still recorded in steps.jsonl despite transcript loss, got $($Steps.Count)"
+            foreach ($S in $Steps) {
+                Assert (Test-Path (Join-Path $Paths.AttemptDir $S.raw_output)) "raw_output artifact missing for step $($S.step_index) despite transcript loss"
+            }
         }
     }
     finally {
@@ -866,6 +945,16 @@ if (-not $SkipRunbook) {
             Assert ($Final.failing_command -match 'certification-injected failure') 'failing_command not auto-populated from last step'
         }
 
+        Invoke-Check -Layer 'Runbook' -Check 'failure lifecycle: transcript.txt is judged complete (satisfies plan section 10''s "complete transcript" requirement), not just present' -Body {
+            $Dir = $FailureAttemptDirForAssertions
+            $Final = Get-Content (Join-Path $Dir 'final-status.json') -Raw | ConvertFrom-Json
+            Assert ($null -ne $Final.transcript_complete) 'final-status.json has no transcript_complete field'
+            Assert ($Final.transcript_complete -eq $true) (
+                "transcript.txt did not cover every recorded step under a real README-driven run: " +
+                "$($Final.transcript_step_markers) marker(s) for $($Final.transcript_expected_steps) step(s) -- $($Final.transcript_completeness_reason)"
+            )
+        }
+
         Invoke-Check -Layer 'Runbook' -Check 'failure lifecycle: steps.jsonl step_index/raw_output evidence complete and process-independent of transcript.txt' -Body {
             $Dir = $FailureAttemptDirForAssertions
             $Steps =
@@ -972,6 +1061,16 @@ Set-Location (Join-Path '$Dir' 'toyotamahime\Study01')
             $Actual = (Get-FileHash -Path $Zip -Algorithm SHA256).Hash.ToLowerInvariant()
             Assert ($Recorded -eq $Actual) 'archive SHA-256 does not match archive bytes'
             Assert (Test-Path (Join-Path $Dir 'knowledge-leak-log.md')) 'knowledge-leak-log.md missing from the README-literal one-liner'
+        }
+
+        Invoke-Check -Layer 'Runbook' -Check 'success lifecycle: transcript.txt is judged complete (satisfies plan section 10''s "complete transcript" requirement), not just present' -Body {
+            $Dir = $SuccessAttemptDirForAssertions
+            $Final = Get-Content (Join-Path $Dir 'final-status.json') -Raw | ConvertFrom-Json
+            Assert ($null -ne $Final.transcript_complete) 'final-status.json has no transcript_complete field'
+            Assert ($Final.transcript_complete -eq $true) (
+                "transcript.txt did not cover every recorded step under a real README-driven run: " +
+                "$($Final.transcript_step_markers) marker(s) for $($Final.transcript_expected_steps) step(s) -- $($Final.transcript_completeness_reason)"
+            )
         }
 
         Invoke-Check -Layer 'Runbook' -Check 'closed-attempt immutability (success case): Stop-K8 refuses a second close' -Body {

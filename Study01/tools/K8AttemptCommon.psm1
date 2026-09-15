@@ -870,6 +870,97 @@ function Add-K8KnowledgeLeak {
     return $Entry
 }
 
+function Test-K8TranscriptCoverage {
+    <#
+        Judges whether transcript.txt actually covers this attempt's
+        recorded steps -- from the text of the finished transcript.txt
+        file and steps.jsonl's own step count, never by inspecting live
+        PowerShell transcript/session state. This is what lets
+        docs/k8-independent-reproduction-plan.md section 10's Gate K8
+        exit criterion ("complete transcript") be checked from retained
+        evidence after the fact, instead of silently trusting that every
+        step's best-effort Start-Transcript -Append (see Invoke-K8Step)
+        actually succeeded. It does not reintroduce a dependency on
+        Start-/Stop-Transcript's nested/reference-counting behaviour for
+        *correctness* -- it only reads the resulting file's content,
+        which is safe and behaviour-independent by construction.
+
+        Each Invoke-K8Step call writes a "=== K8 STEP: <description> ==="
+        banner via Write-Host before running its command. Write-Host goes
+        to the host UI, which a currently-active transcript session
+        captures verbatim -- so that banner lands in transcript.txt if
+        and only if this step's transcript re-attach actually worked.
+        Counting those banners against steps.jsonl's own step count is
+        therefore an accurate, after-the-fact completeness signal that
+        needs nothing beyond the two artifacts this module already
+        writes: no new evidence type, no new file.
+
+        Does not change what step-level formal evidence *is* -- steps.jsonl
+        and steps-raw/*.log remain the sole formal evidence authority for
+        step completeness; this function and Invoke-K8Step do not call
+        each other. This only adds a second, independent judgement about
+        transcript.txt specifically, so transcript.txt's own retention
+        requirement (plan section 6 and section 10) is not left to
+        silently pass or fail on faith.
+
+        Uses -ge, not -eq, when comparing marker count to step count: the
+        marker text can in principle also appear inside a step's own
+        captured output (e.g. a command that happens to echo it back),
+        which could only ever inflate the marker count, never deflate it
+        -- so real incompleteness (a missing re-attach) is still caught,
+        while that coincidence cannot manufacture a false incompleteness
+        finding.
+    #>
+    param(
+        [Parameter(Mandatory)] $Paths
+    )
+
+    $StepCount = 0
+    if (Test-Path $Paths.StepsLog) {
+        $StepCount =
+            @(Get-Content -Path $Paths.StepsLog | Where-Object { $_.Trim() }).Count
+    }
+
+    if (-not (Test-Path $Paths.Transcript)) {
+        return [pscustomobject]@{
+            Complete    = $false
+            StepCount   = $StepCount
+            MarkerCount = 0
+            Reason      = 'transcript.txt does not exist'
+        }
+    }
+
+    $TranscriptText =
+        Get-Content -Path $Paths.Transcript -Raw -ErrorAction Stop
+
+    $MarkerCount =
+        [regex]::Matches($TranscriptText, [regex]::Escape('=== K8 STEP: ')).Count
+
+    $Complete =
+        $MarkerCount -ge $StepCount
+
+    $Reason =
+        if ($Complete) {
+            'transcript.txt contains a step marker for every steps.jsonl entry'
+        }
+        else {
+            "transcript.txt has $MarkerCount step marker(s) but steps.jsonl " +
+            "records $StepCount step(s) -- transcript.txt is incomplete, " +
+            'most likely because a mid-attempt Start-Transcript -Append ' +
+            'failed silently (see Invoke-K8Step). This does not affect ' +
+            'step-level formal evidence (steps.jsonl / steps-raw/ are ' +
+            'unaffected), but it does mean transcript.txt itself does not ' +
+            'satisfy the "complete transcript" retention requirement.'
+        }
+
+    return [pscustomobject]@{
+        Complete    = $Complete
+        StepCount   = $StepCount
+        MarkerCount = $MarkerCount
+        Reason      = $Reason
+    }
+}
+
 function Complete-K8Attempt {
     <#
         Runs on both success and failure. Always attempts every step
@@ -935,35 +1026,59 @@ function Complete-K8Attempt {
         Write-Warning "Failed to capture final repository state: $($_.Exception.Message)"
     }
 
-    # 3. final-status.json.
-    try {
-        $FinalStatus =
-            [ordered]@{
-                attempt_id            = $Paths.AttemptId
-                outcome               = $Outcome
-                reason                = $Reason
-                failing_command       = $FailingCommand
-                failing_exit_code     = $FailingExitCode
-                stop_time_utc         = (Get-Date).ToUniversalTime().ToString('o')
-                final_head            = $FinalHead
-                final_status_short    = $FinalStatusShort
-                final_status_clean    = if ($null -ne $FinalStatusShort) { $FinalStatusShort.Count -eq 0 } else { $null }
-                gate_k8               = 'NOT DETERMINED BY THIS TOOL -- Gate K8 is independent review, not self-certified.'
-            }
-
-        Write-K8Json -Object $FinalStatus -Path $Paths.FinalStatusJson
-    }
-    catch {
-        Write-Warning "Failed to write final-status.json: $($_.Exception.Message)"
-    }
-
-    # 4. Stop transcript (after this, no more Write-Host output is captured
-    #    by it, so do it after the console-visible steps above).
+    # 3. Stop transcript -- moved ahead of final-status.json (was step 4)
+    #    so that step 4 below reads a fully flushed, closed transcript.txt,
+    #    not one PowerShell may still be buffering. After this point, no
+    #    more Write-Host output is captured by it, so this still runs
+    #    after the console-visible steps above.
     try {
         Stop-Transcript | Out-Null
     }
     catch {
         Write-Warning "Failed to stop transcript (may not have been running): $($_.Exception.Message)"
+    }
+
+    # 4. transcript.txt completeness judgement, then final-status.json.
+    #    See Test-K8TranscriptCoverage's own doc comment: this reads
+    #    transcript.txt's text and steps.jsonl's step count only -- it
+    #    does not depend on Start-/Stop-Transcript's internal behaviour
+    #    for its own correctness, and it is best-effort here the same way
+    #    every other finalize step is: a failure judging completeness
+    #    must not stop the attempt from closing and being archived.
+    try {
+        $TranscriptCoverage =
+            Test-K8TranscriptCoverage -Paths $Paths
+
+        $FinalStatus =
+            [ordered]@{
+                attempt_id                = $Paths.AttemptId
+                outcome                   = $Outcome
+                reason                    = $Reason
+                failing_command           = $FailingCommand
+                failing_exit_code         = $FailingExitCode
+                stop_time_utc             = (Get-Date).ToUniversalTime().ToString('o')
+                final_head                = $FinalHead
+                final_status_short        = $FinalStatusShort
+                final_status_clean        = if ($null -ne $FinalStatusShort) { $FinalStatusShort.Count -eq 0 } else { $null }
+                transcript_complete       = $TranscriptCoverage.Complete
+                transcript_step_markers   = $TranscriptCoverage.MarkerCount
+                transcript_expected_steps = $TranscriptCoverage.StepCount
+                transcript_completeness_reason = $TranscriptCoverage.Reason
+                gate_k8                   = 'NOT DETERMINED BY THIS TOOL -- Gate K8 is independent review, not self-certified.'
+            }
+
+        Write-K8Json -Object $FinalStatus -Path $Paths.FinalStatusJson
+
+        if (-not $TranscriptCoverage.Complete) {
+            # Explicit, visible signal -- not a silent pass. Does not throw:
+            # a closed attempt with an honestly-recorded incomplete
+            # transcript is still better evidence than one that failed to
+            # close at all (see this function's own top-level doc comment).
+            Write-Warning "transcript.txt is INCOMPLETE for attempt '$($Paths.AttemptId)': $($TranscriptCoverage.Reason)"
+        }
+    }
+    catch {
+        Write-Warning "Failed to judge transcript completeness / write final-status.json: $($_.Exception.Message)"
     }
 
     # 5. Manifest: sha256 of every file now in the attempt directory,
@@ -1055,5 +1170,6 @@ Export-ModuleMember -Function @(
     'Invoke-K8Step',
     'Get-K8LastStep',
     'Add-K8KnowledgeLeak',
+    'Test-K8TranscriptCoverage',
     'Complete-K8Attempt'
 )
