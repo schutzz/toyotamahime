@@ -187,15 +187,15 @@ git checkout FETCH_HEAD
 cd ..
 ```
 
-**Contract validation** (Range C), pinned to tag `v0.13.0` = `0378f8a32701b481e030f3db3d5f66ea471a4675`:
+**Contract validation** (Range C), pinned to tag `v0.13.1` = `1d0fa75725078100e9da2e8492ca977ba8e89d95` — a packaging-only patch of `v0.13.0` (`0378f8a32701b481e030f3db3d5f66ea471a4675`) that adds a PEP 263 `# -*- coding: utf-8 -*-` line to `requirements.txt` so `pip` does not need to guess this file's encoding on a non-UTF-8-locale host; the validator's own code, schema, and behavior are unchanged from `v0.13.0` (see `ot-range-amenonuboco`'s `v0.13.1` tag message and the `v0.13.0..v0.13.1` diff, which touches only that one line):
 
 <!-- k8-test:id=amenonuboco-range-c-clone mode=parse cwd=repo-root -->
 ```powershell
-git clone --branch v0.13.0 --depth=1 https://github.com/schutzz/ot-range-amenonuboco amenonuboco-v0.13.0
-python -m pip install -r amenonuboco-v0.13.0/requirements.txt
+git clone --branch v0.13.1 --depth=1 https://github.com/schutzz/ot-range-amenonuboco amenonuboco-v0.13.1
+python -m pip install -r amenonuboco-v0.13.1/requirements.txt
 ```
 
-That installs `pydantic` and `PyYAML` at the versions the validator's own repository declares (`pydantic>=2.0,<3.0`, `PyYAML>=6.0` as of `v0.13.0`) — do not pin different versions here.
+That installs `pydantic` and `PyYAML` at the versions the validator's own repository declares (`pydantic>=2.0,<3.0`, `PyYAML>=6.0` as of `v0.13.1`, unchanged from `v0.13.0`) — do not pin different versions here.
 
 Keep them as two separate checkouts. Do not reuse one for both.
 
@@ -240,7 +240,7 @@ Expected, not forced: Ground Truth Pass; Sensor and Collector Fail; rule output 
 
 Range C is **never provisioned**. `docker compose up` is not part of this step in any form.
 
-1. Create a disposable worktree from the `v0.13.0` checkout, detached at `0378f8a`, and confirm it is clean **before** placing anything into it.
+1. Create a disposable worktree from the `v0.13.1` checkout, detached at `1d0fa75`, and confirm it is clean **before** placing anything into it.
 2. Derive the negative manifest from the pinned base manifest by the substitution recorded in `experiments/range-c-negative-manifest/` — a segment required by `observability_contract.required_segments` while `instrumentation.exclude` removes it. Preserve the base manifest's own line terminators; the original base is CRLF in the worktree.
 3. Run only `python platform/cli.py validate manifests/power-grid-reference.range-c-negative.yaml`.
 4. Retain the derived manifest, the derivation, the command, stdout, stderr, the exit code, and tool versions as raw bytes without newline translation.
