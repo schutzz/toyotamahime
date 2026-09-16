@@ -93,7 +93,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v6` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v7` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -118,7 +118,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v6'
+    [string] $Ref = 'k8-bootstrap-v7'
 )
 
 Set-StrictMode -Version Latest
