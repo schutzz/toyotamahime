@@ -8,7 +8,7 @@ This document fixes how the selected C2 scenario is derived. It does not execute
 
 | Item | Canonical path / value |
 | --- | --- |
-| Amenonuboco worktree | A clean worktree at `78fc17746b5d663fafec9dffe563d79fe9ea02b7` (`v0.12.0`) |
+| Amenonuboco worktree | For historical inspection, the recorded historical worktree. For a prospective AMEND-005 K8 candidate, a clean worktree at `80e550ffeab8daa6583590add490433a0305bb53` (`v0.13.5`) |
 | Base manifest | `manifests/power-grid-reference.yaml` |
 | Range A manifest | The unmodified canonical base manifest |
 | Range B manifest | The same unmodified canonical base manifest as Range A |
@@ -26,10 +26,23 @@ From the clean fixed Amenonuboco worktree, generate the Compose file into the ru
 
 ```powershell
 python platform/cli.py provision manifests/power-grid-reference.yaml `
-  -o <run-workspace>/power-grid-reference.range-a.docker-compose.yml
+  -o <run-workspace>/power-grid-reference.range-a.docker-compose.yml `
+  --image-override "wan_router=ghcr.io/schutzz/amenonuboco-network-tools@sha256:1b8eb24e78a5b9ec1048e14db69e60a59509dda72dba847a1269a270f5fc01a3" `
+  --image-override "tap_observer=ghcr.io/schutzz/amenonuboco-network-tools@sha256:1b8eb24e78a5b9ec1048e14db69e60a59509dda72dba847a1269a270f5fc01a3" `
+  --image-override "log_structurer=ghcr.io/schutzz/amenonuboco-network-tools-structurer@sha256:efc9e6a2540ae492bfc646f3ebf59d1dc1e2ccff9c39c1224468b6214253097e" `
+  --image-override "cc_scada_master=ghcr.io/schutzz/amenonuboco-dnp3@sha256:d517cbb9e234b69d192b4808c843e0e5a629385566d3b6a88260659ee4785e55" `
+  --image-override "sub_c_rtu=ghcr.io/schutzz/amenonuboco-dnp3@sha256:d517cbb9e234b69d192b4808c843e0e5a629385566d3b6a88260659ee4785e55" `
+  --image-override "sub_b_process_points=ghcr.io/schutzz/amenonuboco-opcua@sha256:7268abe37e31d601c550f1f5a29e374a5bd7f055f8746f1b4ef4d30b90318afe" `
+  --image-override "historian=ghcr.io/schutzz/amenonuboco-opcua@sha256:7268abe37e31d601c550f1f5a29e374a5bd7f055f8746f1b4ef4d30b90318afe" `
+  --image-override "sub_b_rtu_hmi=ghcr.io/schutzz/amenonuboco-power-grid-nodered-tools@sha256:13c665ed2532b36dd925b3158809ec38ccdef048fa1d671e0b8815c3bb7a956e" `
+  --image-override "sub_c_hmi=ghcr.io/schutzz/amenonuboco-power-grid-nodered-tools@sha256:13c665ed2532b36dd925b3158809ec38ccdef048fa1d671e0b8815c3bb7a956e" `
+  --image-override "sub_a_ied_02=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8" `
+  --image-override "ups_attacker=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8" `
+  --image-override "sub_d_ied_01=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8" `
+  --image-override "cc_ups=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8"
 Get-FileHash <run-workspace>/power-grid-reference.range-a.docker-compose.yml -Algorithm SHA256
 # The execution preflight below is a gate: do not run `up` until it exits 0.
-docker compose -p <run-id> -f <run-workspace>/power-grid-reference.range-a.docker-compose.yml up -d --build
+docker compose -p <run-id> -f <run-workspace>/power-grid-reference.range-a.docker-compose.yml up -d --no-build
 ```
 
 Range A uses normal instrumentation and injects no runtime observation fault. Before the sender procedure begins, record `docker compose ps`, resolved gateway interface evidence, image inventory, and capture setup in the run evidence tree.
@@ -68,8 +81,21 @@ Range B repeats the exact Range A derivation and provisioning procedure with onl
 
 ```powershell
 python platform/cli.py provision manifests/power-grid-reference.yaml `
-  -o <run-workspace>/power-grid-reference.range-b.docker-compose.yml
-docker compose -p <run-id> -f <run-workspace>/power-grid-reference.range-b.docker-compose.yml up -d --build
+  -o <run-workspace>/power-grid-reference.range-b.docker-compose.yml `
+  --image-override "wan_router=ghcr.io/schutzz/amenonuboco-network-tools@sha256:1b8eb24e78a5b9ec1048e14db69e60a59509dda72dba847a1269a270f5fc01a3" `
+  --image-override "tap_observer=ghcr.io/schutzz/amenonuboco-network-tools@sha256:1b8eb24e78a5b9ec1048e14db69e60a59509dda72dba847a1269a270f5fc01a3" `
+  --image-override "log_structurer=ghcr.io/schutzz/amenonuboco-network-tools-structurer@sha256:efc9e6a2540ae492bfc646f3ebf59d1dc1e2ccff9c39c1224468b6214253097e" `
+  --image-override "cc_scada_master=ghcr.io/schutzz/amenonuboco-dnp3@sha256:d517cbb9e234b69d192b4808c843e0e5a629385566d3b6a88260659ee4785e55" `
+  --image-override "sub_c_rtu=ghcr.io/schutzz/amenonuboco-dnp3@sha256:d517cbb9e234b69d192b4808c843e0e5a629385566d3b6a88260659ee4785e55" `
+  --image-override "sub_b_process_points=ghcr.io/schutzz/amenonuboco-opcua@sha256:7268abe37e31d601c550f1f5a29e374a5bd7f055f8746f1b4ef4d30b90318afe" `
+  --image-override "historian=ghcr.io/schutzz/amenonuboco-opcua@sha256:7268abe37e31d601c550f1f5a29e374a5bd7f055f8746f1b4ef4d30b90318afe" `
+  --image-override "sub_b_rtu_hmi=ghcr.io/schutzz/amenonuboco-power-grid-nodered-tools@sha256:13c665ed2532b36dd925b3158809ec38ccdef048fa1d671e0b8815c3bb7a956e" `
+  --image-override "sub_c_hmi=ghcr.io/schutzz/amenonuboco-power-grid-nodered-tools@sha256:13c665ed2532b36dd925b3158809ec38ccdef048fa1d671e0b8815c3bb7a956e" `
+  --image-override "sub_a_ied_02=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8" `
+  --image-override "ups_attacker=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8" `
+  --image-override "sub_d_ied_01=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8" `
+  --image-override "cc_ups=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8"
+docker compose -p <run-id> -f <run-workspace>/power-grid-reference.range-b.docker-compose.yml up -d --no-build
 ```
 
 After the environment is healthy and before capture/trigger, resolve the unique gateway interface by its IP address rather than by an ordinal such as `eth5`:

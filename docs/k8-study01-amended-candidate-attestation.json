@@ -1,32 +1,29 @@
 {
   "schema": "study01-amended-candidate-attestation/1",
-  "subject_study01_tree": "573b217c1368858e687799867953ab703a507526",
-  "base_study01_tree": "a30db0c6697168d1b9d92b4c0977540255530a8f",
-  "base_release": "k8-bootstrap-v4",
-  "base_release_commit": "91ba5d2f7709a8938ef00fed1bcfd10c14181c8b",
-  "source_kakuriyo_commit": "8873aeeb2837b357fa39fd4b36e3b265d8eea9d5",
-  "base_kakuriyo_commit": "f0df3e1f7ddf76e5a7e394628337f1b578801859",
+  "subject_study01_tree": "bac67817ac718ce54597a6b87f19d0cb7653faca",
+  "base_study01_tree": "68273ecde070ef7b73320245aa1f9832f7626593",
+  "base_release": "k8-bootstrap-v7",
+  "base_release_commit": "04dc2a58dec3afe08ca4085f0ab81c9119f38c89",
+  "source_kakuriyo_commit": "78ac792a9860a850eb1853683d2faaecc7eee16a",
+  "base_kakuriyo_commit": "8873aeeb2837b357fa39fd4b36e3b265d8eea9d5",
   "applied_amendments": [
     "AMEND-001",
     "AMEND-002",
     "AMEND-003",
-    "AMEND-004"
+    "AMEND-004",
+    "AMEND-005"
   ],
   "not_applied_amendments": [],
-  "intended_release_tag": "k8-bootstrap-v5",
+  "intended_release_tag": "k8-bootstrap-v8",
   "transcription_authority": {
-    "review_subject_commit": "3b6d6dc63a7d65ec6a3d78d0f3cd9fc5bddc6c35",
-    "review_record_commit": "df7d3c5f27f4726fabdfea2566030f88fde4f780",
-    "review_record_path": "studies/study-01-negative-result/K8-S2-AMEND-004-SCORER-TRANSCRIPTION-EXACT-COMMIT-INDEPENDENT-REVIEW.md",
-    "review_record_blob": "2ba4f24dec7c4b691dae2b569ede294cbc2176de",
+    "review_subject_commit": "78ac792a9860a850eb1853683d2faaecc7eee16a",
+    "review_record_commit": "e7ab77ef3c90edc82ee1f61ae69b7677adb0f9d3",
+    "review_record_path": "studies/study-01-negative-result/K8-S2-AMEND-005-PROSPECTIVE-APPARATUS-PIN-INDEPENDENT-REVIEW.md",
+    "review_record_blob": "4a02668b143d6007353c8af259efb1b8ce854d3a",
     "regression_command": "python -m pytest studies/study-01-negative-result/scripts/tests -q",
-    "regression_result": "410 passed / 2 skipped / 40 subtests passed / exit 0",
-    "regression_observed_at": "accepted_transcription_subject 3b6d6dc63a7d65ec6a3d78d0f3cd9fc5bddc6c35 clean worktree",
+    "regression_result": "445 passed / 2 skipped / 40 subtests passed / exit 0",
+    "regression_observed_at": "accepted_transcription_subject 78ac792a9860a850eb1853683d2faaecc7eee16a clean worktree",
     "accepted_blobs": [
-      {
-        "path": "studies/study-01-negative-result/protocol/amendments.md",
-        "blob": "4795b864ff16571a2c112c2efdfb5e32dcbbb987"
-      },
       {
         "path": "studies/study-01-negative-result/scripts/study01/frozen/semantics.py",
         "blob": "931394d66405abeb4fd13805f2fb9257999e34ac"
@@ -38,6 +35,10 @@
       {
         "path": "studies/study-01-negative-result/scripts/tests/test_phase1.py",
         "blob": "27210fd98d3b59c0d12204bde2d2fd552fb6cd92"
+      },
+      {
+        "path": "studies/study-01-negative-result/scripts/study01/frozen/apparatus.py",
+        "blob": "6335a698ae63b5aa4bf48537118e2d2911e9de1e"
       }
     ],
     "accepted_amendment_entries": [
@@ -56,92 +57,83 @@
       {
         "amendment_id": "AMEND-004",
         "entry_digest": "7067337ce90f89ad6aa1dd322dbba4fafca0e8db018ce6ac52655b2d317007d6"
+      },
+      {
+        "amendment_id": "AMEND-005",
+        "entry_digest": "bbceed8d94b37e8a8a10b2a3e6f64550225d73d030a365e0a3668cf1c85d3448"
       }
     ],
-    "accepted_amendments_blob": "4795b864ff16571a2c112c2efdfb5e32dcbbb987",
+    "accepted_amendments_blob": "994fb6c684cb6f425f68a57466cfd88ace7fb675",
     "source_ancestry": {
-      "ancestor_commit": "3b6d6dc63a7d65ec6a3d78d0f3cd9fc5bddc6c35",
-      "descendant_commit": "8873aeeb2837b357fa39fd4b36e3b265d8eea9d5",
-      "is_ancestor": true
+      "ancestor_commit": "78ac792a9860a850eb1853683d2faaecc7eee16a",
+      "descendant_commit": "78ac792a9860a850eb1853683d2faaecc7eee16a",
+      "is_ancestor": true,
+      "_note": "The Authority Anchor's accepted_transcription_subject was advanced to this exact commit (see Kakuriyo commit b61eeaa), so source_kakuriyo_commit equals the reviewed subject directly rather than merely descending from it; a commit is its own ancestor under git merge-base --is-ancestor, and this was verified, not assumed."
     }
   },
   "amendment_transcription": [
     {
       "toyotamahime_path": "Study01/studies/study-01-negative-result/protocol/amendments.md",
       "kakuriyo_path": "studies/study-01-negative-result/protocol/amendments.md",
-      "base_blob": "09aaae6bca0d69350e88427aee885d9681b89b9e",
-      "new_blob": "cbbb2da381262194b5fb500ae6c51f9375806c8c",
-      "base_sha256": "678e88f545c6d09d3908b1c513083529722e1bd9ce5fd1a1c11a2e4c494dcfe5",
-      "new_sha256": "0691dcd77c67152bbe968bc54b98a6dcf165cd538f9354e3669673bbf54fd881",
-      "amendment_id": "AMEND-004",
-      "transcribed_clause": "AMEND-004 normative entry and the corrected current-entry count"
+      "base_blob": "cbbb2da381262194b5fb500ae6c51f9375806c8c",
+      "new_blob": "994fb6c684cb6f425f68a57466cfd88ace7fb675",
+      "base_sha256": "0691dcd77c67152bbe968bc54b98a6dcf165cd538f9354e3669673bbf54fd881",
+      "new_sha256": "db6c3d21306d3d9b471fa9646a58f983c3bdce1749e0430d0d11a3533f7cee6c",
+      "amendment_id": "AMEND-005",
+      "transcribed_clause": "AMEND-005 normative entry (Prospective K8 Range A/B runtime provisioning pin) and its Authority Anchor registration"
     },
     {
-      "toyotamahime_path": "Study01/studies/study-01-negative-result/scripts/study01/frozen/semantics.py",
-      "kakuriyo_path": "studies/study-01-negative-result/scripts/study01/frozen/semantics.py",
-      "base_blob": "4ae5f1f892df83b7911c9b958d2dcf79be6ffce9",
-      "new_blob": "931394d66405abeb4fd13805f2fb9257999e34ac",
-      "base_sha256": "a3f6ccba59acc30b80cf91d10d989d44c06e7c731f31cf53a0bb3db280adc2f2",
-      "new_sha256": "33ee084ac0b4107bb64e1a1759a96907c0e34d92b24d2d3a90cd5d8af812f315",
-      "amendment_id": "AMEND-004",
-      "transcribed_clause": "Range B R-OBS-05 Fail and Unresolved observations normalize Runtime contract to Unresolved while remaining distinct observations"
+      "toyotamahime_path": "Study01/studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md",
+      "kakuriyo_path": "studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md",
+      "base_blob": "5635d5137baa9e8b709e1fb41fa9e2eeb4bfac98",
+      "new_blob": "570466b015cce1a2daaf8df53e828461661d7265",
+      "base_sha256": "ded5e1ea4019e800567b7de3b13215be9f80be5e15e83da83cc6715be24a8fe2",
+      "new_sha256": "7f3845b373e1391c113f102fe4ea2d2be8532a5f2c24e6cfa78edbd972646928",
+      "amendment_id": "AMEND-005",
+      "transcribed_clause": "Range A/B derivation procedure updated to the --image-override exact-digest mechanism against the AMEND-005 pin for all 13 affected services; worktree table split into historical-inspection and prospective-AMEND-005-K8-candidate sections"
     },
     {
-      "toyotamahime_path": "Study01/studies/study-01-negative-result/scripts/study01/scorer.py",
-      "kakuriyo_path": "studies/study-01-negative-result/scripts/study01/scorer.py",
-      "base_blob": "1a1132e6906c70dadff6f9bb590f38775f2f6733",
-      "new_blob": "bce3eb1bf7082a1a56ba5c79c5ded7416652e7f1",
-      "base_sha256": "1aa648e6126cd58c722e8e0dc4a829f2684a2754f80917813fef1b6bf88e4468",
-      "new_sha256": "464506b8c88fb0da93e29fce6155bdede3a0bc844cee49f3279079195906590c",
-      "amendment_id": "AMEND-004",
-      "transcribed_clause": "Range B R-OBS-05 Unresolved propagates to Runtime contract Unresolved and Inconclusive experiment"
+      "toyotamahime_path": "Study01/studies/study-01-negative-result/protocol/dependencies.md",
+      "kakuriyo_path": "studies/study-01-negative-result/protocol/dependencies.md",
+      "base_blob": "031eb5c8908e0a3ecf62d775158b98a2bb50fb7f",
+      "new_blob": "af164f572d33c7682d50a82f653a5f6c373fdf7a",
+      "base_sha256": "d37c605c711a8ea366ad44e69c9db353c43f5392f47e4c890974760087fb68a2",
+      "new_sha256": "3c606351a252a695a77b2d44cb2a368f37a6b5100271293e7c94c350a4bf517e",
+      "amendment_id": "AMEND-005",
+      "transcribed_clause": "New section 2.2 Prospective K8 Range A/B runtime provisioning pin: Amenonuboco v0.13.5 / 80e550ffeab8daa6583590add490433a0305bb53, scoped to prospective K8-S2 and subsequent formal K8-3 candidates only; historical section 2.1 (v0.12.0 / 78fc177) unchanged"
     },
     {
-      "toyotamahime_path": "Study01/studies/study-01-negative-result/scripts/tests/test_phase1.py",
-      "kakuriyo_path": "studies/study-01-negative-result/scripts/tests/test_phase1.py",
-      "base_blob": "6c7a2e9324c28f4b42331abe491ab6548841398e",
-      "new_blob": "27210fd98d3b59c0d12204bde2d2fd552fb6cd92",
-      "base_sha256": "2d352d9a26bf9c42226f429b2204351b6854930756a680033dd264dbe9b911fe",
-      "new_sha256": "f5baf664586df5973e3101c131455417125efab345cf860f99bb8cd779ba3670",
-      "amendment_id": "AMEND-004",
-      "transcribed_clause": "Executable checks for AMEND-004 propagation, prohibited classifications, Range B scope, Pass non-regression, and amendment-log presence"
+      "toyotamahime_path": "Study01/studies/study-01-negative-result/scripts/study01/frozen/apparatus.py",
+      "kakuriyo_path": "studies/study-01-negative-result/scripts/study01/frozen/apparatus.py",
+      "base_blob": "d40c8708fdfee807a2f93a49ae3db6595ea3718e",
+      "new_blob": "6335a698ae63b5aa4bf48537118e2d2911e9de1e",
+      "base_sha256": "0cbd0675576dbb09c1095ae9b2ec2b47344a9bd6f2676692e193794c8214ebd6",
+      "new_sha256": "e7b8d6f7d6f9cadf87dfb3c0fd8dc7246fe924034ed07a0796a8dd45a9baee72",
+      "amendment_id": "AMEND-005",
+      "transcribed_clause": "AMENONUBOCO_COMMIT moved from the historical 78fc17746b5d663fafec9dffe563d79fe9ea02b7 (v0.12.0) to the AMEND-005 accepted 80e550ffeab8daa6583590add490433a0305bb53 (v0.13.5); the single assignment line is the entire delta"
     }
   ],
   "publication_binding": [
     {
       "toyotamahime_path": "Study01/provenance.json",
-      "base_blob": "bcb9c4c513e9de045eb2edb412c2f9fc4cefafbd",
-      "new_blob": "73926f10b74934238ac1c52406b4ec493d411d29",
+      "base_blob": "73926f10b74934238ac1c52406b4ec493d411d29",
+      "new_blob": "74926f63af424f0786b2fdbcf453e713a54449a0",
       "change_class": "publication_binding",
-      "publication_reason": "Bind all 71 exported files to the dedicated Kakuriyo export-source commit and its committed file identities"
+      "publication_reason": "Advance kakuriyo_commit to the AMEND-005 accepted subject 78ac792 and update the 4 changed files' blob/sha256/bytes; all 71 export paths were independently re-diffed against the new subject and only these 4 changed"
     },
     {
       "toyotamahime_path": "Study01/PROVENANCE.md",
-      "base_blob": "e74b8eaeb7d2401c39dbdc192557087386fd8370",
-      "new_blob": "9c8a6f66270ab187d9d0f9b510a6c763a6771668",
+      "base_blob": "9c8a6f66270ab187d9d0f9b510a6c763a6771668",
+      "new_blob": "3e5a68bca91adc1c9fa3c9d33b6a70984d960299",
       "change_class": "publication_binding",
-      "publication_reason": "Document the amended source identity and separate the historical claim anchor from the prospective candidate anchor"
+      "publication_reason": "Document AMEND-005's apparatus.py transcription alongside AMEND-004's, move apparatus.py out of the byte-identical-to-a772ea1 table, update the pinned-dependency table to the v0.13.5 prospective pin, and update the intended-tag note from k8-bootstrap-v5 (already cut) to k8-bootstrap-v8"
     },
     {
       "toyotamahime_path": "Study01/README.md",
-      "base_blob": "325bfbccb738600f9000e9fce91ed8ecb2f38e0a",
-      "new_blob": "6e4dd031820508a187287bc8f4a771813519ad28",
+      "base_blob": "3a34692f2f3fa4705d4b72d8d029cd6054f7ea6f",
+      "new_blob": "248d7b4002a04eb4c7fbc07c2751c2ac86ca9938",
       "change_class": "publication_binding",
-      "publication_reason": "Pin the intended k8-bootstrap-v5 fetch name and the SHA-256 of the candidate bootstrap script bytes"
-    },
-    {
-      "toyotamahime_path": "bootstrap/Start-Study01.ps1",
-      "base_blob": "f60291afbf3c86da3c1130b5198f919396acb774",
-      "new_blob": "9bd43fd23e36eeb337eecb14abe84147e13b9f03",
-      "change_class": "publication_binding",
-      "publication_reason": "Make the bootstrap default Ref and changelog describe the intended k8-bootstrap-v5 amended baseline"
-    },
-    {
-      "toyotamahime_path": "bootstrap/README.md",
-      "base_blob": "ce76d627d340a332b215185ac606c47ea88c2229",
-      "new_blob": "a63b2defc47c9ca35f9e053afcac44ce30df4959",
-      "change_class": "publication_binding",
-      "publication_reason": "Keep bootstrap documentation aligned with the intended k8-bootstrap-v5 default Ref"
+      "publication_reason": "Section 4.1 range-generation clone instructions updated to the AMEND-005 prospective pin (80e550f / v0.13.5) so the documented fetch matches the enforced frozen/apparatus.py AMENONUBOCO_COMMIT constant; bootstrap tag/-Ref references left at k8-bootstrap-v7, unchanged by this commit"
     }
   ]
 }

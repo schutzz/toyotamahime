@@ -220,11 +220,11 @@
       "toyotamahime": "Study01/studies/study-01-negative-result/protocol/.gitkeep"
     },
     {
-      "blob": "cbbb2da381262194b5fb500ae6c51f9375806c8c",
-      "bytes": 15247,
+      "blob": "994fb6c684cb6f425f68a57466cfd88ace7fb675",
+      "bytes": 18001,
       "crlf": false,
       "kakuriyo": "studies/study-01-negative-result/protocol/amendments.md",
-      "sha256": "0691dcd77c67152bbe968bc54b98a6dcf165cd538f9354e3669673bbf54fd881",
+      "sha256": "db6c3d21306d3d9b471fa9646a58f983c3bdce1749e0430d0d11a3533f7cee6c",
       "toyotamahime": "Study01/studies/study-01-negative-result/protocol/amendments.md"
     },
     {
@@ -260,11 +260,11 @@
       "toyotamahime": "Study01/studies/study-01-negative-result/protocol/c2-dnp3-image-inventory.md"
     },
     {
-      "blob": "5635d5137baa9e8b709e1fb41fa9e2eeb4bfac98",
-      "bytes": 11673,
+      "blob": "570466b015cce1a2daaf8df53e828461661d7265",
+      "bytes": 15754,
       "crlf": false,
       "kakuriyo": "studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md",
-      "sha256": "ded5e1ea4019e800567b7de3b13215be9f80be5e15e83da83cc6715be24a8fe2",
+      "sha256": "7f3845b373e1391c113f102fe4ea2d2be8532a5f2c24e6cfa78edbd972646928",
       "toyotamahime": "Study01/studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md"
     },
     {
@@ -356,11 +356,11 @@
       "toyotamahime": "Study01/studies/study-01-negative-result/protocol/cross-document-consistency-review.md"
     },
     {
-      "blob": "031eb5c8908e0a3ecf62d775158b98a2bb50fb7f",
-      "bytes": 11376,
+      "blob": "af164f572d33c7682d50a82f653a5f6c373fdf7a",
+      "bytes": 13656,
       "crlf": false,
       "kakuriyo": "studies/study-01-negative-result/protocol/dependencies.md",
-      "sha256": "d37c605c711a8ea366ad44e69c9db353c43f5392f47e4c890974760087fb68a2",
+      "sha256": "3c606351a252a695a77b2d44cb2a368f37a6b5100271293e7c94c350a4bf517e",
       "toyotamahime": "Study01/studies/study-01-negative-result/protocol/dependencies.md"
     },
     {
@@ -476,11 +476,11 @@
       "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/frozen/__init__.py"
     },
     {
-      "blob": "d40c8708fdfee807a2f93a49ae3db6595ea3718e",
+      "blob": "6335a698ae63b5aa4bf48537118e2d2911e9de1e",
       "bytes": 3019,
       "crlf": false,
       "kakuriyo": "studies/study-01-negative-result/scripts/study01/frozen/apparatus.py",
-      "sha256": "0cbd0675576dbb09c1095ae9b2ec2b47344a9bd6f2676692e193794c8214ebd6",
+      "sha256": "e7b8d6f7d6f9cadf87dfb3c0fd8dc7246fe924034ed07a0796a8dd45a9baee72",
       "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/frozen/apparatus.py"
     },
     {
@@ -572,6 +572,6 @@
       "toyotamahime": "Study01/studies/study-01-negative-result/scripts/tests/test_phase1.py"
     }
   ],
-  "kakuriyo_commit": "8873aeeb2837b357fa39fd4b36e3b265d8eea9d5",
+  "kakuriyo_commit": "78ac792a9860a850eb1853683d2faaecc7eee16a",
   "study_root": "studies/study-01-negative-result"
 }

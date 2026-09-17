@@ -175,14 +175,14 @@ This must print `PACKAGE CERTIFICATION: PASS` and exit `0`, on the commit you ar
 
 Two different pinned commits of the same public repository, `https://github.com/schutzz/ot-range-amenonuboco`.
 
-**Range generation** (Ranges A and B), pinned to `78fc17746b5d663fafec9dffe563d79fe9ea02b7`:
+**Range generation** (Ranges A and B), pinned to `80e550ffeab8daa6583590add490433a0305bb53` (annotated tag `v0.13.5`; the underlying repository publishes it as a Git tag with published GHCR images, not a GitHub Release object). This is the AMEND-005 prospective pin for this K8 candidate — it replaces the historical `v0.12.0` / `78fc17746b5d663fafec9dffe563d79fe9ea02b7` pin that K6/K7 and prior K8 attempts were run against; see `protocol/dependencies.md` §2.2 and `protocol/amendments.md`'s Amendment 005 entry for the exact scope of that change:
 
 <!-- k8-test:id=amenonuboco-range-gen-clone mode=parse cwd=repo-root -->
 ```powershell
 git init amenonuboco-gen
 cd amenonuboco-gen
 git remote add origin https://github.com/schutzz/ot-range-amenonuboco
-git fetch --depth=1 origin 78fc17746b5d663fafec9dffe563d79fe9ea02b7
+git fetch --depth=1 origin 80e550ffeab8daa6583590add490433a0305bb53
 git checkout FETCH_HEAD
 cd ..
 ```

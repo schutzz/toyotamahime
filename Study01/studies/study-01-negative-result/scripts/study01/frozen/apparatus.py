@@ -5,7 +5,7 @@ no scoring semantics; ``semantics.py`` remains the sole scoring transcription.
 """
 
 # c2-dnp3-range-derivation.md §1
-AMENONUBOCO_COMMIT = "78fc17746b5d663fafec9dffe563d79fe9ea02b7"
+AMENONUBOCO_COMMIT = "80e550ffeab8daa6583590add490433a0305bb53"
 BASE_MANIFEST = "manifests/power-grid-reference.yaml"
 
 # c2-dnp3-sender-procedure.md §1

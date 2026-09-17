@@ -1,7 +1,7 @@
 # Study 01 Amendment Log
 
 **Status:** Operative (K3 Protocol Freeze complete: `study-01-protocol-v1.0` / `9d57d1e63d6cf16dcc37e8f60d560d30da5f4835`)  
-**Current entries:** 4
+**Current entries:** 5
 
 ## Purpose
 
@@ -30,6 +30,17 @@ The first K4 release/commit pin is an amendment/dependency-change event even tho
 The two records have different roles and may link to each other; neither substitutes for the other.
 
 ## Amendment log
+
+### Amendment 005 — Prospective K8 Range A/B runtime provisioning pin
+
+| Field | Content |
+| --- | --- |
+| Amendment ID and date | `AMEND-005`, 2026-09-17 (JST) |
+| Prior frozen state | Historical K6/K7 evidence and prior K8 reproduction attempts remain bound to Amenonuboco `v0.12.0` / `78fc17746b5d663fafec9dffe563d79fe9ea02b7` and the K6-start `frozen/apparatus.py` blob `d40c8708fdfee807a2f93a49ae3db6595ea3718e`. The existing prospective K8 plan also required that historical apparatus blob, so a candidate naming a remediated Amenonuboco pin failed closed. |
+| Change and rationale | For future K8-S2 qualification candidates and the next formal K8-3 candidate only, Range A/B provisioning is pinned to Amenonuboco `v0.13.5` / commit `80e550ffeab8daa6583590add490433a0305bb53` and six exact `linux/amd64` GHCR manifest digests recorded in `dependencies.md` §2.2. The release bakes required networking/protocol packages into images and removes runtime `apt-get` / `apk add` from all generated Study 01 Range A/B service commands. `frozen/apparatus.py` changes only `AMENONUBOCO_COMMIT`; sender, capture, Range B fault, selector, scoring, expected semantics, procedure conformance, `claims/`, and `expected/` are unchanged. The permitted apparatus delta is exactly the accepted old/new blob pair recorded by the Authority Anchor Record; it is not permission for another apparatus change. |
+| Affected evidence/claims | No historical evidence or claim changes. K6 accepted evidence, K7 claims/judgments, prior K8 attempts, failed archives, and existing tags/releases retain their original identities and are inspected with the historical anchor. No historical result is rerun or reinterpreted with the prospective apparatus. The changed dependency is used only by a future clean K8 execution. |
+| Rerun decision | **Rerun ASSESS / PARTIAL.** This is an image/runtime-provisioning rebuild for which semantic equivalence is claimed, so the amendment rules require this category. Assessment finds the historical rerun/re-evaluation set empty because historical records retain their original dependency and apparatus anchor. The prospective execution set is the future K8-S2 candidate and next formal K8-3 only; their Range A/B provisioning must use the exact amended pin and digests. |
+| New authoritative state | The Kakuriyo commit containing this entry, the one-token `frozen/apparatus.py` pin transcription, the prospective-only plan revision, and the independent exact-commit ACCEPT review; after review, the existing Authority Anchor mechanism records the exact accepted apparatus blob and AMEND-005 entry digest. Operational identities are in [`dependencies.md` §2.2](./dependencies.md#22-prospective-k8-range-ab-runtime-provisioning-pin). |
 
 ### Amendment 004 — Range B `R-OBS-05 = Unresolved` scoring propagation
 
