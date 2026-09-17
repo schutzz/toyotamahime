@@ -3,7 +3,7 @@
   "subject_study01_tree": "bac67817ac718ce54597a6b87f19d0cb7653faca",
   "base_study01_tree": "68273ecde070ef7b73320245aa1f9832f7626593",
   "base_release": "k8-bootstrap-v7",
-  "base_release_commit": "04dc2a58dec3afe08ca4085f0ab81c9119f38c89",
+  "base_release_commit": "83a09b52fe7045d1d2b1448945660776e5814be2",
   "source_kakuriyo_commit": "78ac792a9860a850eb1853683d2faaecc7eee16a",
   "base_kakuriyo_commit": "8873aeeb2837b357fa39fd4b36e3b265d8eea9d5",
   "applied_amendments": [
