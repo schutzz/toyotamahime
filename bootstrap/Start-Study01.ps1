@@ -71,6 +71,25 @@
     passes K8-S2 and a fresh certification run; until then this is a
     candidate, tracked in docs/k8-candidates/ledger.json.
 
+    v6/v7 changes from k8-bootstrap-v5: packaging-only pin bumps (a
+    dirty-tree/pytest-transcript remediation, then the Range C validator
+    moving to v0.13.1) -- neither touched frozen apparatus or scientific
+    semantics, so neither added its own changelog note here; see the
+    K8-S2 authorization applicability reviews for those two HEADs.
+
+    v8 change from k8-bootstrap-v7: v8 is the second amended Study 01
+    baseline. AMEND-005 is now reflected in the frozen apparatus --
+    `scripts/study01/frozen/apparatus.py`'s `AMENONUBOCO_COMMIT` moves
+    from the historical `78fc177` (v0.12.0) to `80e550f` (v0.13.5),
+    transcribed from Kakuriyo under an independent exact-commit review
+    and recorded in the Authority Anchor Record (now also accepting
+    AMEND-005, alongside the AMEND-001-004 it already accepted for v5).
+    The kit was re-exported from a dedicated Kakuriyo export-source
+    commit, not the v7 source. Scientific semantics are unchanged --
+    the pin is a runtime provisioning dependency identity, not a
+    scoring or observation definition; see Study01/PROVENANCE.md and
+    docs/k8-study01-amended-candidate-attestation.json.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -93,7 +112,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v7` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v8` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -118,7 +137,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v7'
+    [string] $Ref = 'k8-bootstrap-v8'
 )
 
 Set-StrictMode -Version Latest
