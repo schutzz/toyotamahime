@@ -88,9 +88,9 @@ This section adds an **optional harness** that automates the bookkeeping around 
 
 <!-- k8-test:id=bootstrap-fetch-verify-run mode=parse cwd=repo-root -->
 ```powershell
-$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v10/bootstrap/Start-Study01.ps1'
+$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v11/bootstrap/Start-Study01.ps1'
 $Dest     = Join-Path $env:TEMP 'Start-Study01.ps1'
-$Expected = '6f23b012df6b5675ca411d65fd4116a14a9f4b8f7dd11e050209d8ff420356b2'
+$Expected = '715764ca812052827880a9245acc397385573ca0275babf3627ec41816d46eb2'
 
 Invoke-WebRequest -Uri $Url -OutFile $Dest
 $Actual = (Get-FileHash -Path $Dest -Algorithm SHA256).Hash.ToLower()
@@ -101,7 +101,7 @@ if ($Actual -ne $Expected) {
 & $Dest
 ```
 
-The tag `k8-bootstrap-v10` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. `Start-Study01.ps1` also checks out that same tag by default when it clones Toyotamahime (its `-Ref` parameter defaults to `k8-bootstrap-v10`), so the commit you fetched this script from and the commit your attempt actually reproduces are the same one, even if `main` has moved on by the time you run this. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
+The tag `k8-bootstrap-v11` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. `Start-Study01.ps1` also checks out that same tag by default when it clones Toyotamahime (its `-Ref` parameter defaults to `k8-bootstrap-v11`), so the commit you fetched this script from and the commit your attempt actually reproduces are the same one, even if `main` has moved on by the time you run this. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
 
 **What it executes and where it writes.** `Start-Study01.ps1` creates a new attempt directory under `C:\K8\attempts\<attempt-id>\` (override with `-AttemptRoot`), starts a transcript there, clones `https://github.com/schutzz/toyotamahime` into it, records the exact clone `HEAD`, and captures a small environment record. It writes only under `-AttemptRoot`; it does not touch anything outside it, and it does not send anything over the network beyond the clone itself.
 
@@ -208,11 +208,19 @@ The capture helper is pinned by digest and must be pulled by digest:
 docker pull corfr/tcpdump@sha256:3006b3bd9f041bf73f21e626b97cca5e78fd6ce271549ca95b8e6a508165512b
 ```
 
-Range A and Range B build their service images from the generated Compose file; `protocol/c2-dnp3-image-inventory.md` records what the original runs used. Record the digests you end up with.
+Range A and Range B's 13 protocol-image services use the exact-digest published images pinned in `protocol/c2-dnp3-range-derivation.md` §2 (via `--image-override`, `--no-build`) — they are not built locally. `protocol/c2-dnp3-image-inventory.md` records what the original (locally built) runs used; record the digests you end up with.
 
 ## 5. Running the three ranges
 
 The canonical procedures are in `protocol/`, and they are the authority — this section sequences them and tells you what each step must leave behind. **Where a protocol document gives a literal command, use that command.**
+
+**Where `<run-evidence>` (Range A/B) and `<static-validation-workspace>` (Range C) live.** If you are using §3.2's recorded-attempt harness, their base is `$env:K8_ATTEMPT_DIR`, a sibling of the `toyotamahime\` clone it also creates — not inside the clone:
+
+- Range A: `$env:K8_ATTEMPT_DIR\evidence\main-runs\range-a\<run-id>`
+- Range B: `$env:K8_ATTEMPT_DIR\evidence\main-runs\range-b\<run-id>`
+- Range C: `$env:K8_ATTEMPT_DIR\evidence\static-validations\range-c\<validation-id>`
+
+This fixes only where the evidence root sits relative to the attempt directory; the tree schema beneath it (`main-runs/`, `static-validations/`, and everything under a run or validation ID) is unchanged and is defined in `protocol/evidence-schema.md`. If you are not using the harness, place the same tree wherever you track attempt evidence — the schema, not this base path, is what the apparatus and the protocol documents depend on.
 
 ### 5.1 Range A — the observation-valid control
 

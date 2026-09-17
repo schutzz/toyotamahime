@@ -41,7 +41,7 @@ A reader who checks a shipped blob id against a value quoted in `claims/` — fo
 | Anchor | What it is | Where it lives |
 | --- | --- | --- |
 | **Historical claim anchor** | `k8-bootstrap-v4` = Kakuriyo `f0df3e1`. The K6 and K7 results — including the *Inconclusive* headline judgment — were obtained on **this** apparatus. Every blob id quoted in `claims/` is true against this anchor and is not re-interpreted here. | tag `k8-bootstrap-v4`, permanently retained |
-| **Prospective candidate anchor** | This baseline's `Study01/` tree. It is the apparatus for K8-S2 and any subsequent formal K8-3. It differs from the historical anchor only by the accepted amendment transcription recorded in `amendment_transcription[]` of [`docs/k8-study01-amended-candidate-attestation.json`](../docs/k8-study01-amended-candidate-attestation.json). | this commit's `Study01` tree OID; intended tag `k8-bootstrap-v8` |
+| **Prospective candidate anchor** | This baseline's `Study01/` tree. It is the apparatus for K8-S2 and any subsequent formal K8-3. It differs from the historical anchor only by the accepted amendment transcription recorded in `amendment_transcription[]` of [`docs/k8-study01-amended-candidate-attestation.json`](../docs/k8-study01-amended-candidate-attestation.json). | this commit's `Study01` tree OID; intended tag `k8-bootstrap-v11` |
 
 **The K6 / K7 claims are not asserted to hold under this candidate.** They are the frozen record of what the historical apparatus produced. Re-running them on the amended apparatus is a separate, forward activity (formal K8-3 against the new release), not a re-litigation of the frozen outcome. `amendment_transcription[]` in the attestation records, per file, which amendment authorised the change and from which blob to which blob.
 
@@ -50,7 +50,7 @@ A reader who checks a shipped blob id against a value quoted in `claims/` — fo
 | Pin | Value | How to obtain it |
 | --- | --- | --- |
 | Amenonuboco, range generation (AMEND-005 prospective pin) | `80e550ffeab8daa6583590add490433a0305bb53` (annotated tag `v0.13.5`) | fetchable by SHA from the public repository; see `README.md` §4.1 |
-| Amenonuboco, contract validator | `v0.13.0` = `0378f8a32701b481e030f3db3d5f66ea471a4675` | public tag |
+| Amenonuboco, contract validator | `v0.13.1` = `1d0fa75725078100e9da2e8492ca977ba8e89d95` (packaging-only patch of `v0.13.0` = `0378f8a32701b481e030f3db3d5f66ea471a4675`; validator code/schema/behavior unchanged) | public tag |
 | Capture helper image | `corfr/tcpdump@sha256:3006b3bd9f041bf73f21e626b97cca5e78fd6ce271549ca95b8e6a508165512b` | pull by digest |
 | Sender asset | SHA-256 `093FEFD5F1F36D715AAE4D7AB91DBAD2D7A93BFE212705D721C95B356A7C053B` | shipped; the preflight checks it |
 | Kakuriyo K6 start boundary | `a772ea11b07b59208586846d76abe1d1841dddd9` | referenced by the judgments |

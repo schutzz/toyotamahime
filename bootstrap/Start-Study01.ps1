@@ -119,6 +119,21 @@
     build-context path and third-party images are unchanged. No frozen
     apparatus, scientific semantics, or Authority Anchor content changed.
 
+    v11 change from k8-bootstrap-v10: v10 documentation/path-ambiguity
+    cleanup, no code or apparatus change. Study01/README.md section 4.2
+    corrected -- it said Range A/B build their service images, which
+    contradicted the AMEND-005 published-image path (the 13
+    protocol-image services are --image-override'd, not built).
+    Section 5's `<run-evidence>` / `<static-validation-workspace>` base
+    path was unstated and an operator guessed at it during a prior
+    formal attempt (recorded as a knowledge-leak); now fixed at
+    `$env:K8_ATTEMPT_DIR\evidence\...` when using the recorded-attempt
+    harness. Study01/PROVENANCE.md's stated intended tag and Range C
+    validator pin, both stale, brought current. No third-party image
+    gained a new digest requirement, and the evidence tree schema
+    itself (protocol/evidence-schema.md) is unchanged -- only its base
+    path relative to an attempt directory is now explicit.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -141,7 +156,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v10` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v11` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -166,7 +181,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v10'
+    [string] $Ref = 'k8-bootstrap-v11'
 )
 
 Set-StrictMode -Version Latest
