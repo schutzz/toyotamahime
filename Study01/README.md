@@ -68,7 +68,7 @@ python -m pytest tests -q
 Pop-Location
 ```
 
-74 tests should pass. If they do not, stop and record the failure; do not continue. This exact count is machine-checked, not just documented here: `Study01/tools/Test-Study01Packaging.ps1`'s packaging certification runs this same check against this repository's own shipped test suite before every bootstrap release and fails certification if the actual collected/passed count and this paragraph's stated count disagree, so a future apparatus change that adds or removes tests cannot ship without this paragraph being updated in the same commit. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (74 passed):
+81 tests should pass. If they do not, stop and record the failure; do not continue. This exact count is machine-checked, not just documented here: `Study01/tools/Test-Study01Packaging.ps1`'s packaging certification runs this same check against this repository's own shipped test suite before every bootstrap release and fails certification if the actual collected/passed count and this paragraph's stated count disagree, so a future apparatus change that adds or removes tests cannot ship without this paragraph being updated in the same commit. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (81 passed):
 
 <!-- k8-test:id=apparatus-check-via-harness mode=exec cwd=Study01 -->
 ```powershell
@@ -88,9 +88,9 @@ This section adds an **optional harness** that automates the bookkeeping around 
 
 <!-- k8-test:id=bootstrap-fetch-verify-run mode=parse cwd=repo-root -->
 ```powershell
-$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v9/bootstrap/Start-Study01.ps1'
+$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v10/bootstrap/Start-Study01.ps1'
 $Dest     = Join-Path $env:TEMP 'Start-Study01.ps1'
-$Expected = '2ba732dad0528627473a6129e4fd908b009b4a55ffa79d48624539cb5caa94ff'
+$Expected = '6f23b012df6b5675ca411d65fd4116a14a9f4b8f7dd11e050209d8ff420356b2'
 
 Invoke-WebRequest -Uri $Url -OutFile $Dest
 $Actual = (Get-FileHash -Path $Dest -Algorithm SHA256).Hash.ToLower()
@@ -101,7 +101,7 @@ if ($Actual -ne $Expected) {
 & $Dest
 ```
 
-The tag `k8-bootstrap-v9` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. `Start-Study01.ps1` also checks out that same tag by default when it clones Toyotamahime (its `-Ref` parameter defaults to `k8-bootstrap-v9`), so the commit you fetched this script from and the commit your attempt actually reproduces are the same one, even if `main` has moved on by the time you run this. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
+The tag `k8-bootstrap-v10` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. `Start-Study01.ps1` also checks out that same tag by default when it clones Toyotamahime (its `-Ref` parameter defaults to `k8-bootstrap-v10`), so the commit you fetched this script from and the commit your attempt actually reproduces are the same one, even if `main` has moved on by the time you run this. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
 
 **What it executes and where it writes.** `Start-Study01.ps1` creates a new attempt directory under `C:\K8\attempts\<attempt-id>\` (override with `-AttemptRoot`), starts a transcript there, clones `https://github.com/schutzz/toyotamahime` into it, records the exact clone `HEAD`, and captures a small environment record. It writes only under `-AttemptRoot`; it does not touch anything outside it, and it does not send anything over the network beyond the clone itself.
 

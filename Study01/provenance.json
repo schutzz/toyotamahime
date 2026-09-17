@@ -1,7 +1,7 @@
 {
   "digest_basis": "committed bytes (git show HEAD:), never working-tree bytes",
   "extracted_from": "schutzz/kakuriyo-cyber-range-research",
-  "file_count": 71,
+  "file_count": 72,
   "files": [
     {
       "blob": "0f70e75f66d37c0947e5b5c9663eb0e787af0587",
@@ -492,11 +492,11 @@
       "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/frozen/semantics.py"
     },
     {
-      "blob": "0999aa8736aa65bd85f979778d6da7af4b046b98",
-      "bytes": 11822,
+      "blob": "40de19fb81946cafd83139273f405b04dc8d4b44",
+      "bytes": 17438,
       "crlf": false,
       "kakuriyo": "studies/study-01-negative-result/scripts/study01/preflight.py",
-      "sha256": "aec113df660e5683303872b2c266ec9e13f67f6b0ead37d13c874bfdbf786b60",
+      "sha256": "d739f286b4c80c122d0318719c02ecefed2abf67eed5ee9959bb4d97577f42c3",
       "toyotamahime": "Study01/studies/study-01-negative-result/scripts/study01/preflight.py"
     },
     {
@@ -570,8 +570,16 @@
       "kakuriyo": "studies/study-01-negative-result/scripts/tests/test_phase1.py",
       "sha256": "f5baf664586df5973e3101c131455417125efab345cf860f99bb8cd779ba3670",
       "toyotamahime": "Study01/studies/study-01-negative-result/scripts/tests/test_phase1.py"
+    },
+    {
+      "blob": "69dadf814ffdf6552717892c45c8e64e66a61ecb",
+      "bytes": 5421,
+      "crlf": false,
+      "kakuriyo": "studies/study-01-negative-result/scripts/tests/test_preflight_amend005_provisioning.py",
+      "sha256": "6d5cc7f3a0857c0a1a7972755bc1065ff20e97484c34ad09502b59c8e959ba6e",
+      "toyotamahime": "Study01/studies/study-01-negative-result/scripts/tests/test_preflight_amend005_provisioning.py"
     }
   ],
-  "kakuriyo_commit": "78ac792a9860a850eb1853683d2faaecc7eee16a",
+  "kakuriyo_commit": "106e76d70b0f777a8536209e554e945738369889",
   "study_root": "studies/study-01-negative-result"
 }

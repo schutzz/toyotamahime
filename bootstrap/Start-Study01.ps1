@@ -107,6 +107,18 @@
     verified end to end with Test-K8ReleaseBinding.ps1 before being
     treated as usable.
 
+    v10 change from k8-bootstrap-v9: formal K8-3 attempt k8-repro-20260917-001
+    stopped before Range A provisioning -- preflight.compose_build_contexts()
+    still assumed a generated Range A/B Compose file always declares a local
+    build context, and failed closed the moment AMEND-005's published-image
+    path (--image-override/--no-build on all 13 protocol-image services)
+    left zero build contexts by design. Fixed in
+    studies/study-01-negative-result/scripts/study01/preflight.py: the
+    13 known services are now checked individually against their accepted
+    exact-digest image when none of them is building; the historical
+    build-context path and third-party images are unchanged. No frozen
+    apparatus, scientific semantics, or Authority Anchor content changed.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -129,7 +141,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v9` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v10` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -154,7 +166,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v9'
+    [string] $Ref = 'k8-bootstrap-v10'
 )
 
 Set-StrictMode -Version Latest
