@@ -90,6 +90,23 @@
     scoring or observation definition; see Study01/PROVENANCE.md and
     docs/k8-study01-amended-candidate-attestation.json.
 
+    v9 change from k8-bootstrap-v8: v8 repeated the v3 incident (see the
+    v4 note above) in a new shape. v8 was tagged at the commit that
+    package certification actually passed on (c9a259f), but that commit
+    still said `k8-bootstrap-v7` in its own -Ref default and in
+    Study01/README.md's pin -- the self-referential bump to say "v8"
+    was made in a *following* commit (b8aa1b1), which was never
+    certified or tagged on its own. So `k8-bootstrap-v8`'s target does
+    not self-describe as v8, and Test-K8ReleaseBinding.ps1 -Tag
+    k8-bootstrap-v8 -ExpectedCommit c9a259f... correctly reports the
+    README SHA-256 pin as FAIL (it names b8aa1b1's blob, not c9a259f's).
+    `k8-bootstrap-v8` is left exactly as it was -- an immutable tag is
+    never moved -- and is not usable as a bootstrap default; v9 is a
+    fresh commit (this one, self-referencing v9 throughout, before
+    being certified or tagged), fresh certification run, fresh tag,
+    verified end to end with Test-K8ReleaseBinding.ps1 before being
+    treated as usable.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -112,7 +129,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v8` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v9` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -137,7 +154,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v8'
+    [string] $Ref = 'k8-bootstrap-v9'
 )
 
 Set-StrictMode -Version Latest
