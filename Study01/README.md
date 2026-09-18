@@ -68,7 +68,7 @@ python -m pytest tests -q
 Pop-Location
 ```
 
-81 tests should pass. If they do not, stop and record the failure; do not continue. This exact count is machine-checked, not just documented here: `Study01/tools/Test-Study01Packaging.ps1`'s packaging certification runs this same check against this repository's own shipped test suite before every bootstrap release and fails certification if the actual collected/passed count and this paragraph's stated count disagree, so a future apparatus change that adds or removes tests cannot ship without this paragraph being updated in the same commit. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (81 passed):
+85 tests should pass. If they do not, stop and record the failure; do not continue. This exact count is machine-checked, not just documented here: `Study01/tools/Test-Study01Packaging.ps1`'s packaging certification runs this same check against this repository's own shipped test suite before every bootstrap release and fails certification if the actual collected/passed count and this paragraph's stated count disagree, so a future apparatus change that adds or removes tests cannot ship without this paragraph being updated in the same commit. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (85 passed):
 
 <!-- k8-test:id=apparatus-check-via-harness mode=exec cwd=Study01 -->
 ```powershell
@@ -88,9 +88,9 @@ This section adds an **optional harness** that automates the bookkeeping around 
 
 <!-- k8-test:id=bootstrap-fetch-verify-run mode=parse cwd=repo-root -->
 ```powershell
-$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v11/bootstrap/Start-Study01.ps1'
+$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v12/bootstrap/Start-Study01.ps1'
 $Dest     = Join-Path $env:TEMP 'Start-Study01.ps1'
-$Expected = '715764ca812052827880a9245acc397385573ca0275babf3627ec41816d46eb2'
+$Expected = '9e1b02f09aae9fcdbba86975c9c9e7849db1258b9134d0e63df78f911c940e83'
 
 Invoke-WebRequest -Uri $Url -OutFile $Dest
 $Actual = (Get-FileHash -Path $Dest -Algorithm SHA256).Hash.ToLower()
@@ -101,7 +101,7 @@ if ($Actual -ne $Expected) {
 & $Dest
 ```
 
-The tag `k8-bootstrap-v11` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. `Start-Study01.ps1` also checks out that same tag by default when it clones Toyotamahime (its `-Ref` parameter defaults to `k8-bootstrap-v11`), so the commit you fetched this script from and the commit your attempt actually reproduces are the same one, even if `main` has moved on by the time you run this. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
+The tag `k8-bootstrap-v12` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. `Start-Study01.ps1` also checks out that same tag by default when it clones Toyotamahime (its `-Ref` parameter defaults to `k8-bootstrap-v12`), so the commit you fetched this script from and the commit your attempt actually reproduces are the same one, even if `main` has moved on by the time you run this. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
 
 **What it executes and where it writes.** `Start-Study01.ps1` creates a new attempt directory under `C:\K8\attempts\<attempt-id>\` (override with `-AttemptRoot`), starts a transcript there, clones `https://github.com/schutzz/toyotamahime` into it, records the exact clone `HEAD`, and captures a small environment record. It writes only under `-AttemptRoot`; it does not touch anything outside it, and it does not send anything over the network beyond the clone itself.
 
@@ -226,7 +226,15 @@ This fixes only where the evidence root sits relative to the attempt directory; 
 
 1. Choose a fresh run ID. Use it as the Compose project name, the run-evidence directory name, and nowhere else. Never reuse one.
 2. Generate the Compose file into a run workspace **exactly one level below the Amenonuboco worktree root** — `protocol/c2-dnp3-range-derivation.md` §2.1 explains why this is load-bearing and what fails if it is not.
-3. Create the empty evidence tree, then run the **execution preflight** (`protocol/c2-dnp3-range-derivation.md` §2.3). It starts no container. Do not provision until it exits 0.
+3. Create the empty evidence tree **with the shipped wrapper**, then run the **execution preflight** (`protocol/c2-dnp3-range-derivation.md` §2.3). Neither starts a container. Do not provision until the preflight exits 0.
+
+<!-- k8-test:id=evidence-tree-create mode=parse cwd=Study01 -->
+```powershell
+python studies/study-01-negative-result/scripts/study01_evidence_tree.py `
+  --run-evidence "$env:K8_ATTEMPT_DIR\evidence\main-runs\range-a\<run-id>"
+```
+
+   Do not hand-build this tree from a directory listing. The wrapper calls the same definition the preflight gate checks against, so the two cannot disagree; it creates **eight** directories, including the two nested capture-export destinations `ground-truth/independent-capture/` and `sensor-input/mirror-capture/` that the capture procedure writes into. A formal attempt that hand-built the six top-level ones was stopped by the gate at 12/13.
 4. Provision, establish readiness, resolve the capture contexts, and start the capture helpers before the event window opens — `protocol/c2-dnp3-capture-procedure.md`.
 5. Place and hash the sender asset, then invoke it **exactly once** through `study01_sender.py` — `protocol/c2-dnp3-sender-procedure.md`. The invocation defines T0, and the frozen window is `[T0 − 5 s, T0 + 15 s]`.
 6. Cover the window, stop and export both captures, decode them, and retain the Collector and Rule queries with their responses and mappings.
@@ -239,6 +247,8 @@ Expected, not forced: Ground Truth / Sensor / Collector Pass, runtime contract P
 ### 5.2 Range B — the same run with one fault
 
 Identical to Range A, under a **new** run ID, with exactly one difference: before the capture and trigger, delete the ingress qdisc on the interface carrying `10.1.20.254/24`. Resolve that interface by address, never by ordinal.
+
+Its evidence tree is created the same way, under `range-b`: `--run-evidence "$env:K8_ATTEMPT_DIR\evidence\main-runs\range-b\<run-id>"`.
 
 Additionally, Range B must capture and retain the R-OBS-05 unrelated-flow liveness evidence end to end — the contract is `protocol/k6-r-obs-05-collector-query-contract.md`. Without it the run is `Inconclusive experiment`, not `Invalid negative result`.
 

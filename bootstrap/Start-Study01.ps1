@@ -134,6 +134,30 @@
     itself (protocol/evidence-schema.md) is unchanged -- only its base
     path relative to an attempt directory is now explicit.
 
+    v12 change from k8-bootstrap-v11: formal K8-3 attempt
+    k8-repro-20260918-001 hit two defects of the same class -- the
+    implementation required something the published procedure did not
+    expose. (1) evidence_tree.create() builds eight directories and the
+    execution preflight gate checks all eight, but create() was
+    reachable only from tests and protocol/evidence-schema.md's diagram
+    showed only six, omitting the two nested capture-export
+    destinations; the operator hand-built six and the gate stopped the
+    attempt 12/13. Fixed by publishing scripts/study01_evidence_tree.py
+    (which calls create() and nothing else, so wrapper and gate cannot
+    diverge) and by naming all eight in the schema, the derivation
+    procedure, and README section 5.1. (2) Invoke-K8Step lost a step's
+    steps.jsonl record whenever the command block threw -- which
+    protocol/'s literal commands do, in sixteen places, via their own
+    `if ($LASTEXITCODE -ne 0) { throw ... }` guards -- leaving
+    steps-raw/NNNN.log on disk with no corresponding record and
+    Stop-K8's auto-populated final-status describing the previous,
+    passing step. Fixed in Study01/tools/K8AttemptCommon.psm1: the
+    block's exception is captured, written to the raw artifact,
+    recorded as a failed step with its message, and only then
+    re-raised. The failed attempt's own archive is retained unmodified;
+    that gap stays in it as historical evidence. No frozen apparatus,
+    scientific semantics, or Authority Anchor content changed.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -156,7 +180,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v11` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v12` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -181,7 +205,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v11'
+    [string] $Ref = 'k8-bootstrap-v12'
 )
 
 Set-StrictMode -Version Latest

@@ -433,6 +433,87 @@ if (-not $SkipUnit) {
             } finally { try { Stop-Transcript | Out-Null } catch {} }
         }
 
+        Invoke-Check -Layer 'Unit' -Check 'Invoke-K8Step: a literal protocol guard that throws is still recorded in steps.jsonl' -Body {
+            # Regresses the k8-repro-20260918-001 evidence gap. protocol/'s
+            # literal commands end in their own guard -- e.g.
+            # `if ($LASTEXITCODE -ne 0) { throw "execution preflight failed" }`
+            # -- and README tells the operator to paste those verbatim into
+            # -Command. Before the fix, that throw unwound past the
+            # steps.jsonl append: steps-raw/NNNN.log held the real output,
+            # but the failing step had no record, so Stop-K8's
+            # auto-populated final-status described the previous passing
+            # step instead. The shape below is the real one: a native
+            # command exiting non-zero, then the guard.
+            $Paths = Initialize-K8AttemptDirectory -AttemptRoot (Join-Path $UnitRoot 'a19') -AttemptId 'k8-repro-19700101-001' -RepoUrl 'unit-test'
+            try {
+                $Threw = $false
+                try {
+                    Invoke-K8Step -Paths $Paths -Description 'native non-zero then literal guard throw' -Command {
+                        & cmd.exe /c "echo preflight output && exit 1"
+                        if ($LASTEXITCODE -ne 0) { throw 'execution preflight failed; do not provision this run ID' }
+                    } | Out-Null
+                }
+                catch { $Threw = $true }
+                Assert $Threw 'the guard''s throw must still reach the caller, so the attempt still stops'
+
+                $Steps = @(Get-Content $Paths.StepsLog | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
+                Assert ($Steps.Count -eq 1) "expected the thrown step to be recorded in steps.jsonl, got $($Steps.Count) record(s)"
+
+                $Step = $Steps[0]
+                Assert ($Step.passed -eq $false) 'a step whose command block threw must never be recorded as passed'
+                Assert ($Step.exit_code -eq 1) "expected the native exit code 1 to survive into the record, got $($Step.exit_code)"
+                Assert ([bool]$Step.command_error) 'the record must say the command block threw, not merely that it failed'
+                Assert ($Step.command_error -match 'execution preflight failed') "command_error should carry the guard's own message, got: $($Step.command_error)"
+
+                $Raw = Join-Path $Paths.AttemptDir $Step.raw_output
+                Assert (Test-Path $Raw) 'raw_output artifact missing for a step whose command block threw'
+                $RawText = Get-Content $Raw -Raw
+                Assert ($RawText -match 'preflight output') 'raw output produced before the throw must be retained'
+                Assert ($RawText -match 'command block threw') 'the raw artifact must record that the block threw'
+
+                # Stop-K8 auto-populates from this record; before the fix it
+                # had nothing to read and described the wrong step.
+                $Last = Get-K8LastStep -Paths $Paths
+                Assert ($Last.description -eq 'native non-zero then literal guard throw') 'Get-K8LastStep must see the failing step'
+                Assert ($Last.passed -eq $false) 'Get-K8LastStep must report the failing step as failed'
+            } finally { try { Stop-Transcript | Out-Null } catch {} }
+        }
+
+        Invoke-Check -Layer 'Unit' -Check 'Invoke-K8Step: a guard throwing after a zero-exit command is still a failed step' -Body {
+            # The sender procedure's hash guard is this shape: the native
+            # command succeeds, the comparison fails, the block throws.
+            # $LASTEXITCODE is 0 there, so passed must come from the
+            # exception, not from the exit code alone.
+            $Paths = Initialize-K8AttemptDirectory -AttemptRoot (Join-Path $UnitRoot 'a20') -AttemptId 'k8-repro-19700101-001' -RepoUrl 'unit-test'
+            try {
+                try {
+                    Invoke-K8Step -Paths $Paths -Description 'zero exit then guard throw' -Command {
+                        & cmd.exe /c "exit 0"
+                        throw 'sender hash mismatch: DEADBEEF'
+                    } | Out-Null
+                }
+                catch { }
+                $Steps = @(Get-Content $Paths.StepsLog | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
+                Assert ($Steps.Count -eq 1) "expected 1 recorded step, got $($Steps.Count)"
+                Assert ($Steps[0].exit_code -eq 0) 'the last native exit code was 0 and should be recorded as such'
+                Assert ($Steps[0].passed -eq $false) 'exit 0 plus a thrown guard must still be a failed step'
+                Assert ($Steps[0].command_error -match 'sender hash mismatch') 'the guard message must be recorded'
+            } finally { try { Stop-Transcript | Out-Null } catch {} }
+        }
+
+        Invoke-Check -Layer 'Unit' -Check 'Invoke-K8Step: -ContinueOnFailure returns the record for a thrown block instead of rethrowing' -Body {
+            $Paths = Initialize-K8AttemptDirectory -AttemptRoot (Join-Path $UnitRoot 'a21') -AttemptId 'k8-repro-19700101-001' -RepoUrl 'unit-test'
+            try {
+                $Rec = Invoke-K8Step -Paths $Paths -Description 'thrown block, continue' -Command {
+                    throw 'capture device name was not resolved'
+                } -ContinueOnFailure
+                Assert ($Rec.passed -eq $false) 'expected a failed record'
+                Assert ($Rec.command_error -match 'capture device name') 'expected the guard message on the returned record'
+                $Steps = @(Get-Content $Paths.StepsLog | Where-Object { $_.Trim() })
+                Assert ($Steps.Count -eq 1) 'the step must be recorded under -ContinueOnFailure too'
+            } finally { try { Stop-Transcript | Out-Null } catch {} }
+        }
+
         Invoke-Check -Layer 'Unit' -Check 'Get-K8LastStep: null before any step, correct after' -Body {
             $Paths = Initialize-K8AttemptDirectory -AttemptRoot (Join-Path $UnitRoot 'a11') -AttemptId 'k8-repro-19700101-001' -RepoUrl 'unit-test'
             try {

@@ -730,12 +730,41 @@ function Invoke-K8Step {
         # file, line by line, as it arrives -- not buffered in memory
         # and written once at the end, so a step that is killed mid-run
         # still leaves whatever output it produced on disk.
-        & $Command 2>&1 |
-            ForEach-Object {
-                $Line = $_.ToString()
-                Write-Host $Line
-                Add-Content -Path $RawOutputPath -Value $Line -Encoding utf8
-            }
+        #
+        # The command block is allowed to throw, and must not escape
+        # before this step is recorded. protocol/'s literal commands --
+        # the ones Study01/README.md tells the operator to use verbatim
+        # -- routinely end in their own guard, e.g.
+        # `if ($LASTEXITCODE -ne 0) { throw "execution preflight failed" }`,
+        # and there are sixteen such guards across the capture,
+        # derivation, and sender procedures. Before this catch, such a
+        # throw unwound straight past the steps.jsonl append below:
+        # steps-raw/NNNN.log existed with the real output, but the step
+        # had no record at all, so Get-K8LastStep (and therefore
+        # Stop-K8.ps1's auto-populated final-status) saw the previous,
+        # passing step instead of the failure. Formal attempt
+        # k8-repro-20260918-001 lost its failing step exactly this way.
+        # The exception is captured here, written to the raw artifact,
+        # recorded as a failed step below, and only then re-raised.
+        $CommandError =
+            $null
+
+        try {
+            & $Command 2>&1 |
+                ForEach-Object {
+                    $Line = $_.ToString()
+                    Write-Host $Line
+                    Add-Content -Path $RawOutputPath -Value $Line -Encoding utf8
+                }
+        }
+        catch {
+            $CommandError = $_
+
+            $ErrorLine =
+                "[k8-harness] command block threw: $($_.Exception.Message)"
+            Write-Host $ErrorLine -ForegroundColor Red
+            Add-Content -Path $RawOutputPath -Value $ErrorLine -Encoding utf8
+        }
 
         if (-not (Test-Path $RawOutputPath)) {
             # The command produced no output at all -- retain an empty,
@@ -748,8 +777,14 @@ function Invoke-K8Step {
         $ExitCode =
             $LASTEXITCODE
 
+        # A step whose command block threw never passes, whatever
+        # $LASTEXITCODE says -- a guard that throws on a non-zero native
+        # exit leaves the real exit code here, but a guard that throws
+        # on a failed string comparison (the sender hash check, say)
+        # leaves the last successful native exit code, which would
+        # otherwise read as a pass.
         $Passed =
-            $ExpectedExitCode -contains $ExitCode
+            ($null -eq $CommandError) -and ($ExpectedExitCode -contains $ExitCode)
 
         $Record =
             [ordered]@{
@@ -763,6 +798,11 @@ function Invoke-K8Step {
                 raw_output   = $RawOutputRelativePath
             }
 
+        if ($null -ne $CommandError) {
+            $Record['command_error'] =
+                $CommandError.Exception.Message
+        }
+
         ($Record | ConvertTo-Json -Compress) |
             Add-Content -Path $Paths.StepsLog -Encoding utf8
 
@@ -770,16 +810,29 @@ function Invoke-K8Step {
             Write-Host "=== STEP OK (exit $ExitCode) ===" -ForegroundColor Green
         }
         else {
-            Write-Host (
-                "=== STEP FAILED (exit $ExitCode, expected " +
-                "$($ExpectedExitCode -join ',')) ==="
-            ) -ForegroundColor Red
+            if ($null -ne $CommandError) {
+                Write-Host (
+                    "=== STEP FAILED (command block threw; last exit " +
+                    "$ExitCode) ==="
+                ) -ForegroundColor Red
+            }
+            else {
+                Write-Host (
+                    "=== STEP FAILED (exit $ExitCode, expected " +
+                    "$($ExpectedExitCode -join ',')) ==="
+                ) -ForegroundColor Red
+            }
             Write-Host (
                 'Do not work around this from memory. Close this attempt: ' +
                 "Stop-K8.ps1 `"<why>`""
             ) -ForegroundColor Yellow
 
             if (-not $ContinueOnFailure) {
+                # Recorded first, then re-raised: the failure still stops
+                # the operator's script exactly as before.
+                if ($null -ne $CommandError) {
+                    throw $CommandError
+                }
                 throw "K8 step failed: $Description (exit $ExitCode)"
             }
         }

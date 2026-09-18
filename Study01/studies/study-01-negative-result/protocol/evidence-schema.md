@@ -25,7 +25,9 @@ evidence/
       metadata.md
       environment/
       ground-truth/
+        independent-capture/
       sensor-input/
+        mirror-capture/
       collector-output/
       rule-output/
       contract-output/
@@ -35,7 +37,9 @@ evidence/
       metadata.md
       environment/
       ground-truth/
+        independent-capture/
       sensor-input/
+        mirror-capture/
       collector-output/
       rule-output/
       contract-output/
@@ -52,6 +56,8 @@ evidence/
 ```
 
 Pilot and Main Experiment records are intentionally separate. Range C is non-provisioned and belongs only under `static-validations/`; it contains the negative manifest, validation command/output, hashes, and deviations, and it has no runtime Ground Truth, sensor, collector, or rule artifact directories.
+
+**A Range A/B run's directories are created by `scripts/study01_evidence_tree.py`, not by hand.** That wrapper calls `study01.evidence_tree.create`, which is the one definition of this set — the same one the execution preflight gate checks against (`c2-dnp3-range-derivation.md` §2.3). The eight it creates are the six above plus the two nested capture-export destinations, `ground-truth/independent-capture/` and `sensor-input/mirror-capture/`: the capture procedure exports into them, and a run missing them fails the gate before provisioning. Earlier revisions of this diagram omitted the nested two, and a formal attempt built the tree from the diagram and was stopped by the gate for exactly that reason.
 
 ## 2. Mandatory metadata
 

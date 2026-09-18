@@ -61,7 +61,16 @@ That hash is therefore retained as a within-run integrity record and **must not*
 
 ### 2.3 Execution preflight gate
 
-Every Range A/B run must pass the Docker-free acceptance gate before provisioning. It starts no container and sends no event:
+Create the run's evidence tree with the shipped wrapper rather than by hand — it is the same definition the gate below checks against, so the two cannot disagree:
+
+```powershell
+python studies/study-01-negative-result/scripts/study01_evidence_tree.py `
+  --run-evidence <run-evidence>
+```
+
+That creates eight directories: `environment/`, `ground-truth/`, `ground-truth/independent-capture/`, `sensor-input/`, `sensor-input/mirror-capture/`, `collector-output/`, `rule-output/`, `contract-output/`. The two nested capture-export destinations are required — the capture procedure exports into them — and a tree built by hand from a directory listing that omits them fails the gate. It refuses an existing directory: a fresh run ID gets a fresh tree.
+
+Every Range A/B run must then pass the Docker-free acceptance gate before provisioning. It starts no container and sends no event:
 
 ```powershell
 python studies/study-01-negative-result/scripts/study01_preflight.py `
