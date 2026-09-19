@@ -94,7 +94,7 @@ Retain the instantiated request and full raw response. `hits.total.relation` mus
 
 ## 4. Pcap-to-document correlation
 
-At least one returned document must correlate to one decoded frame in the separate R-OBS-05 `tap_observer:eth0` liveness pcap:
+At least one returned document must correlate to one decoded frame in the separate R-OBS-05 `tap_observer:eth0` liveness pcap. That pcap is the `robs05-liveness` capture stage's artifact, retained at **`contract-output/c2-robs05-liveness.pcap`** (AMEND-006; stage, filter, and commands are in [`c2-dnp3-capture-procedure.md`](./c2-dnp3-capture-procedure.md) §7). It is **not** the primary Sensor pcap `sensor-input/mirror-capture/c2-mirror-sensor.pcap`, which is filtered on the target event and structurally cannot contain this flow. Correlation requires:
 
 1. both timestamps are inside the frozen window;
 2. direction, source/destination IP, TCP service-port side, DNP3 function, and link source/destination are equal; and

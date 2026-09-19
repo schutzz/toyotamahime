@@ -68,7 +68,7 @@ python -m pytest tests -q
 Pop-Location
 ```
 
-85 tests should pass. If they do not, stop and record the failure; do not continue. This exact count is machine-checked, not just documented here: `Study01/tools/Test-Study01Packaging.ps1`'s packaging certification runs this same check against this repository's own shipped test suite before every bootstrap release and fails certification if the actual collected/passed count and this paragraph's stated count disagree, so a future apparatus change that adds or removes tests cannot ship without this paragraph being updated in the same commit. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (85 passed):
+99 tests should pass. If they do not, stop and record the failure; do not continue. This exact count is machine-checked, not just documented here: `Study01/tools/Test-Study01Packaging.ps1`'s packaging certification runs this same check against this repository's own shipped test suite before every bootstrap release and fails certification if the actual collected/passed count and this paragraph's stated count disagree, so a future apparatus change that adds or removes tests cannot ship without this paragraph being updated in the same commit. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (99 passed):
 
 <!-- k8-test:id=apparatus-check-via-harness mode=exec cwd=Study01 -->
 ```powershell
@@ -88,9 +88,9 @@ This section adds an **optional harness** that automates the bookkeeping around 
 
 <!-- k8-test:id=bootstrap-fetch-verify-run mode=parse cwd=repo-root -->
 ```powershell
-$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v12/bootstrap/Start-Study01.ps1'
+$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v13/bootstrap/Start-Study01.ps1'
 $Dest     = Join-Path $env:TEMP 'Start-Study01.ps1'
-$Expected = '9e1b02f09aae9fcdbba86975c9c9e7849db1258b9134d0e63df78f911c940e83'
+$Expected = '94490a4b59887da043320e6ca18bcc7974da920c89428c67e6d0872703cccbcc'
 
 Invoke-WebRequest -Uri $Url -OutFile $Dest
 $Actual = (Get-FileHash -Path $Dest -Algorithm SHA256).Hash.ToLower()
@@ -101,7 +101,7 @@ if ($Actual -ne $Expected) {
 & $Dest
 ```
 
-The tag `k8-bootstrap-v12` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. `Start-Study01.ps1` also checks out that same tag by default when it clones Toyotamahime (its `-Ref` parameter defaults to `k8-bootstrap-v12`), so the commit you fetched this script from and the commit your attempt actually reproduces are the same one, even if `main` has moved on by the time you run this. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
+The tag `k8-bootstrap-v13` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. `Start-Study01.ps1` also checks out that same tag by default when it clones Toyotamahime (its `-Ref` parameter defaults to `k8-bootstrap-v13`), so the commit you fetched this script from and the commit your attempt actually reproduces are the same one, even if `main` has moved on by the time you run this. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
 
 **What it executes and where it writes.** `Start-Study01.ps1` creates a new attempt directory under `C:\K8\attempts\<attempt-id>\` (override with `-AttemptRoot`), starts a transcript there, clones `https://github.com/schutzz/toyotamahime` into it, records the exact clone `HEAD`, and captures a small environment record. It writes only under `-AttemptRoot`; it does not touch anything outside it, and it does not send anything over the network beyond the clone itself.
 
@@ -251,6 +251,18 @@ Identical to Range A, under a **new** run ID, with exactly one difference: befor
 Its evidence tree is created the same way, under `range-b`: `--run-evidence "$env:K8_ATTEMPT_DIR\evidence\main-runs\range-b\<run-id>"`.
 
 Additionally, Range B must capture and retain the R-OBS-05 unrelated-flow liveness evidence end to end — the contract is `protocol/k6-r-obs-05-collector-query-contract.md`. Without it the run is `Inconclusive experiment`, not `Invalid negative result`.
+
+**Range B runs a third capture stage, `robs05-liveness`** (AMEND-006), alongside `ground-truth` and `sensor` and over the same frozen window. It exists because the two target-event stages are filtered on the target event and structurally cannot retain the unrelated flow R-OBS-05 is evaluated against — a formal attempt failed for exactly that reason. Do not read R-OBS-05 out of the Sensor pcap.
+
+| | R-OBS-05 auxiliary liveness capture |
+| --- | --- |
+| Stage | `robs05-liveness` (Range B only; Range A never runs it) |
+| Observation point | `tap_observer`, `eth0` — the same mirror point the Sensor stage uses |
+| Filter | `host 10.1.10.10 and host 10.1.40.10 and tcp port 20000` (the contract's own §3 selector) |
+| pcap used for correlation | `contract-output/c2-robs05-liveness.pcap` — **not** `sensor-input/mirror-capture/c2-mirror-sensor.pcap` |
+| Lifecycle / context records | `contract-output/robs05-liveness-capture-lifecycle.json`, `contract-output/robs05-liveness-capture-context.json` |
+
+Its `resolve` / `start` / `stop-export` commands are in `protocol/c2-dnp3-capture-procedure.md` §7, run with `--stage robs05-liveness` in the same order and window as the other two stages.
 
 Expected, not forced: Ground Truth Pass; Sensor and Collector Fail; rule output `No alert`; R-OBS-05 Pass; runtime contract Fail; classification `Invalid negative result`.
 

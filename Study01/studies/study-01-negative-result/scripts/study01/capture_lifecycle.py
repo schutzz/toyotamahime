@@ -96,7 +96,7 @@ def expected_argv(record, step):
 
 
 def new_record(run_id, stage, namespace_container, interface, run_root):
-    stage_spec = apparatus.CAPTURE_STAGES[stage]
+    stage_spec = apparatus.ALL_CAPTURE_STAGES[stage]
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -108,7 +108,7 @@ def new_record(run_id, stage, namespace_container, interface, run_root):
         "namespace_service": stage_spec["service"],
         "namespace_container_id": namespace_container,
         "interface": interface,
-        "filter": apparatus.CAPTURE_FILTER,
+        "filter": stage_spec["filter"],
         "container_pcap": stage_spec["container_pcap"],
         "artifact": stage_spec["artifact"],
         "pcap_sha256": None,
@@ -139,9 +139,9 @@ def validate(record, t0=None, context=None):
         raise CaptureLifecycleError("capture-lifecycle fields are incomplete or unknown")
     if record["schema_version"] != SCHEMA_VERSION:
         raise CaptureLifecycleError("unknown capture-lifecycle schema version")
-    if record["stage"] not in apparatus.CAPTURE_STAGES:
+    if record["stage"] not in apparatus.ALL_CAPTURE_STAGES:
         raise CaptureLifecycleError("unknown capture stage")
-    spec = apparatus.CAPTURE_STAGES[record["stage"]]
+    spec = apparatus.ALL_CAPTURE_STAGES[record["stage"]]
     if record["helper_name"] != f"{record['run_id']}-{record['stage']}-capture":
         raise CaptureLifecycleError("helper name is not derived from this run ID and stage")
     if record["namespace_service"] != spec["service"]:
@@ -160,8 +160,10 @@ def validate(record, t0=None, context=None):
             raise CaptureLifecycleError("execution_run_root does not end in this run ID")
     if record["helper_image"] != apparatus.CAPTURE_IMAGE:
         raise CaptureLifecycleError("capture helper image is not the frozen digest")
-    if record["filter"] != apparatus.CAPTURE_FILTER:
-        raise CaptureLifecycleError("capture filter is not the frozen filter")
+    # AMEND-006: each stage carries its own frozen filter, so a stage whose
+    # filter is not CAPTURE_FILTER is not rejected as if it had drifted.
+    if record["filter"] != spec["filter"]:
+        raise CaptureLifecycleError("capture filter is not the frozen filter for this stage")
     for field in ("helper_container_id", "namespace_container_id", "interface", "pcap_sha256", "execution_run_root"):
         value = record[field]
         if not isinstance(value, str) or not value.strip():

@@ -1,7 +1,7 @@
 # Study 01 Amendment Log
 
 **Status:** Operative (K3 Protocol Freeze complete: `study-01-protocol-v1.0` / `9d57d1e63d6cf16dcc37e8f60d560d30da5f4835`)  
-**Current entries:** 5
+**Current entries:** 6
 
 ## Purpose
 
@@ -30,6 +30,17 @@ The first K4 release/commit pin is an amendment/dependency-change event even tho
 The two records have different roles and may link to each other; neither substitutes for the other.
 
 ## Amendment log
+
+### Amendment 006 — Range B R-OBS-05 auxiliary liveness capture stage
+
+| Field | Content |
+| --- | --- |
+| Amendment ID and date | `AMEND-006`, 2026-09-19 (JST) |
+| Prior frozen state | `frozen/apparatus.py` blob `6335a698ae63b5aa4bf48537118e2d2911e9de1e` (the AMEND-005 accepted blob) and `scripts/tests/test_phase1.py` blob `27210fd98d3b59c0d12204bde2d2fd552fb6cd92`, as recorded by the Authority Anchor Record. `CAPTURE_STAGES` held exactly the two target-event stages, and every stage reused the single global `CAPTURE_FILTER`. |
+| Change and rationale | [`k6-r-obs-05-collector-query-contract.md`](./k6-r-obs-05-collector-query-contract.md) §4 correlates a Collector document against *the separate R-OBS-05 `tap_observer:eth0` liveness pcap*, and its §7 example names a historical *auxiliary liveness pcap* distinct from the fixed Sensor pcap. The capture tooling never implemented that capture: the only mechanism available was `CAPTURE_FILTER = "host 10.1.20.11 and host 10.1.10.10 and tcp port 20000"`, which requires the target sender host in every retained frame and therefore cannot retain a frame of the unrelated `cc_scada_master` (`10.1.10.10`) ↔ `sub_c_rtu` (`10.1.40.10`) flow at all. Formal K8-3 attempt `k8-repro-20260919-002` could not evaluate R-OBS-05 for this reason. This amendment adds a dedicated `robs05-liveness` capture stage at the same frozen observation point (`tap_observer:eth0`), using the contract §3 selector already frozen there, expressed as `ROBS05_LIVENESS_FILTER = "host 10.1.10.10 and host 10.1.40.10 and tcp port 20000"`, retaining its artifacts under the existing `contract-output/` schema directory. Each stage now carries its own frozen filter; the two target-event stages carry `CAPTURE_FILTER` unchanged. The new stage is declared in `AUXILIARY_CAPTURE_STAGES`, **not** in `CAPTURE_STAGES`, because `study01_collect.validate` walks `CAPTURE_STAGES` to decide the mandatory artifacts of every validated run — adding it there would have made R-OBS-05 liveness evidence mandatory for Range A, which R-OBS-05 does not govern (contract §1 is Range B only). `CAPTURE_CONTAINER_PATHS`, the execution-preflight path probes, the evidence-tree schema, the target-event selector, window, Range A/B fault mechanics, scoring, `claims/`, and `expected/` are unchanged. |
+| Affected evidence/claims | No historical evidence or claim changes. K6 accepted evidence, K7 claims/judgments, prior K8 attempts and their archives, and existing tags/releases retain their original identities and are inspected with the historical anchor; none of them contains or requires a `robs05-liveness` artifact. No historical result is rerun or reinterpreted. Range A's retained-artifact set is bit-for-bit what it was. |
+| Rerun decision | **Rerun NOT REQUIRED for historical evidence.** The amendment adds an evidence-acquisition stage for a fact R-OBS-05 already required; it changes no frozen event, selector, window, fault, scoring rule, or classification, so no accepted historical record is invalidated or re-evaluated. The prospective execution set is the next formal K8-3 Range B run, which must run this stage to make R-OBS-05 evaluable from primary observation. |
+| New authoritative state | The Kakuriyo commit containing this entry, the `frozen/apparatus.py` / `scripts/tests/test_phase1.py` transcription, the capture-tooling and procedure updates, and the independent exact-commit ACCEPT review; after review, the existing Authority Anchor mechanism records the exact accepted blobs and this entry's digest. |
 
 ### Amendment 005 — Prospective K8 Range A/B runtime provisioning pin
 

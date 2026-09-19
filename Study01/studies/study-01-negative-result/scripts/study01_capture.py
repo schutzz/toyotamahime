@@ -20,13 +20,13 @@ from study01.frozen import apparatus
 
 
 def _stage_paths(run_evidence, stage):
-    spec = apparatus.CAPTURE_STAGES[stage]
+    spec = apparatus.ALL_CAPTURE_STAGES[stage]
     return run_evidence / spec["lifecycle"], run_evidence / spec["artifact"], spec
 
 
 def resolve(a):
     """Retain the runtime resolutions the helper's frozen argv will carry."""
-    spec = apparatus.CAPTURE_STAGES[a.stage]
+    spec = apparatus.ALL_CAPTURE_STAGES[a.stage]
     path = a.run_evidence / spec["context"]
     if path.exists():
         raise context.CaptureContextError("a capture-context already exists; retry requires a fresh run ID")
@@ -118,7 +118,7 @@ def main():
         s = sub.add_parser(name)
         s.add_argument("--run-id", required=True)
         s.add_argument("--run-evidence", type=Path, required=True)
-        s.add_argument("--stage", choices=tuple(apparatus.CAPTURE_STAGES), required=True)
+        s.add_argument("--stage", choices=tuple(apparatus.ALL_CAPTURE_STAGES), required=True)
         s.set_defaults(handler=handler)
         if name == "resolve":
             s.add_argument("--compose", type=Path, required=True, help="the generated Range A/B Compose file")

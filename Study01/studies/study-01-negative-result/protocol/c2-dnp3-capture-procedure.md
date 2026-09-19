@@ -55,7 +55,7 @@ If either container ID is empty or there is a zero or multiple match, do not sta
 
 ## 4. Canonical ordering
 
-`<filter>` is the fixed BPF host/port filter; it does not replace the frozen decoded selector.
+`<filter>` is the fixed BPF host/port filter for that stage; it does not replace the frozen decoded selector. **Each stage carries its own frozen filter** (AMEND-006): the two target-event stages below use `CAPTURE_FILTER`, and Range B's R-OBS-05 auxiliary stage uses `ROBS05_LIVENESS_FILTER` (see §7).
 
 Each stage first retains the runtime values its helper will use, so they are proven rather than asserted:
 
@@ -81,7 +81,7 @@ python studies/study-01-negative-result/scripts/study01_capture.py start `
 if ($LASTEXITCODE -ne 0) { throw 'sensor capture helper did not start; do not trigger' }
 ```
 
-The helper image digest, BPF filter, in-container pcap path, and export destination are frozen constants transcribed in `scripts/study01/frozen/apparatus.py`; the operator supplies only the run ID, evidence root, stage, and Compose file; the namespace container and capture device come from the retained resolutions rather than from anything typed by hand.
+The helper image digest, per-stage BPF filter, in-container pcap path, and export destination are frozen constants transcribed in `scripts/study01/frozen/apparatus.py`; the operator supplies only the run ID, evidence root, stage, and Compose file; the namespace container and capture device come from the retained resolutions rather than from anything typed by hand.
 
 Confirm both helpers run before copying or invoking the sender.  Follow the frozen [sender procedure](./c2-dnp3-sender-procedure.md) exactly: record `T0` immediately before invocation and invoke it exactly once.  Both captures must cover `[T0 - 5 seconds, T0 + 15 seconds]`; they may start earlier but must not stop before `T0 + 15 seconds`.
 
@@ -127,3 +127,35 @@ This correction changes no frozen event, selector, window, evidence schema path,
 An unresolved helper start, export failure, missing pcap, capture-placement ambiguity, or incomplete event-window coverage forbids a Ground Truth substitute.  Preserve the run's metadata and deviations; never overwrite evidence or reuse its project.  Retry equals a fresh run ID and fresh Compose project only.
 
 Historical unretained command lines are not represented as observed facts. This is the canonical K5 executable transcription of the primary-record-proven image, namespace placement, IP selection, artifacts, and ordering. The display-token normalization was recorded after `k5-range-a-20260824-004` stopped at the pre-trigger helper guard; it is an executable-transcription correction with semantic impact **NO CHANGE** and requires no Protocol Amendment.
+
+## 7. Range B R-OBS-05 auxiliary liveness capture
+
+**Range B only.** [`k6-r-obs-05-collector-query-contract.md`](./k6-r-obs-05-collector-query-contract.md) §5 correlates a Collector document against *the separate R-OBS-05 `tap_observer:eth0` liveness pcap* — a different artifact from the primary Sensor pcap, which cannot contain the unrelated flow at all: the target-event filter requires the target sender host in every retained frame. AMEND-006 gives that auxiliary pcap its own capture stage. Range A does not run this stage, and `study01_collect.py` does not require its artifacts.
+
+| | Value |
+| --- | --- |
+| Stage name | `robs05-liveness` |
+| Observation point | `tap_observer`, device `eth0` — the same frozen mirror point the Sensor stage uses |
+| Filter | `ROBS05_LIVENESS_FILTER` = `host 10.1.10.10 and host 10.1.40.10 and tcp port 20000` — the contract §3 selector, expressed as BPF |
+| pcap artifact | `contract-output/c2-robs05-liveness.pcap` |
+| Lifecycle record | `contract-output/robs05-liveness-capture-lifecycle.json` |
+| Context record | `contract-output/robs05-liveness-capture-context.json` |
+
+It runs through the same three commands as the target-event stages, in the same order and over the same frozen window, alongside them — `resolve` before the trigger, `start` before `T0 - 5 s`, `stop-export` after `T0 + 15 s`:
+
+```powershell
+python studies/study-01-negative-result/scripts/study01_capture.py resolve `
+  --run-id <run-id> --run-evidence <run-evidence> --stage robs05-liveness --compose <range-b-compose.yml>
+if ($LASTEXITCODE -ne 0) { throw 'R-OBS-05 liveness capture context was not resolved; do not trigger' }
+python studies/study-01-negative-result/scripts/study01_capture.py start `
+  --run-id <run-id> --run-evidence <run-evidence> --stage robs05-liveness
+if ($LASTEXITCODE -ne 0) { throw 'R-OBS-05 liveness capture helper did not start; do not trigger' }
+```
+
+```powershell
+python studies/study-01-negative-result/scripts/study01_capture.py stop-export `
+  --run-id <run-id> --run-evidence <run-evidence> --stage robs05-liveness
+if ($LASTEXITCODE -ne 0) { throw 'R-OBS-05 liveness capture stop/export failed' }
+```
+
+**Which pcap is used for which purpose.** The target event is observed only in `sensor-input/mirror-capture/c2-mirror-sensor.pcap`; R-OBS-05 liveness correlation uses only `contract-output/c2-robs05-liveness.pcap`. Neither substitutes for the other, and a hit in the liveness pcap never satisfies the target-event Sensor or Collector stages (contract §1). This stage adds evidence; it changes no frozen event, selector, window, fault, scoring rule, or claim.

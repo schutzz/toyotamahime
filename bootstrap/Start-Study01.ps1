@@ -158,6 +158,17 @@
     that gap stays in it as historical evidence. No frozen apparatus,
     scientific semantics, or Authority Anchor content changed.
 
+    v13 change from k8-bootstrap-v12: formal K8-3 attempt
+    k8-repro-20260919-002 showed that Range B's required R-OBS-05
+    unrelated-flow liveness evidence had a query contract but no
+    capture lifecycle stage. AMEND-006 adds the auxiliary
+    `robs05-liveness` capture stage and its focused regression coverage.
+    It is deliberately outside `CAPTURE_STAGES`, so Range A's artifact
+    requirements, capture-container paths, and preflight path probes
+    remain unchanged. The accepted transcription and Authority Anchor
+    are recorded in Kakuriyo; this release carries those committed
+    bytes prospectively for the next formal K8-3 attempt.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -180,7 +191,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v12` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v13` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -205,7 +216,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v12'
+    [string] $Ref = 'k8-bootstrap-v13'
 )
 
 Set-StrictMode -Version Latest

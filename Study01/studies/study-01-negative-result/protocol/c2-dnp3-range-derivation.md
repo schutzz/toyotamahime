@@ -121,6 +121,8 @@ docker exec $router tc filter show dev $gatewayIf parent ffff:
 
 The sole permitted fault is deletion of this ingress qdisc. Do not modify routing, IP forwarding, the mirror-link egress rewrite, another gateway ingress qdisc, a container service, or the base manifest. Preserve pre/post command output and the resolved interface in `contract-output/`. Verify an unrelated observed-segment mirror filter and unrelated mirror traffic remain available, as required by the frozen Range B conditions.
 
+**Range B additionally runs the `robs05-liveness` capture stage** (AMEND-006), alongside the two target-event stages and over the same frozen window: `resolve` before the trigger, `start` before `T0 - 5 s`, `stop-export` after `T0 + 15 s`. It is what produces the auxiliary liveness pcap the R-OBS-05 correlation reads — the primary Sensor pcap is filtered on the target event and cannot contain the unrelated flow. Commands, filter, and artifact paths: [`c2-dnp3-capture-procedure.md`](./c2-dnp3-capture-procedure.md) §7; the correlation itself: [`k6-r-obs-05-collector-query-contract.md`](./k6-r-obs-05-collector-query-contract.md) §4. Range A does not run this stage.
+
 ## 4. Range C derivation and validation boundary
 
 Range C is a non-provisioned static asset. In a disposable worktree copied from the fixed baseline, first copy the base manifest under the negative-manifest filename. Derive a temporary path-adjusted patch from the retained canonical patch, then apply it and generate only static artifacts:

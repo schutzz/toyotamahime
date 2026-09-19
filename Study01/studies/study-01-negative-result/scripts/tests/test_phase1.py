@@ -24,12 +24,12 @@ def lifecycle_record(run_id, stage, interface=None, pcap_sha=None, t0=T0_FIXTURE
   from datetime import datetime, timedelta
   from study01 import capture_lifecycle as lc
   from study01.frozen import apparatus as ap
-  spec=ap.CAPTURE_STAGES[stage]
+  spec=ap.ALL_CAPTURE_STAGES[stage]
   iface=interface if interface is not None else (spec["interface"] or "eth3")
   root=lc.normalize_root(run_root if run_root is not None else os.path.abspath(os.path.join(os.sep,"host",run_id)))
   rec={"schema_version":1,"run_id":run_id,"execution_run_root":root,"stage":stage,"helper_name":f"{run_id}-{stage}-capture",
        "helper_image":ap.CAPTURE_IMAGE,"helper_container_id":"abc123","namespace_service":spec["service"],
-       "namespace_container_id":container,"interface":iface,"filter":ap.CAPTURE_FILTER,
+       "namespace_container_id":container,"interface":iface,"filter":spec["filter"],
        "container_pcap":spec["container_pcap"],"artifact":spec["artifact"],
        "pcap_sha256":pcap_sha or "0"*64,"steps":[]}
   base=datetime.fromisoformat(t0)
@@ -50,7 +50,7 @@ def lifecycle_record(run_id, stage, interface=None, pcap_sha=None, t0=T0_FIXTURE
 def context_record(run_id, stage, interface="eth3", container="def456"):
   from study01 import capture_context as cc
   from study01.frozen import apparatus as ap
-  spec=ap.CAPTURE_STAGES[stage]
+  spec=ap.ALL_CAPTURE_STAGES[stage]
   rec={"schema_version":1,"run_id":run_id,"stage":stage,"namespace_service":spec["service"],
        "namespace_resolution":{"argv":cc.compose_argv(run_id,"c.yml",spec["service"]),
                                "output":container,"exit_code":0},
