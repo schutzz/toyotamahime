@@ -1,7 +1,7 @@
 # Study 01 Amendment Log
 
 **Status:** Operative (K3 Protocol Freeze complete: `study-01-protocol-v1.0` / `9d57d1e63d6cf16dcc37e8f60d560d30da5f4835`)  
-**Current entries:** 6
+**Current entries:** 7
 
 ## Purpose
 
@@ -30,6 +30,17 @@ The first K4 release/commit pin is an amendment/dependency-change event even tho
 The two records have different roles and may link to each other; neither substitutes for the other.
 
 ## Amendment log
+
+### Amendment 007 — Windows portability of test_8g temporary-directory cleanup
+
+| Field | Content |
+| --- | --- |
+| Amendment ID and date | `AMEND-007`, 2026-09-19 (JST) |
+| Prior frozen state | Kakuriyo `9fadc8082ec3f06e9ed011cd2da9b4d9f70542e8`; `scripts/tests/test_phase1.py` blob `3c4002f974a350cc7494212c2b013a4363b156a7`, accepted by the current Authority Anchor Record. `test_8g_finalized_hashes_survive_a_real_git_commit_and_fresh_checkout` uses `tempfile.TemporaryDirectory()` for a real Git commit, fresh clone, integrity verification, and binary pcap byte-preservation assertion. |
+| Change and rationale | On a fresh Windows VM, full `test_phase1.py` and the README apparatus-integrity command reproduced `WinError 32/5` while `TemporaryDirectory` removed the real-Git fixture, after Git init, commit, clone, and `verify-integrity` succeeded. The test alone and `test_8f` plus `test_8g` passed. Add only a bounded, backoff-based retry around `test_8g` cleanup for Windows `WinError 32/5`; retry no other error, fail if deletion remains unsuccessful, and do not ignore or retain a temporary artifact as a passing result. All real-Git operations, integrity verification, binary pcap assertion, and other substantive assertions remain unchanged. This is Windows portability of test cleanup, not a new research condition or an exception to Plan §3's blob authority. |
+| Affected evidence/claims | No historical or prospective evidence, frozen apparatus, Range A/B/C condition, scorer semantics, expected result, claim, or prior release is changed. The v13 package-certification failure remains a retained failure, not converted to PASS. The correction affects only whether a short Windows sharing/access violation during disposal of the test fixture prevents pre-attempt certification. |
+| Rerun decision | **Rerun NOT REQUIRED for historical evidence.** The test's acceptance assertions are unchanged and no experiment artifact or research interpretation is modified. A new exact-commit test and package certification are required for the prospective package before any new release; this is not a rerun of a formal K8-3 attempt. |
+| New authoritative state | The Kakuriyo commit containing this entry and the cleanup-only `scripts/tests/test_phase1.py` transcription, followed by an independent exact-commit ACCEPT review; only after that review may the existing Authority Anchor Record accept the new test blob and amendment entry digest. |
 
 ### Amendment 006 — Range B R-OBS-05 auxiliary liveness capture stage
 

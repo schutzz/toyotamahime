@@ -789,13 +789,15 @@ class RetentionTests(unittest.TestCase):
    self.assertNotEqual(second.returncode,0)
  def test_8g_finalized_hashes_survive_a_real_git_commit_and_fresh_checkout(self):
   """The 013 blocker: verify-integrity must hold against repository bytes."""
-  import hashlib, shutil
+  import hashlib, os, shutil, time
   from study01.frozen import apparatus as ap
   from study01.evidence_io import write_text
   from study01.evidence_tree import create as tree
   git=shutil.which("git")
   if not git: self.skipTest("git unavailable")
-  with tempfile.TemporaryDirectory() as d:
+  temp_dir=tempfile.TemporaryDirectory()
+  d=temp_dir.name
+  try:
    origin=Path(d)/"origin"; origin.mkdir()
    def run(*a, cwd): subprocess.run([git,*a],cwd=cwd,check=True,capture_output=True)
    run("init","-q","-b","main",cwd=origin)
@@ -820,4 +822,16 @@ class RetentionTests(unittest.TestCase):
    self.assertEqual(out.returncode,0, f"verify-integrity failed on a fresh checkout: {out.stderr}")
    self.assertEqual((fresh/"run"/ap.CAPTURE_STAGES["sensor"]["artifact"]).read_bytes(), b"\xd4\xc3\xb2\xa1\r\n\r\npcap",
                     "binary pcap bytes must survive the round trip unchanged")
+  finally:
+   # Windows can briefly retain a handle after the real Git clone exits.
+   # Retry only its sharing/access violations; never ignore failed cleanup.
+   for attempt in range(7):
+    try:
+     temp_dir.cleanup()
+     break
+    except OSError as exc:
+     if os.name != "nt" or getattr(exc, "winerror", None) not in (5, 32) or attempt == 6:
+      raise
+     time.sleep(min(0.05 * (2 ** attempt), 0.8))
+   self.assertFalse(Path(d).exists(), "test_8g temporary Git fixture was not removed")
 if __name__ == "__main__": unittest.main()

@@ -220,11 +220,11 @@
       "toyotamahime": "Study01/studies/study-01-negative-result/protocol/.gitkeep"
     },
     {
-      "blob": "6644f1dd991529bf8f8ea352d6277de263dc03d3",
-      "bytes": 21551,
+      "blob": "bfc67298dbe492e63c5a89b399c676053b04e98d",
+      "bytes": 24006,
       "crlf": false,
       "kakuriyo": "studies/study-01-negative-result/protocol/amendments.md",
-      "sha256": "52f01f8054703a79f764e5631b721b51ca0bad9761e799b8dd4f03832c90904a",
+      "sha256": "6b6b2f959603794aa5ad86bbf06cc55ba54cd4af75c922dbb872ae547afe4be9",
       "toyotamahime": "Study01/studies/study-01-negative-result/protocol/amendments.md"
     },
     {
@@ -580,11 +580,11 @@
       "toyotamahime": "Study01/studies/study-01-negative-result/scripts/tests/test_evidence_tree_exposure.py"
     },
     {
-      "blob": "3c4002f974a350cc7494212c2b013a4363b156a7",
-      "bytes": 55653,
+      "blob": "504d10b324a58a1193313bd51cfdde5eb4e1acfc",
+      "bytes": 56183,
       "crlf": false,
       "kakuriyo": "studies/study-01-negative-result/scripts/tests/test_phase1.py",
-      "sha256": "1dd5306194af1f230202b275cccb16e573baacc6de22b3fb913e47fe43fec0ed",
+      "sha256": "2c180c24df85f9548f64e95af0c4d4e09c0158f048bac612fa6a6371694705dc",
       "toyotamahime": "Study01/studies/study-01-negative-result/scripts/tests/test_phase1.py"
     },
     {
@@ -604,6 +604,6 @@
       "toyotamahime": "Study01/studies/study-01-negative-result/scripts/tests/test_preflight_amend005_provisioning.py"
     }
   ],
-  "kakuriyo_commit": "6c9f3c1edc3b6c43cbbb04fb5e8068853f5144c5",
+  "kakuriyo_commit": "c88c6f2f9c7bc5a6c098c4522a8e265a94357b01",
   "study_root": "studies/study-01-negative-result"
 }
