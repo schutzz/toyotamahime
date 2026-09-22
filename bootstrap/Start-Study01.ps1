@@ -169,6 +169,14 @@
     are recorded in Kakuriyo; this release carries those committed
     bytes prospectively for the next formal K8-3 attempt.
 
+    v14 change from k8-bootstrap-v13: AMEND-007 makes only test_8g's
+    temporary real-Git fixture cleanup portable on Windows. A short-lived
+    WinError 5/32 sharing/access violation is retried with finite backoff;
+    any unrelated error or exhausted cleanup still fails the test. The real
+    Git commit, fresh clone, verify-integrity, and binary pcap byte assertion
+    are unchanged. No apparatus, scoring, expected result, claim, or Range
+    A/B/C semantic changes.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -191,7 +199,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v13` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v14` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -216,7 +224,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v13'
+    [string] $Ref = 'k8-bootstrap-v14'
 )
 
 Set-StrictMode -Version Latest
