@@ -699,7 +699,25 @@ function New-K8PackagingFixtureRepo {
         throw "robocopy failed building the certification fixture (exit $LASTEXITCODE)"
     }
 
+    # /XD excludes directories only. In a linked worktree, .git is a file,
+    # so remove either representation before initializing the fixture repo.
+    $FixtureGit = Join-Path $FixtureRoot '.git'
+    if (Test-Path -LiteralPath $FixtureGit) {
+        Remove-Item -LiteralPath $FixtureGit -Recurse -Force
+    }
+
     & git -C $FixtureRoot init -q 2>&1 | Out-Null
+
+    $FixtureTopLevel = (& git -C $FixtureRoot rev-parse --show-toplevel).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Failed to resolve the certification fixture repository top-level.'
+    }
+    $ExpectedTopLevel = [System.IO.Path]::GetFullPath($FixtureRoot).TrimEnd('\', '/')
+    $ActualTopLevel = [System.IO.Path]::GetFullPath($FixtureTopLevel).TrimEnd('\', '/')
+    if (-not $ExpectedTopLevel.Equals($ActualTopLevel, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Certification fixture repository escaped its root: expected '$ExpectedTopLevel', got '$ActualTopLevel'"
+    }
+
     & git -C $FixtureRoot config user.email 'k8-cert@example.invalid' 2>&1 | Out-Null
     & git -C $FixtureRoot config user.name 'K8 Certification' 2>&1 | Out-Null
     & git -C $FixtureRoot add -A 2>&1 | Out-Null
@@ -847,7 +865,7 @@ if (-not $SkipIntegration) {
         # default (un-overridden) bootstrap invocation must still check
         # out the TAGGED commit -- not whatever the branch tip has since
         # become.
-        $TaggedHead = (& git -C $FixtureRepo rev-parse $BootstrapDefaultRef).Trim()
+        $TaggedHead = (& git -C $FixtureRepo rev-parse "$BootstrapDefaultRef^{commit}").Trim()
 
         $DriftMarker = Join-Path $FixtureRepo 'k8-cert-drift-marker.txt'
         Set-Content -Path $DriftMarker -Value 'commit landed after certification/tagging' -Encoding utf8
