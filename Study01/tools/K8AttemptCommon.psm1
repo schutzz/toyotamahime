@@ -26,6 +26,13 @@ not need to provide.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# G7 v5 evidence-generation/validation primitives (accepted authority --
+# see K8G7Evidence.psm1's own header for the full boundary/provenance
+# note). Imported here because attempt lifecycle now generates and
+# validates that evidence at the points marked below; K8G7Evidence.psm1
+# itself has no dependency back on this module.
+Import-Module (Join-Path $PSScriptRoot 'K8G7Evidence.psm1') -Force
+
 function Write-K8Json {
     <#
         Writes an object as UTF-8 (no BOM) JSON. Used for every *.json
@@ -47,14 +54,29 @@ function Write-K8Json {
 
 function New-K8AttemptId {
     <#
-        Generates k8-repro-YYYYMMDD-NNN. Scans $AttemptRoot for existing
-        attempt directories and archives dated today and returns the next
-        free sequence number. Never reuses or overwrites an existing ID:
-        if the computed ID somehow already exists on disk, this throws
-        rather than proceeding.
+        Generates k8-repro-YYYYMMDD-NNN. Scans $AttemptRoot -- and, if
+        given, every -CanonicalInventoryRoot -- for existing attempt
+        directories/archives dated today, and returns the next free
+        sequence number. Never reuses or overwrites an existing ID: if
+        the computed ID collides anywhere in that combined inventory,
+        this throws rather than proceeding.
+
+        -CanonicalInventoryRoots exists because $AttemptRoot alone is
+        this VM's own local disk, which is exactly what a VM snapshot
+        rollback resets -- the failure class that produced
+        k8-repro-20260828-001-v4's same-ID violation (plan section 9(3),
+        HISTORICAL-SAME-ID-VIOLATION.md). A rollback cannot un-happen; the
+        defense is checking against an inventory that a rollback does not
+        reset -- e.g. a mounted/synced copy of Kakuriyo's
+        evidence/reproduction/ tree, or any other retained-archive
+        location outside the rolled-back volume. See
+        K8G7Evidence.psm1's Test-K8AttemptIdAvailable for the actual
+        collision check both the sequence-number scan and the final
+        safety check below share.
     #>
     param(
-        [Parameter(Mandatory)] [string] $AttemptRoot
+        [Parameter(Mandatory)] [string] $AttemptRoot,
+        [string[]] $CanonicalInventoryRoots = @()
     )
 
     $Date =
@@ -63,24 +85,18 @@ function New-K8AttemptId {
     $Prefix =
         "k8-repro-$Date-"
 
-    $Existing =
-        @()
+    $InventoryRoots =
+        @($AttemptRoot) + @($CanonicalInventoryRoots)
 
-    if (Test-Path $AttemptRoot) {
-        $Existing =
-            @(
-                Get-ChildItem -Path $AttemptRoot -Force -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -like "$Prefix*" } |
-                    ForEach-Object {
-                        # Strip a trailing .zip / .zip.sha256 so both the
-                        # attempt directory and its archive count toward
-                        # the same sequence.
-                        ($_.BaseName -replace '\.zip$', '')
-                    } |
+    $Existing =
+        @(
+            foreach ($Root in $InventoryRoots) {
+                Get-K8CanonicalAttemptIds -Root $Root |
+                    Where-Object { $_ -like "$Prefix*" } |
                     Where-Object { $_ -match "^$([regex]::Escape($Prefix))(\d{3})$" } |
                     ForEach-Object { [int]$Matches[1] }
-            )
-    }
+            }
+        )
 
     $Next =
         1
@@ -92,19 +108,10 @@ function New-K8AttemptId {
     $Id =
         '{0}{1:D3}' -f $Prefix, $Next
 
-    $CandidateDir =
-        Join-Path $AttemptRoot $Id
-
-    $CandidateZip =
-        Join-Path $AttemptRoot "$Id.zip"
-
-    if ((Test-Path $CandidateDir) -or (Test-Path $CandidateZip)) {
-        throw (
-            "Computed attempt ID '$Id' already exists under " +
-            "'$AttemptRoot'. Refusing to reuse or overwrite an existing " +
-            'attempt. Investigate before retrying.'
-        )
-    }
+    # Final safety check against the same combined inventory -- fail-closed
+    # on collision, never a silent suffix repair (plan section 9).
+    Test-K8AttemptIdAvailable -AttemptId $Id -AttemptRoot $AttemptRoot `
+        -CanonicalInventoryRoots $CanonicalInventoryRoots
 
     return $Id
 }
@@ -138,6 +145,9 @@ function Get-K8AttemptPaths {
         # best-effort human-readable aggregate (see Invoke-K8Step's own
         # doc comment for the evidence-authority split).
         StepsRawDir         = Join-Path $Dir 'steps-raw'
+        # G7 v5 SECTION A.1a.2 pre-execution expectation manifest --
+        # optional, opt-in via -StepPlanPath (Initialize-K8ExpectationManifest).
+        ExpectationsJsonl   = Join-Path $Dir 'expectations.jsonl'
         KnowledgeLeakMd     = Join-Path $Dir 'knowledge-leak-log.md'
         KnowledgeLeakJsonl  = Join-Path $Dir 'knowledge-leak-log.jsonl'
         StopReasonTxt       = Join-Path $Dir 'stop-reason.txt'
@@ -365,6 +375,77 @@ function Initialize-K8AttemptDirectory {
     Write-K8Json -Object $Attempt -Path $Paths.AttemptJson
 
     return $Paths
+}
+
+function Initialize-K8ExpectationManifest {
+    <#
+        SECTION A.1a.2: builds expectations.jsonl from a pre-authored step
+        plan and pins its SHA-256 into attempt.json.expectation_manifest_sha256
+        -- before any step executes.
+
+        The accepted authority's own words are "written once, at
+        attempt-open time, alongside start_time_utc". In this harness,
+        attempt.json is actually written twice for a formal attempt: once
+        pre-clone, by bootstrap/Start-Study01.ps1's minimal duplicate (the
+        Study01/tools/ module this function lives in does not exist on
+        disk yet at that point -- see that script's own header), and this
+        call folds the expectation-manifest field in as an *additive*
+        second write, immediately after the clone and before the operator
+        runs the README's first documented command. That is still
+        strictly before any step executes, which is the property this
+        binding exists to prove; it is not the same single write the
+        accepted text pictures, and that gap between "attempt.json first
+        exists" and "this field is pinned" is deliberately disclosed here
+        rather than silently treated as identical.
+
+        -StepPlanPath is a JSON file: an array of objects with
+        `description`, `command`, `output_class`, `stdout_expectation`,
+        `stderr_expectation` -- one per step this attempt plans to run, in
+        order. An illegal output_class/channel combination for any step
+        throws (SECTION A.1a.1b, schema-reject before execution) and
+        leaves attempt.json untouched.
+    #>
+    param(
+        [Parameter(Mandatory)] $Paths,
+        [Parameter(Mandatory)] [string] $StepPlanPath
+    )
+
+    Assert-K8AttemptOpen -Paths $Paths -Operation 'bind an expectation manifest'
+
+    if (-not (Test-Path $Paths.AttemptJson)) {
+        throw "attempt.json does not exist yet at $($Paths.AttemptJson) -- call this after Initialize-K8AttemptDirectory (or the bootstrap-phase equivalent)."
+    }
+
+    if (Test-Path $Paths.ExpectationsJsonl) {
+        throw "expectations.jsonl already exists at $($Paths.ExpectationsJsonl) -- refusing to overwrite a pre-execution-bound manifest."
+    }
+
+    $StepPlan =
+        Get-Content -Path $StepPlanPath -Raw | ConvertFrom-Json
+
+    $Expectations =
+        for ($i = 0; $i -lt $StepPlan.Count; $i++) {
+            $Step = $StepPlan[$i]
+            New-K8StepExpectation -AttemptId $Paths.AttemptId -StepIndex $i `
+                -Command $Step.command -OutputClass $Step.output_class `
+                -StdoutExpectation $Step.stdout_expectation `
+                -StderrExpectation $Step.stderr_expectation
+        }
+
+    $ManifestSha256 =
+        Write-K8ExpectationsManifest -Path $Paths.ExpectationsJsonl -Expectations @($Expectations)
+
+    $Attempt =
+        Get-Content -Path $Paths.AttemptJson -Raw | ConvertFrom-Json -AsHashtable
+
+    $Attempt['expectation_manifest_sha256'] = $ManifestSha256
+
+    Write-K8Json -Object $Attempt -Path $Paths.AttemptJson
+
+    Write-Host "expectations.jsonl written: $($Expectations.Count) step(s) planned."
+    Write-Host "expectation_manifest_sha256: $ManifestSha256"
+
+    return $ManifestSha256
 }
 
 function Get-K8BootstrapDefaultRef {
@@ -673,6 +754,22 @@ function Invoke-K8Step {
         Get-K8WslField, the one function Shakedown imports from this
         module, is untouched by this function and is not called from
         here.
+
+        G7 v5 additions (accepted authority; additive to everything
+        above -- the combined steps-raw/NNNN.log artifact, steps.jsonl's
+        existing field set, and transcript re-attach are all unchanged):
+        each step's canonical command_identity (SECTION A.1a.1a) is
+        recorded, its stdout/stderr are *additionally* captured to their
+        own per-channel artifacts (steps-raw/NNNN.stdout.log /
+        .stderr.log -- stdout/stderr told apart from the one 2>&1-merged
+        pipeline via PowerShell's own convention of wrapping stderr
+        content in ErrorRecord objects), and, when expectations.jsonl has
+        a pre-execution-bound record for this step_index, the
+        command_identity binding result and each channel's SECTION A.3
+        verdict are recorded on the step. A fail-closed verdict here
+        never aborts the step; it blocks later certification, decided by
+        an independent reviewer from these retained bytes, matching this
+        function's own scope discipline above.
     #>
     param(
         [Parameter(Mandatory)] $Paths,
@@ -702,6 +799,13 @@ function Invoke-K8Step {
         Join-Path $Paths.StepsRawDir ('{0:D4}.log' -f $StepIndex)
     $RawOutputRelativePath =
         "steps-raw/{0:D4}.log" -f $StepIndex
+
+    # G7 v5 SECTION A.2/A.3 per-channel capture -- additive to the combined
+    # raw_output artifact above, which is unchanged.
+    $StdOutRawPath =
+        Join-Path $Paths.StepsRawDir ('{0:D4}.stdout.log' -f $StepIndex)
+    $StdErrRawPath =
+        Join-Path $Paths.StepsRawDir ('{0:D4}.stderr.log' -f $StepIndex)
 
     # Best-effort convenience only from here on -- see the doc comment
     # above. A failure here must never fail the step, and nothing below
@@ -755,6 +859,17 @@ function Invoke-K8Step {
                     $Line = $_.ToString()
                     Write-Host $Line
                     Add-Content -Path $RawOutputPath -Value $Line -Encoding utf8
+
+                    # G7 v5 per-channel split, additive: PowerShell wraps
+                    # stderr content in an ErrorRecord when merged via
+                    # 2>&1 -- confirmed for both native executables and
+                    # PowerShell-native Write-Error content.
+                    if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                        Add-Content -Path $StdErrRawPath -Value $Line -Encoding utf8
+                    }
+                    else {
+                        Add-Content -Path $StdOutRawPath -Value $Line -Encoding utf8
+                    }
                 }
         }
         catch {
@@ -764,6 +879,7 @@ function Invoke-K8Step {
                 "[k8-harness] command block threw: $($_.Exception.Message)"
             Write-Host $ErrorLine -ForegroundColor Red
             Add-Content -Path $RawOutputPath -Value $ErrorLine -Encoding utf8
+            Add-Content -Path $StdErrRawPath -Value $ErrorLine -Encoding utf8
         }
 
         if (-not (Test-Path $RawOutputPath)) {
@@ -772,6 +888,12 @@ function Invoke-K8Step {
             # never ran" stay distinguishable on disk (same discipline
             # EVD-03 already requires of other empty-output evidence).
             New-Item -ItemType File -Path $RawOutputPath -Force | Out-Null
+        }
+        if (-not (Test-Path $StdOutRawPath)) {
+            New-Item -ItemType File -Path $StdOutRawPath -Force | Out-Null
+        }
+        if (-not (Test-Path $StdErrRawPath)) {
+            New-Item -ItemType File -Path $StdErrRawPath -Force | Out-Null
         }
 
         $ExitCode =
@@ -786,21 +908,49 @@ function Invoke-K8Step {
         $Passed =
             ($null -eq $CommandError) -and ($ExpectedExitCode -contains $ExitCode)
 
+        $CommandText =
+            $Command.ToString().Trim()
+
+        # G7 v5 SECTION A.1a.1a canonical command_identity.
+        $CommandIdentity =
+            Get-K8CommandIdentity -Command $CommandText
+
         $Record =
             [ordered]@{
-                step_index   = $StepIndex
-                timestamp    = $Start.ToUniversalTime().ToString('o')
-                description  = $Description
-                command      = $Command.ToString().Trim()
-                exit_code    = $ExitCode
-                expected     = $ExpectedExitCode
-                passed       = $Passed
-                raw_output   = $RawOutputRelativePath
+                step_index        = $StepIndex
+                timestamp         = $Start.ToUniversalTime().ToString('o')
+                description       = $Description
+                command           = $CommandText
+                command_identity  = $CommandIdentity
+                exit_code         = $ExitCode
+                expected          = $ExpectedExitCode
+                passed            = $Passed
+                raw_output        = $RawOutputRelativePath
             }
 
         if ($null -ne $CommandError) {
             $Record['command_error'] =
                 $CommandError.Exception.Message
+        }
+
+        # G7 v5 SECTION A.1a.1 / A.3: if a pre-execution-bound expectation
+        # exists for this step_index, validate against it and record the
+        # verdict as retained data -- never a throw (see this function's
+        # own doc comment above).
+        $Expectation =
+            Get-K8ExpectationForStep -ExpectationsPath $Paths.ExpectationsJsonl -StepIndex $StepIndex
+
+        if ($null -ne $Expectation) {
+            $Record['expectation_command_identity_bound'] =
+                ($Expectation.command_identity -eq $CommandIdentity)
+
+            $StdOutBytes = [System.IO.File]::ReadAllBytes($StdOutRawPath)
+            $StdErrBytes = [System.IO.File]::ReadAllBytes($StdErrRawPath)
+
+            $Record['stdout_verdict'] = Get-K8ChannelVerdict -Expectation $Expectation.stdout_expectation `
+                -CapturePresent $true -CaptureBytes $StdOutBytes -StepChronologyProven $true -HasExpectationRecord $true
+            $Record['stderr_verdict'] = Get-K8ChannelVerdict -Expectation $Expectation.stderr_expectation `
+                -CapturePresent $true -CaptureBytes $StdErrBytes -StepChronologyProven $true -HasExpectationRecord $true
         }
 
         ($Record | ConvertTo-Json -Compress) |
@@ -1091,33 +1241,78 @@ function Complete-K8Attempt {
         Write-Warning "Failed to stop transcript (may not have been running): $($_.Exception.Message)"
     }
 
-    # 4. transcript.txt completeness judgement, then final-status.json.
-    #    See Test-K8TranscriptCoverage's own doc comment: this reads
-    #    transcript.txt's text and steps.jsonl's step count only -- it
-    #    does not depend on Start-/Stop-Transcript's internal behaviour
-    #    for its own correctness, and it is best-effort here the same way
-    #    every other finalize step is: a failure judging completeness
+    # 4. transcript.txt completeness judgement, G7 v5 knowledge-leak
+    #    zero-state (SECTION D.1) and expectation-manifest binding
+    #    verification, then final-status.json. See Test-K8TranscriptCoverage's
+    #    own doc comment for why the transcript judgement does not depend
+    #    on Start-/Stop-Transcript's internal behaviour for its own
+    #    correctness. The G7 additions are the same kind of best-effort,
+    #    fail-closed-as-data (never as a throw) judgement: a failure here
     #    must not stop the attempt from closing and being archived.
     try {
         $TranscriptCoverage =
             Test-K8TranscriptCoverage -Paths $Paths
 
+        $GeneratedAtUtc =
+            (Get-Date).ToUniversalTime().ToString('o')
+
+        $ExpectationBinding = $null
+        if (Test-Path $Paths.AttemptJson) {
+            $AttemptRecord = Get-Content -Path $Paths.AttemptJson -Raw | ConvertFrom-Json
+            $PinnedSha256 =
+                if ($AttemptRecord.PSObject.Properties.Name -contains 'expectation_manifest_sha256') {
+                    $AttemptRecord.expectation_manifest_sha256
+                } else { $null }
+
+            if ($null -ne $PinnedSha256) {
+                $ExpectationBinding =
+                    Test-K8ExpectationManifestBinding -ExpectationsPath $Paths.ExpectationsJsonl `
+                        -PinnedSha256 $PinnedSha256
+            }
+        }
+
+        # ConvertFrom-K8JsonLine, not the ConvertFrom-Json cmdlet: the
+        # cmdlet silently upgrades an ISO-8601-shaped JSON string (this
+        # entry's own timestamp field) to a .NET [DateTime], which is not
+        # the string value SECTION D.1a.1 requires re-serializing.
+        $JsonlEntries = @()
+        if (Test-Path $Paths.KnowledgeLeakJsonl) {
+            $JsonlEntries = @(
+                Get-Content -Path $Paths.KnowledgeLeakJsonl |
+                    Where-Object { $_.Trim() } |
+                    ForEach-Object { ConvertFrom-K8JsonLine -Line $_ }
+            )
+        }
+
+        $MdEntries =
+            Get-K8KnowledgeLeakMdEntries -Path $Paths.KnowledgeLeakMd
+
+        $KnowledgeLeak =
+            New-K8KnowledgeLeakZeroState -Entries $JsonlEntries -GeneratedAtUtc $GeneratedAtUtc -Finalized $true
+
+        $KnowledgeLeakConsistency =
+            Test-K8KnowledgeLeakCrossRepresentation -Canonical $KnowledgeLeak -MdEntries $MdEntries -JsonlEntries $JsonlEntries
+
         $FinalStatus =
             [ordered]@{
-                attempt_id                = $Paths.AttemptId
-                outcome                   = $Outcome
-                reason                    = $Reason
-                failing_command           = $FailingCommand
-                failing_exit_code         = $FailingExitCode
-                stop_time_utc             = (Get-Date).ToUniversalTime().ToString('o')
-                final_head                = $FinalHead
-                final_status_short        = $FinalStatusShort
-                final_status_clean        = if ($null -ne $FinalStatusShort) { $FinalStatusShort.Count -eq 0 } else { $null }
-                transcript_complete       = $TranscriptCoverage.Complete
-                transcript_step_markers   = $TranscriptCoverage.MarkerCount
-                transcript_expected_steps = $TranscriptCoverage.StepCount
-                transcript_completeness_reason = $TranscriptCoverage.Reason
-                gate_k8                   = 'NOT DETERMINED BY THIS TOOL -- Gate K8 is independent review, not self-certified.'
+                attempt_id                     = $Paths.AttemptId
+                outcome                        = $Outcome
+                reason                         = $Reason
+                failing_command                = $FailingCommand
+                failing_exit_code              = $FailingExitCode
+                stop_time_utc                  = $GeneratedAtUtc
+                final_head                     = $FinalHead
+                final_status_short             = $FinalStatusShort
+                final_status_clean             = if ($null -ne $FinalStatusShort) { $FinalStatusShort.Count -eq 0 } else { $null }
+                transcript_complete             = $TranscriptCoverage.Complete
+                transcript_step_markers         = $TranscriptCoverage.MarkerCount
+                transcript_expected_steps       = $TranscriptCoverage.StepCount
+                transcript_completeness_reason  = $TranscriptCoverage.Reason
+                knowledge_leak                  = $KnowledgeLeak
+                knowledge_leak_consistency      = $KnowledgeLeakConsistency
+                expectation_manifest_present    = if ($null -ne $ExpectationBinding) { $ExpectationBinding.Present } else { $false }
+                expectation_manifest_bound      = if ($null -ne $ExpectationBinding) { $ExpectationBinding.Bound } else { $null }
+                gate_k8                         = 'NOT DETERMINED BY THIS TOOL -- Gate K8 is independent review, not self-certified.'
             }
 
         Write-K8Json -Object $FinalStatus -Path $Paths.FinalStatusJson
@@ -1131,7 +1326,7 @@ function Complete-K8Attempt {
         }
     }
     catch {
-        Write-Warning "Failed to judge transcript completeness / write final-status.json: $($_.Exception.Message)"
+        Write-Warning "Failed to judge transcript/G7 evidence completeness or write final-status.json: $($_.Exception.Message)"
     }
 
     # 5. Manifest: sha256 of every file now in the attempt directory,
@@ -1215,6 +1410,7 @@ Export-ModuleMember -Function @(
     'Assert-K8AttemptOpen',
     'Get-K8BootstrapDefaultRef',
     'Initialize-K8AttemptDirectory',
+    'Initialize-K8ExpectationManifest',
     'Invoke-K8CloneToyotamahime',
     'Get-K8ToolVersion',
     'Invoke-Utf16LEProcessCapture',
