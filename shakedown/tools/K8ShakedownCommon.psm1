@@ -918,8 +918,9 @@ function Test-K8FrozenPathIdentity {
                 if ($reviewed -isnot [System.Collections.IDictionary] -or [string]$reviewed['head'] -notmatch '^[0-9a-f]{40}$' -or [string]$reviewed['study01_tree'] -notmatch '^[0-9a-f]{40}$') {
                     throw 'C-9 frozen identity: Class C reviewed_subject is malformed.'
                 }
-                & git -C $repo merge-base --is-ancestor ([string]$reviewed['head']) $commit 2>$null | Out-Null
-                if ($LASTEXITCODE -ne 0 -or [string]$reviewed['study01_tree'] -ne $studyTree) {
+                try { Invoke-IdentityGit @('merge-base', '--is-ancestor', [string]$reviewed['head'], $commit) | Out-Null }
+                catch { throw 'C-9 frozen identity: final candidate does not descend from the exact reviewed Class C subject.' }
+                if ([string]$reviewed['study01_tree'] -ne $studyTree) {
                     throw 'C-9 frozen identity: final candidate does not inherit the exact reviewed Class C subject/tree.'
                 }
             }
@@ -961,9 +962,12 @@ function Test-K8FrozenPathIdentity {
 
         function Get-IdentityBlobOrNull {
             param([string]$Object, [string]$Path)
-            & git -C $repo cat-file -e "$Object`:$Path" 2>$null
-            if ($LASTEXITCODE -ne 0) { return $null }
-            return Invoke-IdentityGit @('rev-parse', "$Object`:$Path")
+            $row = Invoke-IdentityGit @('ls-tree', $Object, '--', $Path)
+            if ([string]::IsNullOrWhiteSpace($row)) { return $null }
+            if ($row -notmatch '^[0-9]{6} blob ([0-9a-f]{40})\t') {
+                throw "C-9 frozen identity: '$Object`:$Path' did not resolve to one blob."
+            }
+            return $Matches[1]
         }
         foreach ($path in $listedSet) {
             $row = $listed[$path]
