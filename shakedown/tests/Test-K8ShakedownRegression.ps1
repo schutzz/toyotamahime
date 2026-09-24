@@ -7507,16 +7507,12 @@ Assert-K8Test 'C-9 dual-anchor: historical v4 identity remains fixed and require
     finally { Reset-K8TestImmutableBase }
 }
 
-Assert-K8Test 'C-9 dual-anchor: the real repository''s current checked-out commit still resolves as the historical fixed base' {
+Assert-K8Test 'C-9 dual-anchor: the real repository exact commit resolves through fixed-v4 closed candidate authority' {
     # Every other check in this block exercises Test-K8FrozenPathIdentity only
     # through a synthetic New-K8DualAnchorFixture repository. None of them
     # verify that the ACTUAL Toyotamahime tree under test -- this clone, this
-    # exact commit -- still satisfies the historical immutable-base relation
-    # the dual-anchor design assumes as its non-candidate default. This is the
-    # gap an independent review of the dual-anchor patch named directly: a
-    # regression suite that no longer directly proves the current real
-    # repository's frozen Study01/bootstrap/certification paths are still the
-    # v4 base. It uses the module's real production pin (no
+    # exact commit -- satisfies the fixed-v4 closed-world candidate relation.
+    # It uses the module's real production pin (no
     # Set-K8TestImmutableBase substitution) and the real $RepoRoot.
     #
     # The resolved 40-hex commit is passed, never 'HEAD' or a branch name, so
@@ -7528,11 +7524,11 @@ Assert-K8Test 'C-9 dual-anchor: the real repository''s current checked-out commi
     }
 
     $result = Test-K8FrozenPathIdentity -Repository $RepoRoot -Revision $exactCommit
-    if ($result.mode -ne 'historical-fixed-base') {
-        throw "the real repository's frozen paths at $exactCommit did not resolve as the historical fixed base (got mode '$($result.mode)'); this tooling-only branch is expected to carry no candidate delta"
+    if ($result.mode -ne 'amended-candidate-delegated') {
+        throw "the real repository's frozen paths at $exactCommit did not resolve as an authorized amended candidate (got mode '$($result.mode)')"
     }
-    if ($result.candidate_verification -ne 'not-required') {
-        throw 'the real repository historical-fixed-base result unexpectedly requires candidate verification'
+    if ($result.candidate_verification -ne 'required') {
+        throw 'the real repository amended candidate did not require candidate verification'
     }
 }
 

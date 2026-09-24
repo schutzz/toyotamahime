@@ -812,7 +812,7 @@ function Test-K8FrozenPathIdentity {
     catch {
         throw "C-9 frozen identity: frozen paths differ from historical v4, but candidate authority is missing or malformed at $commit`:$attestationPath -- $($_.Exception.Message)"
     }
-    if ($attestation['schema'] -ne 'study01-amended-candidate-attestation/1') {
+    if ($attestation['schema'] -notin @('study01-amended-candidate-attestation/1', 'study01-amended-candidate-attestation/2')) {
         throw "C-9 frozen identity: candidate attestation schema is '$($attestation['schema'])'."
     }
     if ($attestation['base_release_commit'] -ne $base.Commit) {
@@ -826,6 +826,169 @@ function Test-K8FrozenPathIdentity {
     $studyTree = Invoke-IdentityGit @('rev-parse', "$commit`:Study01")
     if ($attestation['subject_study01_tree'] -ne $studyTree) {
         throw "C-9 frozen identity: attestation subject_study01_tree does not bind $commit`:Study01."
+    }
+
+    if ($attestation['schema'] -eq 'study01-amended-candidate-attestation/2') {
+        $baseStudyTree = Invoke-IdentityGit @('rev-parse', "$($base.Commit)`:Study01")
+        if ($attestation['base_study01_tree'] -ne $baseStudyTree) {
+            throw "C-9 frozen identity: candidate attestation base_study01_tree is not the fixed historical tree $baseStudyTree."
+        }
+
+        $classCPaths = @(
+            'Study01/README.md',
+            'Study01/studies/study-01-negative-result/protocol/evidence-schema.md',
+            'Study01/studies/study-01-negative-result/scripts/study01/capture_context.py',
+            'Study01/studies/study-01-negative-result/scripts/study01/capture_lifecycle.py',
+            'Study01/studies/study-01-negative-result/scripts/study01/preflight.py',
+            'Study01/studies/study-01-negative-result/scripts/study01_capture.py',
+            'Study01/studies/study-01-negative-result/scripts/study01_evidence_tree.py',
+            'Study01/studies/study-01-negative-result/scripts/tests/requirements.txt',
+            'Study01/studies/study-01-negative-result/scripts/tests/test_evidence_tree_exposure.py',
+            'Study01/studies/study-01-negative-result/scripts/tests/test_preflight_amend005_provisioning.py',
+            'Study01/tools/K8AttemptCommon.psm1',
+            'Study01/tools/K8G7Evidence.psm1',
+            'Study01/tools/Test-Study01Packaging.ps1',
+            'Study01/tools/tests/Test-K8AttemptLifecycle.ps1',
+            'Study01/tools/tests/Test-K8G7Evidence.ps1',
+            'bootstrap/Start-Study01.ps1'
+        )
+        $classCSet = @{}
+        foreach ($path in $classCPaths) { $classCSet[$path] = $true }
+
+        $authority = $attestation['transcription_authority']
+        if ($authority -isnot [System.Collections.IDictionary]) {
+            throw 'C-9 frozen identity: candidate transcription_authority is missing or malformed.'
+        }
+        $acceptedBlobs = @{}
+        foreach ($row in @($authority['accepted_blobs'])) {
+            if ($row -isnot [System.Collections.IDictionary] -or [string]::IsNullOrWhiteSpace([string]$row['path']) -or [string]$row['blob'] -notmatch '^[0-9a-f]{40}$') {
+                throw 'C-9 frozen identity: transcription_authority accepted_blobs is malformed.'
+            }
+            $acceptedBlobs[[string]$row['path']] = [string]$row['blob']
+        }
+        $acceptedEntries = @{}
+        foreach ($row in @($authority['accepted_amendment_entries'])) {
+            if ($row -isnot [System.Collections.IDictionary] -or [string]$row['amendment_id'] -notmatch '^AMEND-[0-9]{3}$' -or [string]$row['entry_digest'] -notmatch '^[0-9a-f]{64}$') {
+                throw 'C-9 frozen identity: transcription_authority accepted_amendment_entries is malformed.'
+            }
+            $acceptedEntries[[string]$row['amendment_id']] = [string]$row['entry_digest']
+        }
+
+        $bindings = @{}
+        $allowedByBinding = @{}
+        foreach ($binding in @($attestation['authority_bindings'])) {
+            if ($binding -isnot [System.Collections.IDictionary]) { throw 'C-9 frozen identity: authority binding is malformed.' }
+            $id = [string]$binding['binding_id']
+            $class = [string]$binding['change_class']
+            if ([string]::IsNullOrWhiteSpace($id) -or $bindings.ContainsKey($id) -or $class -notin @('amendment_transcription','publication_binding','authorized_remediation')) {
+                throw "C-9 frozen identity: authority binding '$id' has an invalid or duplicate identity/class."
+            }
+            $allowed = @{}
+            foreach ($allowedRow in @($binding['allowed_final_blobs'])) {
+                $allowedPath = [string]$allowedRow['path']
+                $allowedBlob = [string]$allowedRow['blob']
+                if ([string]::IsNullOrWhiteSpace($allowedPath) -or $allowedBlob -notmatch '^[0-9a-f]{40}$' -or $allowed.ContainsKey($allowedPath)) {
+                    throw "C-9 frozen identity: binding '$id' allowed_final_blobs is malformed or duplicated."
+                }
+                if ($class -eq 'authorized_remediation' -and -not $classCSet.ContainsKey($allowedPath)) {
+                    throw "C-9 frozen identity: Class C path '$allowedPath' is outside the exact reviewed allowlist."
+                }
+                if ($class -eq 'amendment_transcription') {
+                    if ($allowedPath -notmatch '^Study01/studies/' -or @($allowedRow['amendment_ids']).Count -eq 0) {
+                        throw "C-9 frozen identity: Class A path '$allowedPath' lacks amendment authority."
+                    }
+                    foreach ($amendment in @($allowedRow['amendment_ids'])) {
+                        if (-not $acceptedEntries.ContainsKey([string]$amendment)) {
+                            throw "C-9 frozen identity: Class A path '$allowedPath' cites unaccepted amendment '$amendment'."
+                        }
+                    }
+                }
+                $allowed[$allowedPath] = $allowedBlob
+            }
+            if ($class -eq 'authorized_remediation') {
+                foreach ($field in 'authority_record_commit','authority_record_blob') {
+                    if ([string]$binding[$field] -notmatch '^[0-9a-f]{40}$') { throw "C-9 frozen identity: Class C $field is malformed." }
+                }
+                if ([string]$binding['authority_record_sha256'] -notmatch '^[0-9a-f]{64}$' -or
+                    [string]$binding['authority_repository'] -ne 'https://github.com/schutzz/kakuriyo-cyber-range-research.git' -or
+                    [string]$binding['verdict'] -ne 'ACCEPT') {
+                    throw 'C-9 frozen identity: Class C authority snapshot is not exact and accepted.'
+                }
+                $reviewed = $binding['reviewed_subject']
+                if ($reviewed -isnot [System.Collections.IDictionary] -or [string]$reviewed['head'] -notmatch '^[0-9a-f]{40}$' -or [string]$reviewed['study01_tree'] -notmatch '^[0-9a-f]{40}$') {
+                    throw 'C-9 frozen identity: Class C reviewed_subject is malformed.'
+                }
+                & git -C $repo merge-base --is-ancestor ([string]$reviewed['head']) $commit 2>$null | Out-Null
+                if ($LASTEXITCODE -ne 0 -or [string]$reviewed['study01_tree'] -ne $studyTree) {
+                    throw 'C-9 frozen identity: final candidate does not inherit the exact reviewed Class C subject/tree.'
+                }
+            }
+            $bindings[$id] = $binding
+            $allowedByBinding[$id] = $allowed
+        }
+
+        $listed = @{}
+        $usedAuthority = @{}
+        foreach ($row in @($attestation['observed_delta'])) {
+            if ($row -isnot [System.Collections.IDictionary]) { throw 'C-9 frozen identity: observed_delta row is malformed.' }
+            $path = [string]$row['path']
+            $bindingId = [string]$row['final_authority_binding_id']
+            if ([string]::IsNullOrWhiteSpace($path) -or $listed.ContainsKey($path) -or -not $bindings.ContainsKey($bindingId)) {
+                throw "C-9 frozen identity: observed_delta path '$path' is empty, duplicated, or lacks one final authority."
+            }
+            if (-not $allowedByBinding[$bindingId].ContainsKey($path) -or $allowedByBinding[$bindingId][$path] -ne [string]$row['new_blob']) {
+                throw "C-9 frozen identity: final authority '$bindingId' does not allow '$path' at its final blob."
+            }
+            $class = [string]$bindings[$bindingId]['change_class']
+            if ($path -match '^Study01/(claims|expected)(/|$)') {
+                throw 'C-9 frozen identity: candidate changes historical Study01 claims or expected state.'
+            }
+            if ($path -match '^Study01/studies/' -and $class -ne 'amendment_transcription' -and -not $classCSet.ContainsKey($path)) {
+                throw "C-9 frozen identity: scientific/study path '$path' is not bound to Class A amendment authority."
+            }
+            if ($class -eq 'authorized_remediation' -and -not $classCSet.ContainsKey($path)) {
+                throw "C-9 frozen identity: Class C cannot authorize unknown path '$path'."
+            }
+            $listed[$path] = $row
+            $usedAuthority["$bindingId`n$path"] = $true
+        }
+
+        $observedSet = @($observed | Sort-Object -Unique)
+        $listedSet = @($listed.Keys | Sort-Object -Unique)
+        if (($observedSet -join "`n") -ne ($listedSet -join "`n")) {
+            throw "C-9 frozen identity: observed candidate delta is not the attestation's closed delta.`nobserved: $($observedSet -join ', ')`nlisted: $($listedSet -join ', ')"
+        }
+
+        function Get-IdentityBlobOrNull {
+            param([string]$Object, [string]$Path)
+            & git -C $repo cat-file -e "$Object`:$Path" 2>$null
+            if ($LASTEXITCODE -ne 0) { return $null }
+            return Invoke-IdentityGit @('rev-parse', "$Object`:$Path")
+        }
+        foreach ($path in $listedSet) {
+            $row = $listed[$path]
+            $baseBlob = Get-IdentityBlobOrNull -Object $base.Commit -Path $path
+            $newBlob = Get-IdentityBlobOrNull -Object $commit -Path $path
+            if ($row['base_blob'] -ne $baseBlob -or $row['new_blob'] -ne $newBlob) {
+                throw "C-9 frozen identity: attested base/new blob binding does not match '$path'."
+            }
+        }
+        foreach ($bindingId in $allowedByBinding.Keys) {
+            foreach ($path in $allowedByBinding[$bindingId].Keys) {
+                if (-not $usedAuthority.ContainsKey("$bindingId`n$path")) {
+                    throw "C-9 frozen identity: binding '$bindingId' contains unused final authorization for '$path'."
+                }
+            }
+        }
+
+        return [ordered]@{
+            mode = 'amended-candidate-delegated'
+            historical_base_commit = $base.Commit
+            subject_commit = $commit
+            subject_study01_tree = $studyTree
+            observed_delta = $observedSet
+            candidate_verification = 'required'
+        }
     }
 
     $authority = $attestation['transcription_authority']
