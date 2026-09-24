@@ -56,6 +56,24 @@
     same commit, mechanically, rather than relying on a maintainer to
     remember.
 
+    Post-v4 change (accepted G7 evidence-semantics authority, Kakuriyo
+    studies/study-01-negative-result/G7-GATE-K8-EVIDENCE-SEMANTICS-CLARIFICATION-PROPOSAL.md
+    v5): New-BootstrapAttemptId now also checks -CanonicalInventoryRoot,
+    if given, before allocating an ID -- not just $AttemptRoot (this VM's
+    own local disk). $AttemptRoot alone is exactly what a VM snapshot
+    rollback resets, which is what produced k8-repro-20260828-001-v4's
+    same-ID violation (plan section 9(3)): the rollback reset the local
+    allocator's view of "what IDs already exist" along with everything
+    else on the volume. A rollback cannot un-happen; the defense is
+    checking against an inventory the rollback does not reset -- e.g. a
+    mounted/synced copy of Kakuriyo's evidence/reproduction/ tree, or any
+    other retained-archive location outside the rolled-back volume.
+    Passing no -CanonicalInventoryRoot preserves this script's prior
+    behavior exactly (local-only check) -- this is additive, not a
+    behavior change for an operator who does not supply one. The
+    repo-local Study01/tools/K8AttemptCommon.psm1's New-K8AttemptId
+    mirrors this same change; see that file.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -103,7 +121,22 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v4'
+    [string] $Ref = 'k8-bootstrap-v4',
+
+    # Additional attempt-ID inventory root(s) to check before allocating,
+    # besides $AttemptRoot -- see this file's own "Post-v4 change" note
+    # above. Optional; omitting it preserves this script's prior,
+    # local-only collision check exactly.
+    [string[]] $CanonicalInventoryRoot = @(),
+
+    # Optional: a JSON step-plan file (array of {description, command,
+    # output_class, stdout_expectation, stderr_expectation}), passed
+    # through to Initialize-K8ExpectationManifest once the repo-local
+    # harness is available (step 3 below). Omitting it skips SECTION
+    # A.1a.2's pre-execution expectation-manifest binding for this
+    # attempt -- existing, non-G7-governed uses of this script (Study02,
+    # shakedown runs) are unaffected either way.
+    [string] $StepPlanPath = ''
 )
 
 Set-StrictMode -Version Latest
@@ -114,21 +147,52 @@ $ErrorActionPreference = 'Stop'
 # Mirrors Study01/tools/K8AttemptCommon.psm1's New-K8AttemptId.
 # ----------------------------------------------------------------------
 
+function Get-BootstrapAttemptIdInventory {
+    <#
+        The set of attempt_ids already present (as a directory or a
+        <id>.zip/<id>.zip.sha256 archive) under one root. Shared by both
+        the sequence-number scan and the final collision check below, so
+        the two can never disagree about what already exists.
+    #>
+    param([Parameter(Mandatory)] [string] $Root)
+
+    if (-not (Test-Path $Root)) { return @() }
+
+    return @(
+        Get-ChildItem -Path $Root -Force -ErrorAction SilentlyContinue |
+            ForEach-Object { ($_.Name -replace '\.zip$', '') -replace '\.zip\.sha256$', '' } |
+            Where-Object { $_ -match '^k8-repro-\d{8}-\d{3}(-v\d+)?$' } |
+            Sort-Object -Unique
+    )
+}
+
 function New-BootstrapAttemptId {
-    param([Parameter(Mandatory)] [string] $AttemptRoot)
+    <#
+        See this file's "Post-v4 change" note above:
+        -CanonicalInventoryRoots checks additional attempt-ID inventory
+        roots (e.g. a mounted/synced copy of Kakuriyo's
+        evidence/reproduction/) besides $AttemptRoot, so a VM-local
+        snapshot rollback resetting $AttemptRoot cannot, by itself, make
+        this allocator repeat an ID that inventory already retains.
+        Fail-closed on collision anywhere in that combined inventory --
+        never a silent suffix repair.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $AttemptRoot,
+        [string[]] $CanonicalInventoryRoots = @()
+    )
 
     $Prefix = "k8-repro-$(Get-Date -Format 'yyyyMMdd')-"
+    $InventoryRoots = @($AttemptRoot) + @($CanonicalInventoryRoots)
 
-    $Existing = @()
-    if (Test-Path $AttemptRoot) {
-        $Existing = @(
-            Get-ChildItem -Path $AttemptRoot -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -like "$Prefix*" } |
-                ForEach-Object { ($_.BaseName -replace '\.zip$', '') } |
+    $Existing = @(
+        foreach ($Root in $InventoryRoots) {
+            Get-BootstrapAttemptIdInventory -Root $Root |
+                Where-Object { $_ -like "$Prefix*" } |
                 Where-Object { $_ -match "^$([regex]::Escape($Prefix))(\d{3})$" } |
                 ForEach-Object { [int]$Matches[1] }
-        )
-    }
+        }
+    )
 
     $Next = 1
     if ($Existing.Count -gt 0) {
@@ -137,8 +201,16 @@ function New-BootstrapAttemptId {
 
     $Id = '{0}{1:D3}' -f $Prefix, $Next
 
-    if ((Test-Path (Join-Path $AttemptRoot $Id)) -or (Test-Path (Join-Path $AttemptRoot "$Id.zip"))) {
-        throw "Computed attempt ID '$Id' already exists under '$AttemptRoot'. Refusing to reuse or overwrite."
+    foreach ($Root in $InventoryRoots) {
+        if ($Id -in (Get-BootstrapAttemptIdInventory -Root $Root)) {
+            throw (
+                "Computed attempt ID '$Id' already exists under '$Root'. " +
+                'Refusing to reuse or overwrite -- this is the same failure ' +
+                'class a VM snapshot rollback previously produced ' +
+                '(k8-repro-20260828-001-v4). Investigate before retrying; ' +
+                'do not append a suffix to work around this.'
+            )
+        }
     }
 
     return $Id
@@ -207,7 +279,7 @@ function Complete-BootstrapFailure {
 # 1. Attempt ID and directory.
 # ----------------------------------------------------------------------
 
-$AttemptId = New-BootstrapAttemptId -AttemptRoot $AttemptRoot
+$AttemptId = New-BootstrapAttemptId -AttemptRoot $AttemptRoot -CanonicalInventoryRoots $CanonicalInventoryRoot
 $AttemptDir = Join-Path $AttemptRoot $AttemptId
 $ClonedRepoDir = Join-Path $AttemptDir 'toyotamahime'
 
@@ -295,6 +367,23 @@ Import-Module $ModulePath -Force
 
 $Paths = Get-K8AttemptPaths -AttemptRoot $AttemptRoot -AttemptId $AttemptId
 Initialize-K8AttemptEnvironment -Paths $Paths | Out-Null
+
+# ----------------------------------------------------------------------
+# 3a. Pre-execution expectation-manifest binding (SECTION A.1a.2), if a
+#     step plan was supplied. This is the earliest point in the attempt
+#     lifecycle this can run: expectations.jsonl's field schema (SECTION
+#     A.1a.1) requires the repo-local module (Get-K8CommandIdentity etc.),
+#     which does not exist on disk before the clone above completes. It
+#     still runs strictly before the operator's first Invoke-K8Step.ps1
+#     call, which is what this binding exists to prove -- see
+#     Initialize-K8ExpectationManifest's own docstring for the disclosed
+#     gap between "attempt.json first exists" (pre-clone) and "this field
+#     is pinned" (here).
+# ----------------------------------------------------------------------
+
+if ($StepPlanPath) {
+    Initialize-K8ExpectationManifest -Paths $Paths -StepPlanPath $StepPlanPath | Out-Null
+}
 
 # ----------------------------------------------------------------------
 # 4. Hand off to the operator. Transcript keeps running. Canonical cwd
