@@ -56,7 +56,128 @@
     same commit, mechanically, rather than relying on a maintainer to
     remember.
 
-    Post-v4 change (accepted G7 evidence-semantics authority, Kakuriyo
+    v5 change from k8-bootstrap-v4: v5 is the first amended Study 01
+    baseline. Accepted amendments AMEND-001 through AMEND-004 are now
+    reflected in the frozen apparatus -- `scripts/study01/frozen/semantics.py`
+    and `scripts/study01/scorer.py` carry the Range B `R-OBS-05 =
+    Unresolved` scoring propagation (AMEND-004), transcribed from
+    Kakuriyo under an independent exact-commit review and recorded in
+    that amendment's Authority Anchor Record. The kit was re-exported
+    from a dedicated Kakuriyo export-source commit, not the v4 source.
+    The K6 / K7 claims under claims/ were established on the v4
+    (historical) apparatus and are not re-asserted on this baseline --
+    see Study01/PROVENANCE.md. Per the same discipline as the v4 note,
+    the k8-bootstrap-v5 tag is created only after this exact commit
+    passes K8-S2 and a fresh certification run; until then this is a
+    candidate, tracked in docs/k8-candidates/ledger.json.
+
+    v6/v7 changes from k8-bootstrap-v5: packaging-only pin bumps (a
+    dirty-tree/pytest-transcript remediation, then the Range C validator
+    moving to v0.13.1) -- neither touched frozen apparatus or scientific
+    semantics, so neither added its own changelog note here; see the
+    K8-S2 authorization applicability reviews for those two HEADs.
+
+    v8 change from k8-bootstrap-v7: v8 is the second amended Study 01
+    baseline. AMEND-005 is now reflected in the frozen apparatus --
+    `scripts/study01/frozen/apparatus.py`'s `AMENONUBOCO_COMMIT` moves
+    from the historical `78fc177` (v0.12.0) to `80e550f` (v0.13.5),
+    transcribed from Kakuriyo under an independent exact-commit review
+    and recorded in the Authority Anchor Record (now also accepting
+    AMEND-005, alongside the AMEND-001-004 it already accepted for v5).
+    The kit was re-exported from a dedicated Kakuriyo export-source
+    commit, not the v7 source. Scientific semantics are unchanged --
+    the pin is a runtime provisioning dependency identity, not a
+    scoring or observation definition; see Study01/PROVENANCE.md and
+    docs/k8-study01-amended-candidate-attestation.json.
+
+    v9 change from k8-bootstrap-v8: v8 repeated the v3 incident (see the
+    v4 note above) in a new shape. v8 was tagged at the commit that
+    package certification actually passed on (c9a259f), but that commit
+    still said `k8-bootstrap-v7` in its own -Ref default and in
+    Study01/README.md's pin -- the self-referential bump to say "v8"
+    was made in a *following* commit (b8aa1b1), which was never
+    certified or tagged on its own. So `k8-bootstrap-v8`'s target does
+    not self-describe as v8, and Test-K8ReleaseBinding.ps1 -Tag
+    k8-bootstrap-v8 -ExpectedCommit c9a259f... correctly reports the
+    README SHA-256 pin as FAIL (it names b8aa1b1's blob, not c9a259f's).
+    `k8-bootstrap-v8` is left exactly as it was -- an immutable tag is
+    never moved -- and is not usable as a bootstrap default; v9 is a
+    fresh commit (this one, self-referencing v9 throughout, before
+    being certified or tagged), fresh certification run, fresh tag,
+    verified end to end with Test-K8ReleaseBinding.ps1 before being
+    treated as usable.
+
+    v10 change from k8-bootstrap-v9: formal K8-3 attempt k8-repro-20260917-001
+    stopped before Range A provisioning -- preflight.compose_build_contexts()
+    still assumed a generated Range A/B Compose file always declares a local
+    build context, and failed closed the moment AMEND-005's published-image
+    path (--image-override/--no-build on all 13 protocol-image services)
+    left zero build contexts by design. Fixed in
+    studies/study-01-negative-result/scripts/study01/preflight.py: the
+    13 known services are now checked individually against their accepted
+    exact-digest image when none of them is building; the historical
+    build-context path and third-party images are unchanged. No frozen
+    apparatus, scientific semantics, or Authority Anchor content changed.
+
+    v11 change from k8-bootstrap-v10: v10 documentation/path-ambiguity
+    cleanup, no code or apparatus change. Study01/README.md section 4.2
+    corrected -- it said Range A/B build their service images, which
+    contradicted the AMEND-005 published-image path (the 13
+    protocol-image services are --image-override'd, not built).
+    Section 5's `<run-evidence>` / `<static-validation-workspace>` base
+    path was unstated and an operator guessed at it during a prior
+    formal attempt (recorded as a knowledge-leak); now fixed at
+    `$env:K8_ATTEMPT_DIR\evidence\...` when using the recorded-attempt
+    harness. Study01/PROVENANCE.md's stated intended tag and Range C
+    validator pin, both stale, brought current. No third-party image
+    gained a new digest requirement, and the evidence tree schema
+    itself (protocol/evidence-schema.md) is unchanged -- only its base
+    path relative to an attempt directory is now explicit.
+
+    v12 change from k8-bootstrap-v11: formal K8-3 attempt
+    k8-repro-20260918-001 hit two defects of the same class -- the
+    implementation required something the published procedure did not
+    expose. (1) evidence_tree.create() builds eight directories and the
+    execution preflight gate checks all eight, but create() was
+    reachable only from tests and protocol/evidence-schema.md's diagram
+    showed only six, omitting the two nested capture-export
+    destinations; the operator hand-built six and the gate stopped the
+    attempt 12/13. Fixed by publishing scripts/study01_evidence_tree.py
+    (which calls create() and nothing else, so wrapper and gate cannot
+    diverge) and by naming all eight in the schema, the derivation
+    procedure, and README section 5.1. (2) Invoke-K8Step lost a step's
+    steps.jsonl record whenever the command block threw -- which
+    protocol/'s literal commands do, in sixteen places, via their own
+    `if ($LASTEXITCODE -ne 0) { throw ... }` guards -- leaving
+    steps-raw/NNNN.log on disk with no corresponding record and
+    Stop-K8's auto-populated final-status describing the previous,
+    passing step. Fixed in Study01/tools/K8AttemptCommon.psm1: the
+    block's exception is captured, written to the raw artifact,
+    recorded as a failed step with its message, and only then
+    re-raised. The failed attempt's own archive is retained unmodified;
+    that gap stays in it as historical evidence. No frozen apparatus,
+    scientific semantics, or Authority Anchor content changed.
+
+    v13 change from k8-bootstrap-v12: formal K8-3 attempt
+    k8-repro-20260919-002 showed that Range B's required R-OBS-05
+    unrelated-flow liveness evidence had a query contract but no
+    capture lifecycle stage. AMEND-006 adds the auxiliary
+    `robs05-liveness` capture stage and its focused regression coverage.
+    It is deliberately outside `CAPTURE_STAGES`, so Range A's artifact
+    requirements, capture-container paths, and preflight path probes
+    remain unchanged. The accepted transcription and Authority Anchor
+    are recorded in Kakuriyo; this release carries those committed
+    bytes prospectively for the next formal K8-3 attempt.
+
+    v14 change from k8-bootstrap-v13: AMEND-007 makes only test_8g's
+    temporary real-Git fixture cleanup portable on Windows. A short-lived
+    WinError 5/32 sharing/access violation is retried with finite backoff;
+    any unrelated error or exhausted cleanup still fails the test. The real
+    Git commit, fresh clone, verify-integrity, and binary pcap byte assertion
+    are unchanged. No apparatus, scoring, expected result, claim, or Range
+    A/B/C semantic changes.
+
+    Post-v14 change (accepted G7 evidence-semantics authority, Kakuriyo
     studies/study-01-negative-result/G7-GATE-K8-EVIDENCE-SEMANTICS-CLARIFICATION-PROPOSAL.md
     v5): New-BootstrapAttemptId now also checks -CanonicalInventoryRoot,
     if given, before allocating an ID -- not just $AttemptRoot (this VM's
@@ -72,7 +193,11 @@
     behavior exactly (local-only check) -- this is additive, not a
     behavior change for an operator who does not supply one. The
     repo-local Study01/tools/K8AttemptCommon.psm1's New-K8AttemptId
-    mirrors this same change; see that file.
+    mirrors this same change; see that file. This same G7 authority also
+    adds an optional -StepPlanPath (SECTION A.1a.2 pre-execution
+    expectation-manifest binding), bound once the repo-local harness is
+    available post-clone (step 3a below) -- scientific/K8 behavior
+    established through v14 above is otherwise unchanged by this note.
 
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
@@ -96,7 +221,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v4` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v14` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -121,10 +246,10 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v4',
+    [string] $Ref = 'k8-bootstrap-v14',
 
     # Additional attempt-ID inventory root(s) to check before allocating,
-    # besides $AttemptRoot -- see this file's own "Post-v4 change" note
+    # besides $AttemptRoot -- see this file's own "Post-v14 change" note
     # above. Optional; omitting it preserves this script's prior,
     # local-only collision check exactly.
     [string[]] $CanonicalInventoryRoot = @(),
@@ -132,7 +257,7 @@ param(
     # Optional: a JSON step-plan file (array of {description, command,
     # output_class, stdout_expectation, stderr_expectation}), passed
     # through to Initialize-K8ExpectationManifest once the repo-local
-    # harness is available (step 3 below). Omitting it skips SECTION
+    # harness is available (step 3a below). Omitting it skips SECTION
     # A.1a.2's pre-execution expectation-manifest binding for this
     # attempt -- existing, non-G7-governed uses of this script (Study02,
     # shakedown runs) are unaffected either way.
@@ -168,7 +293,7 @@ function Get-BootstrapAttemptIdInventory {
 
 function New-BootstrapAttemptId {
     <#
-        See this file's "Post-v4 change" note above:
+        See this file's "Post-v14 change" note above:
         -CanonicalInventoryRoots checks additional attempt-ID inventory
         roots (e.g. a mounted/synced copy of Kakuriyo's
         evidence/reproduction/) besides $AttemptRoot, so a VM-local

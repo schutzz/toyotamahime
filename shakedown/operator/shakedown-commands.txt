@@ -1,0 +1,200 @@
+K8-3 Shakedown -- operator copy/paste reference
+================================================
+Not a formal K8-3 attempt. Not Gate K8 evidence. See ../README.md.
+
+This file only calls the scripts in ../tools/. It does not restate what they
+do -- read ../README.md and the script comments for that, so this file never
+drifts out of sync with the actual implementation.
+
+Open a qualification sequence first. It locks the exact tooling commit that
+every run in the sequence must execute at:
+
+    .\tools\Start-K8QualificationSequence.ps1
+
+One-time, per VM/session (run from inside the cloned repo's shakedown/ dir):
+
+    .\tools\Start-K8Shakedown.ps1
+
+Then, in order, once Setup has passed:
+
+    .\tools\Run-K8ShakedownRangeA.ps1
+    (save the Collector/Rule query responses it prints instructions for)
+    .\tools\Complete-K8ShakedownRange.ps1 -Range a
+
+    .\tools\Run-K8ShakedownRangeB.ps1
+    (save the Collector/Rule/R-OBS-05 query responses it prints instructions for)
+    .\tools\Complete-K8ShakedownRange.ps1 -Range b
+
+    .\tools\Run-K8ShakedownRangeC.ps1
+    (no live-query dependency -- this one is a single command)
+
+The order is enforced, not just documented: each run refuses to start unless it
+is the range the sequence expects next, no other run is active, the tooling HEAD
+still equals the sequence's locked_head, and the worktree is clean.
+
+Artifact completeness is also enforced per stage, not only at the end: leaving a
+stage checks the artifacts that stage was responsible for producing. A missing
+file stops the run there, naming the stage that owed it.
+
+Scoring input (Range A and Range B)
+-----------------------------------
+Still transcribed BY HAND, still before opening expected/. Nothing below fills
+in a value; the shape is checked, the judgment is not.
+
+Complete-K8ShakedownRange.ps1 prints these two paths when it finishes. The
+template is intentionally incomplete and intentionally not scorable:
+
+    <shakedown root>\run-records\<run_id>\scoring-input.template.json
+    <shakedown root>\run-records\<run_id>\finalize-identity.json
+
+Copy the template, fill every <FILL-IN> from the retained evidence, and in
+"derivation" record which artifact each value came from. Then check the shape:
+
+    python .\tools\k8_scoring_input_contract.py validate `
+        --range a `
+        --input <your-scoring-input.json> `
+        --run-evidence <run evidence dir> `
+        --finalize-snapshot <shakedown root>\run-records\<run_id>\finalize-identity.json
+
+It verifies presence, token domains, that each recorded value matches the
+input, and that each cited artifact is inside the run evidence, covered by the
+finalized manifest, still hashing to what the manifest says, against the
+manifest that actually passed verify-integrity. It does not check whether you
+read the artifact correctly, and it never opens expected/.
+
+To see the contract itself as data:
+
+    python .\tools\k8_scoring_input_contract.py describe --range b
+
+"r_obs_05" accepts Pass, Fail and Unresolved. Unresolved was refused until
+AMEND-004, because no frozen source fixed what it propagated to in scoring and
+the tooling will not invent one. AMEND-004 fixes it: Runtime contract Unresolved
+-> Inconclusive experiment. Any other token is still refused for the same reason
+Unresolved once was. Which token to write is your decision to make and to
+justify -- the tooling never fills it in.
+
+If something fails partway through a Range run
+----------------------------------------------
+A terminated run ends its sequence. There is no retry inside the same sequence
+and no resuming the failed run -- both would break the "one uninterrupted
+A -> B -> C at one exact HEAD" property the sequence exists to establish.
+
+    .\tools\Close-K8QualificationSequence.ps1 -Reason "<what happened>"
+
+    (fix on your dev machine, push)
+
+    git pull
+    pwsh -File .\tests\Test-K8ShakedownRegression.ps1
+    git status --short                  # must be empty
+
+    .\tools\Start-K8QualificationSequence.ps1     <- new sequence, new locked_head
+    .\tools\Run-K8ShakedownRangeA.ps1             <- restart from Range A
+
+Close BEFORE fixing, not after: opening a sequence locks whatever HEAD is
+checked out, and the fix is about to change it.
+
+Closing never modifies, resumes, re-queries or deletes the failed run's
+evidence. It records why the sequence ended, and -- if the run had no
+termination record of its own -- writes one.
+
+A fresh run ID is allocated automatically each time; nothing to type.
+
+Where the records live (under the workspace root, default C:\K8\shakedown)
+-------------------------------------------------------------------------
+    sequences\<sequence_id>.json      what the sequence committed to
+    sequences\current.txt             pointer to the live sequence, if any
+    run-records\<run_id>\             provenance, termination, captured streams
+    runs\<run_id>\                    the scientific evidence tree
+
+run-records\ is control-plane record and is never mixed into the evidence tree.
+The one thing that crosses over is run-provenance.json, mirrored into the
+evidence tree right after it is created.
+
+    run-records\<run_id>\tool-versions.json    host tool versions, retained
+                                               and NEVER used as a gate
+
+New STOP conditions introduced by the external command contract
+---------------------------------------------------------------
+Every external command now names a contract row, and the run stops if:
+
+  * the argv does not match the shape that row declares
+    -- reported BEFORE the command runs, so nothing has happened yet. The
+       record says what was expected and what was about to be run, and
+       deliberately carries no argv/exit_code of its own: the command did
+       not execute, so it has no command semantics to record.
+
+  * a frozen document that governs a Class F step has changed
+    -- this is NOT a claim that the implementation is wrong. It says the
+       basis the contract was written against has moved, and a human must
+       re-derive the contract before that step runs again. Any edit to the
+       document triggers it, including an unrelated typo fix. That is
+       deliberate: the check is file-level, and it errs toward asking.
+
+  * a command exits outside the acceptance domain ITS OWN row declares
+    -- not "non-zero". Range C's validator accepts 0 and 1; the Setup
+       `git rev-parse HEAD` probes accept 0 and 128; readiness probes
+       inside a wait loop accept anything, because their gate is the loop
+       deadline. What stops the run is an exit no one declared acceptable.
+
+  * a required prerequisite tool is missing OR produces no version output
+    -- previously a tool that ran but printed nothing was reported as
+       "not found on PATH", which sent you after the wrong problem. It now
+       says the binary is present but the installation is broken. A tool
+       that runs and prints a version is never gated on WHICH version.
+
+None of these change what any command does. They change where a failure
+becomes visible: at the command that caused it, rather than several steps
+later at something that merely depended on it.
+
+New STOP conditions introduced by source identity (C-9)
+-------------------------------------------------------
+Opening a qualification sequence now also checks that the HEAD it is about to
+lock is published on the canonical remote. Start-K8QualificationSequence.ps1
+stops if:
+
+  * the named remote is not the canonical repository
+    -- ancestry against any remote you happen to have added would only show
+       that HEAD is an ancestor of SOMETHING. You choose the remote NAME; the
+       repository and the ref are pinned.
+
+  * the pinned ref does not exist on that remote
+    -- the remote answered, and the answer is that the ref is absent. Reported
+       as an absent ref, never as "could not observe".
+
+  * the remote could not be observed at all
+    -- recorded as not-observed and stopped. Not overridable: proceeding would
+       lock a HEAD whose publication was never established.
+
+  * HEAD is not an ancestor of the pinned ref
+    -- the commit is not published there. Push first, then open the sequence.
+       That is the ordinary order anyway: fix, push, open a new sequence.
+
+The observation is written once per sequence to
+sequences\<id>.source-identity.json and mirrored into each run's evidence tree
+as source-identity.txt, before finalize-evidence hashes the tree.
+
+Assembling a transfer bundle
+----------------------------
+    .\tools\New-K8TransferBundle.ps1 `
+        -RunId <range-a-id>,<range-b-id>,<range-c-id> `
+        -Destination <empty dir> `
+        -BundleId <id>
+
+Which runs go in is your decision. Whether that selection hangs together is
+not: one COMPLETED sequence, one locked HEAD, a/b/c exactly once, and no
+terminated run among them. The first bundle's three "qualification runs" spanned
+different tooling HEADs and nothing noticed.
+
+The script writes transfer-manifest.json and stops there. It does NOT write
+README.md or .gitattributes -- the first is yours to author, the second is the
+consumer's retention policy, which this repository does not decide. Each file's
+byte class (contains_cr / contains_nul / trailing_newline) is in the manifest;
+that is the fact you need in order to choose a policy.
+
+A destination that already exists is refused. Bundles are assembled once, and a
+re-attempt uses a NEW bundle id rather than reusing one.
+
+Verifying the transferred bytes happens on the consumer side, against both the
+bytes as collected AND the bytes git actually commits. Checking only the first
+is what made RT-01 look fine (423/423) while three quarters of the files were
+being rewritten (97 OK / 326 MISMATCH).

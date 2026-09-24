@@ -72,11 +72,11 @@ def validate(record, run_id=None):
         raise CaptureContextError("capture-context fields are incomplete or unknown")
     if record["schema_version"] != SCHEMA_VERSION:
         raise CaptureContextError("unknown capture-context schema version")
-    if record["stage"] not in apparatus.CAPTURE_STAGES:
+    if record["stage"] not in apparatus.ALL_CAPTURE_STAGES:
         raise CaptureContextError("unknown capture stage")
     if run_id is not None and record["run_id"] != run_id:
         raise CaptureContextError("capture-context run ID does not match this run")
-    spec = apparatus.CAPTURE_STAGES[record["stage"]]
+    spec = apparatus.ALL_CAPTURE_STAGES[record["stage"]]
     if record["namespace_service"] != spec["service"]:
         raise CaptureContextError("namespace service is not the frozen service for this stage")
 

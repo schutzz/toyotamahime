@@ -1,8 +1,10 @@
 # Study 01 — provenance
 
-Every file under `Study01/` was extracted from the private Kakuriyo research repository `schutzz/kakuriyo-cyber-range-research`, at commit **`f0df3e1`**, by reading **committed bytes** (`git show HEAD:<path>`) rather than a working tree. That distinction is not pedantic: hashing working-tree bytes that git then normalizes on commit is a failure this study hit three separate times, and it is why [`.gitattributes`](./.gitattributes) exists here.
+Every file under `Study01/` was extracted from the private Kakuriyo research repository `schutzz/kakuriyo-cyber-range-research`, most recently re-verified at commit **`92316e4`** (the Authority Anchor update accepting AMEND-007's Windows `test_8g` cleanup portability correction; the original export-source commit for this amended baseline was `8873aee`, a strict ancestor of `92316e4`), by reading **committed bytes** (`git show HEAD:<path>`) rather than a working tree. That distinction is not pedantic: hashing working-tree bytes that git then normalizes on commit is a failure this study hit three separate times, and it is why [`.gitattributes`](./.gitattributes) exists here.
 
-[`provenance.json`](./provenance.json) is the machine-readable record: for each of the 71 extracted files it gives the Toyotamahime path, the Kakuriyo path, the **Kakuriyo blob id**, the SHA-256, the byte count, and whether the file carries CRLF.
+**This baseline is amended.** The historical baseline `k8-bootstrap-v4` was cut from Kakuriyo `f0df3e1`. This one reflects the accepted amendments AMEND-001 through AMEND-007: `scripts/study01/frozen/semantics.py` and `scripts/study01/scorer.py` carry the Range B `R-OBS-05 = Unresolved` scoring propagation (AMEND-004), `scripts/study01/frozen/apparatus.py` carries the prospective K8 Range A/B runtime provisioning pin (AMEND-005) and Range B-only auxiliary R-OBS-05 liveness-capture stage (AMEND-006), and `scripts/tests/test_phase1.py` carries the cleanup-only Windows portability correction (AMEND-007). See "Historical claim anchor and prospective candidate anchor" below before comparing any shipped blob id against a value cited in [`claims/`](./claims/).
+
+[`provenance.json`](./provenance.json) is the machine-readable record: for each of the 75 extracted files it gives the Toyotamahime path, the Kakuriyo path, the **Kakuriyo blob id**, the SHA-256, the byte count, and whether the file carries CRLF.
 
 ## Verifying the frozen apparatus without access to Kakuriyo
 
@@ -12,25 +14,43 @@ The blob ids in `provenance.json` are git object ids, so they can be recomputed 
 git hash-object Study01/studies/study-01-negative-result/scripts/study01/frozen/semantics.py
 ```
 
-The six files whose identity the study's own judgments rest on:
+The six files whose identity the study's own judgments rest on. Three are unchanged from the historical apparatus; three carry an amendment.
+
+**Unchanged — byte-identical to the K6 start boundary `a772ea1`:**
 
 | File | Kakuriyo blob |
 | --- | --- |
-| `scripts/study01/frozen/semantics.py` | `4ae5f1f892df83b7911c9b958d2dcf79be6ffce9` |
-| `scripts/study01/frozen/apparatus.py` | `d40c8708fdfee807a2f93a49ae3db6595ea3718e` |
-| `scripts/study01/scorer.py` | `1a1132e6906c70dadff6f9bb590f38775f2f6733` |
 | `protocol/scoring.md` | `191c1dcf6c507a17b7dc82911f1a047aa441dc88` |
 | `protocol/experiment-protocol.md` | `41eda1688bf1821a7b60c0a1db0343080378dd64` |
 | `scripts/study01/procedure_conformance.py` | `92bca65059358a28cd99d0d206fedc5e37776794` |
 
-These are byte-identical to their state at the K6 start boundary `a772ea1`, at each accepted record's raw evidence commit, and at the Kakuriyo commit this kit was cut from. The judgments in [`claims/`](./claims/) verify that identity themselves and cite the same ids.
+**Amendment-transcribed — byte-identical to the accepted blob in the Authority Anchor Record** (`k8-s2-amend-004-transcription-authority-anchor.json` in Kakuriyo, schema `k8-s2-amendment-transcription-authority/1`, now also accepting AMEND-005 and AMEND-006), **not** to `a772ea1`:
+
+| File | historical blob (`a772ea1`) | amended blob (this baseline) | amendment |
+| --- | --- | --- | --- |
+| `scripts/study01/frozen/semantics.py` | `4ae5f1f892df83b7911c9b958d2dcf79be6ffce9` | `931394d66405abeb4fd13805f2fb9257999e34ac` | AMEND-004 |
+| `scripts/study01/scorer.py` | `1a1132e6906c70dadff6f9bb590f38775f2f6733` | `bce3eb1bf7082a1a56ba5c79c5ded7416652e7f1` | AMEND-004 |
+| `scripts/study01/frozen/apparatus.py` | `d40c8708fdfee807a2f93a49ae3db6595ea3718e` | `54176d248e626db9f20e19f4fa754912359967ac` | AMEND-005, AMEND-006 |
+
+The judgments in [`claims/`](./claims/) were written against the historical blobs and cite them verbatim. They are shipped unchanged; the amended blobs are the state of this baseline's apparatus, not a correction to the judgments. See the next section.
+
+## Historical claim anchor and prospective candidate anchor
+
+A reader who checks a shipped blob id against a value quoted in `claims/` — for example the `1a1132e` / `4ae5f1f` cited in `claims/h-j2-judgment.md` and `claims/h-j4-judgment.md` — will find that `scripts/study01/scorer.py` and `scripts/study01/frozen/semantics.py` do not match. That is expected, and it is not a defect. The two anchors are distinct:
+
+| Anchor | What it is | Where it lives |
+| --- | --- | --- |
+| **Historical claim anchor** | `k8-bootstrap-v4` = Kakuriyo `f0df3e1`. The K6 and K7 results — including the *Inconclusive* headline judgment — were obtained on **this** apparatus. Every blob id quoted in `claims/` is true against this anchor and is not re-interpreted here. | tag `k8-bootstrap-v4`, permanently retained |
+| **Prospective candidate anchor** | This baseline's `Study01/` tree. It is the apparatus for K8-S2 and any subsequent formal K8-3. AMEND-001 through AMEND-005 are recorded in `amendment_transcription[]` of [`docs/k8-study01-amended-candidate-attestation.json`](../docs/k8-study01-amended-candidate-attestation.json); AMEND-006 and AMEND-007 and their accepted blobs are recorded by Kakuriyo's updated Authority Anchor at `92316e4`. | this commit's `Study01` tree OID; intended tag `k8-bootstrap-v14` |
+
+**The K6 / K7 claims are not asserted to hold under this candidate.** They are the frozen record of what the historical apparatus produced. Re-running them on the amended apparatus is a separate, forward activity (formal K8-3 against the new release), not a re-litigation of the frozen outcome. `amendment_transcription[]` in the attestation records, per file, which amendment authorised the change and from which blob to which blob.
 
 ## Pinned external dependencies
 
 | Pin | Value | How to obtain it |
 | --- | --- | --- |
-| Amenonuboco, range generation | `78fc17746b5d663fafec9dffe563d79fe9ea02b7` | fetchable by SHA from the public repository; see `README.md` §4.1 |
-| Amenonuboco, contract validator | `v0.13.0` = `0378f8a32701b481e030f3db3d5f66ea471a4675` | public tag |
+| Amenonuboco, range generation (AMEND-005 prospective pin) | `80e550ffeab8daa6583590add490433a0305bb53` (annotated tag `v0.13.5`) | fetchable by SHA from the public repository; see `README.md` §4.1 |
+| Amenonuboco, contract validator | `v0.13.1` = `1d0fa75725078100e9da2e8492ca977ba8e89d95` (packaging-only patch of `v0.13.0` = `0378f8a32701b481e030f3db3d5f66ea471a4675`; validator code/schema/behavior unchanged) | public tag |
 | Capture helper image | `corfr/tcpdump@sha256:3006b3bd9f041bf73f21e626b97cca5e78fd6ce271549ca95b8e6a508165512b` | pull by digest |
 | Sender asset | SHA-256 `093FEFD5F1F36D715AAE4D7AB91DBAD2D7A93BFE212705D721C95B356A7C053B` | shipped; the preflight checks it |
 | Kakuriyo K6 start boundary | `a772ea11b07b59208586846d76abe1d1841dddd9` | referenced by the judgments |
@@ -46,7 +66,7 @@ Both Amenonuboco pins were confirmed publicly reachable, anonymously, at extract
 | `scripts/study01/gate_b2.py`, `study01_gate_b2.py`, `study01_k6_index.py`, `study01_k7_normalize.py` and their tests | Post-run analysis tooling for the K6 equivalence check, the cross-range index, and the K7 normalization. None of it is needed to run or score a range, and `study01_k7_normalize.py` reads Kakuriyo-internal paths, so shipping it would ship a tool that cannot work here. |
 | The K6 and K7 planning, review, and report documents | Kakuriyo carries the process record. What a reader needs to know about the conclusions is in `claims/`. |
 
-The shipped `study01` package is therefore Kakuriyo's minus `gate_b2.py`. Every file that *is* shipped is byte-identical to its Kakuriyo counterpart.
+The shipped `study01` package is therefore Kakuriyo's minus `gate_b2.py`, plus `scripts/study01_evidence_tree.py`, `scripts/tests/test_preflight_amend005_provisioning.py`, `scripts/tests/test_evidence_tree_exposure.py`, and `scripts/tests/test_robs05_liveness_capture.py` (all new; not present at the original `8873aee` export). Every file that *is* shipped is byte-identical to its Kakuriyo counterpart, most recently re-verified at `92316e4` (originally exported at `8873aee`; `provenance.json` records the complete per-file identity, including the accepted AMEND-007 cleanup transcription).
 
 ## Cross-references inside `claims/`
 

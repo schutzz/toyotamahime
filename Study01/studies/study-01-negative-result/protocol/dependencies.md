@@ -51,6 +51,25 @@ The generic Observability Contract capability required by the frozen K4 Acceptan
 
 This pin does not change the §2 Amenonuboco Baseline used for Range A/B/C provisioning and runtime evidence; it adds the generic static-validation capability the frozen protocol required before Pilot.
 
+## 2.2 Prospective K8 Range A/B runtime provisioning pin
+
+AMEND-005 changes only future K8-S2 qualification candidates and the next formal K8-3 candidate. Historical K6/K7 evidence and prior K8 attempts remain bound to their recorded Amenonuboco identity. Range C continues to use the separately pinned static validator.
+
+| Field | Value |
+| --- | --- |
+| Annotated tag / commit | `v0.13.5` / `80e550ffeab8daa6583590add490433a0305bb53` (annotated tag object `9a084a8c6205267b2b759a6a5d6c5683cd61c933`) |
+| Build-only validation | GitHub Actions run `35100341834`, PASS for all six images before tag creation |
+| Release publication | GitHub Actions run `35100436250`, PASS |
+| Published-image smoke | GitHub Actions run `35202977048`, PASS against the exact six digests below; generated 13 digest-pinned services, runtime package-manager command count 0, gateway/qdisc/filter checks PASS, selected containers running with restart count 0 |
+| `amenonuboco-network-tools` | `ghcr.io/schutzz/amenonuboco-network-tools@sha256:1b8eb24e78a5b9ec1048e14db69e60a59509dda72dba847a1269a270f5fc01a3` |
+| `amenonuboco-network-tools-structurer` | `ghcr.io/schutzz/amenonuboco-network-tools-structurer@sha256:efc9e6a2540ae492bfc646f3ebf59d1dc1e2ccff9c39c1224468b6214253097e` |
+| `amenonuboco-dnp3` | `ghcr.io/schutzz/amenonuboco-dnp3@sha256:d517cbb9e234b69d192b4808c843e0e5a629385566d3b6a88260659ee4785e55` |
+| `amenonuboco-opcua` | `ghcr.io/schutzz/amenonuboco-opcua@sha256:7268abe37e31d601c550f1f5a29e374a5bd7f055f8746f1b4ef4d30b90318afe` |
+| `amenonuboco-power-grid-python-tools` | `ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8` |
+| `amenonuboco-power-grid-nodered-tools` | `ghcr.io/schutzz/amenonuboco-power-grid-nodered-tools@sha256:13c665ed2532b36dd925b3158809ec38ccdef048fa1d671e0b8815c3bb7a956e` |
+
+No GitHub Release object was created; `v0.13.5` is the immutable annotated Git tag, while run `35100436250` published the GHCR artifacts. These are platform-specific `linux/amd64` manifest digests, not multi-platform index digests. Future candidate provisioning must use these exact references and `--no-build`; a moving tag, another architecture, another digest, or another Amenonuboco commit fails closed.
+
 ## 3. Schema Binding Rule
 
 Amenonuboco currently represents the manifest schema as Python modules under `platform/schema/` rather than as a separately versioned schema release.

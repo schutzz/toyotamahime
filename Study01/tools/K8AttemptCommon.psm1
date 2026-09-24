@@ -138,7 +138,15 @@ function Get-K8AttemptPaths {
         RepositoryJson      = Join-Path $Dir 'repository.json'
         EnvironmentJson     = Join-Path $Dir 'environment.json'
         StepsLog            = Join-Path $Dir 'steps.jsonl'
+        # Per-step raw stdout/stderr artifacts -- see Invoke-K8Step. Named
+        # steps-raw/, not transcript/, to keep it visually distinct from
+        # transcript.txt: this directory is the process-independent
+        # formal evidence; transcript.txt remains a retained,
+        # best-effort human-readable aggregate (see Invoke-K8Step's own
+        # doc comment for the evidence-authority split).
         StepsRawDir         = Join-Path $Dir 'steps-raw'
+        # G7 v5 SECTION A.1a.2 pre-execution expectation manifest --
+        # optional, opt-in via -StepPlanPath (Initialize-K8ExpectationManifest).
         ExpectationsJsonl   = Join-Path $Dir 'expectations.jsonl'
         KnowledgeLeakMd     = Join-Path $Dir 'knowledge-leak-log.md'
         KnowledgeLeakJsonl  = Join-Path $Dir 'knowledge-leak-log.jsonl'
@@ -689,32 +697,79 @@ function Initialize-K8AttemptEnvironment {
 function Invoke-K8Step {
     <#
         Runs one reproduction command with structured, exit-code-aware
-        capture, so a transcript reviewer never has to guess whether a
-        step passed. Records every step (pass or fail) to steps.jsonl,
-        now including a 0-based step_index, its canonical command_identity
-        (SECTION A.1a.1a), and -- always -- a separately-retained,
-        per-channel raw capture under steps-raw/ (SECTION A.2's
-        "steps-raw/NNNN.log" evidence, split per channel here because
-        SECTION A's expectation model is itself per-channel). stdout and
-        stderr are told apart from one `2>&1`-merged pipeline by
-        PowerShell's own convention of wrapping stderr content in
-        ErrorRecord objects when merged this way -- confirmed for both
-        native executables and PowerShell-native Write-Error content.
-
-        If expectations.jsonl has a pre-execution-bound record for this
-        step_index (Initialize-K8ExpectationManifest), this additionally
-        records the command_identity binding result and each channel's
-        SECTION A.3 verdict -- as retained data, never as a throw. A
-        fail-closed verdict here means the attempt cannot later be
-        certified "complete transcript" (SECTION B); it does not itself
-        abort execution, matching this module's own scope discipline
-        (evidence recording, not gate enforcement -- see the file header).
+        capture, so a reviewer never has to guess whether a step passed.
+        Records every step (pass or fail) to steps.jsonl.
 
         This does NOT retry, does NOT remediate, and by default treats
         any exit code other than 0 as a failure and throws. Pass
         -ExpectedExitCode for a step the protocol itself expects to be
         non-zero (for example the Range C validator) so that existing
         protocol semantics are not broken by this wrapper.
+
+        Formal evidence authority -- process-independent by construction,
+        not by observed PowerShell behaviour. An earlier revision of this
+        function additionally re-attached to transcript.txt with
+        Start-Transcript -Append across process boundaries, and an
+        independent review confirmed that specific fix worked on this
+        repository's PowerShell 7.6.6 test runtime -- but its correctness
+        rested on Start-/Stop-Transcript's nested-session/reference-
+        counting behaviour, which is not part of PowerShell's documented
+        Stop-Transcript contract and was not verified on 7.6.2 (the
+        version the original failed formal attempt,
+        k8-repro-20260914-001, actually ran). That dependency is removed
+        here, not merely re-verified: every step's combined stdout/stderr
+        is now written, line by line, straight to its own per-step raw
+        artifact under Paths.StepsRawDir via Add-Content -- the exact
+        same process-independent file-append primitive steps.jsonl has
+        always used, with no PowerShell transcription API involved at
+        all. steps.jsonl gains `step_index` (this attempt's step count at
+        entry, read fresh from disk so it is correct regardless of which
+        process ran each prior step -- steps.jsonl's own append order,
+        not wall-clock, is this schema's canonical ordering authority)
+        and `raw_output` (the artifact's path, relative to AttemptDir).
+        Existing manifest generation (Complete-K8Attempt) already walks
+        AttemptDir recursively, so steps-raw/*.log is picked up
+        automatically with no change needed there.
+
+        transcript.txt is still opened once, in the bootstrap process
+        (Initialize-K8AttemptDirectory), and this function still
+        defensively tries to re-attach to it with -Append here so it
+        stays a useful, best-effort, human-readable aggregate when the
+        operator's session shape happens to support it -- but nothing
+        about step-evidence *completeness* depends on that succeeding
+        any more. A build, version, or session shape where
+        Start-Transcript silently fails or behaves unexpectedly can no
+        longer cause a gap in the formal record; only the per-step raw
+        artifacts and steps.jsonl are load-bearing. transcript.txt
+        remains a retained artifact (the K8-3 evidence list in
+        docs/k8-independent-reproduction-plan.md names "transcript"
+        explicitly), it is simply no longer where step-level
+        completeness is proven from.
+
+        This has no PowerShell-version-specific assumption beyond
+        #requires -Version 7.0 at the top of this file: Add-Content,
+        Get-Content, the pipeline, and 2>&1 redirection are unchanged
+        since PowerShell Core 6.0 and Windows PowerShell 5.1 alike.
+
+        Get-K8WslField, the one function Shakedown imports from this
+        module, is untouched by this function and is not called from
+        here.
+
+        G7 v5 additions (accepted authority; additive to everything
+        above -- the combined steps-raw/NNNN.log artifact, steps.jsonl's
+        existing field set, and transcript re-attach are all unchanged):
+        each step's canonical command_identity (SECTION A.1a.1a) is
+        recorded, its stdout/stderr are *additionally* captured to their
+        own per-channel artifacts (steps-raw/NNNN.stdout.log /
+        .stderr.log -- stdout/stderr told apart from the one 2>&1-merged
+        pipeline via PowerShell's own convention of wrapping stderr
+        content in ErrorRecord objects), and, when expectations.jsonl has
+        a pre-execution-bound record for this step_index, the
+        command_identity binding result and each channel's SECTION A.3
+        verdict are recorded on the step. A fail-closed verdict here
+        never aborts the step; it blocks later certification, decided by
+        an independent reviewer from these retained bytes, matching this
+        function's own scope discipline above.
     #>
     param(
         [Parameter(Mandatory)] $Paths,
@@ -726,111 +781,217 @@ function Invoke-K8Step {
 
     Assert-K8AttemptOpen -Paths $Paths -Operation 'record a new step'
 
-    $StepIndex =
-        if (Test-Path $Paths.StepsLog) { @(Get-Content -Path $Paths.StepsLog).Count } else { 0 }
+    # steps.jsonl's own line count, read fresh from disk, is this
+    # attempt's step identity/ordering authority -- correct regardless
+    # of which process ran each prior step. Steps are never run
+    # concurrently against one attempt (EXE-01 / C-2b in
+    # docs/k8-experiment-constitution.md), so no locking is needed to
+    # make this read-then-use safe.
+    $StepIndex = 0
+    if (Test-Path $Paths.StepsLog) {
+        $StepIndex =
+            @(Get-Content -Path $Paths.StepsLog | Where-Object { $_.Trim() }).Count
+    }
 
-    $Start =
-        Get-Date
+    New-Item -ItemType Directory -Force -Path $Paths.StepsRawDir |
+        Out-Null
+    $RawOutputPath =
+        Join-Path $Paths.StepsRawDir ('{0:D4}.log' -f $StepIndex)
+    $RawOutputRelativePath =
+        "steps-raw/{0:D4}.log" -f $StepIndex
 
-    Write-Host ''
-    Write-Host "=== K8 STEP: $Description ===" -ForegroundColor Cyan
-    Write-Host "Command: $Command"
+    # G7 v5 SECTION A.2/A.3 per-channel capture -- additive to the combined
+    # raw_output artifact above, which is unchanged.
+    $StdOutRawPath =
+        Join-Path $Paths.StepsRawDir ('{0:D4}.stdout.log' -f $StepIndex)
+    $StdErrRawPath =
+        Join-Path $Paths.StepsRawDir ('{0:D4}.stderr.log' -f $StepIndex)
 
-    $global:LASTEXITCODE =
-        0
+    # Best-effort convenience only from here on -- see the doc comment
+    # above. A failure here must never fail the step, and nothing below
+    # checks whether it actually succeeded.
+    try {
+        Start-Transcript -Path $Paths.Transcript -Append -ErrorAction Stop |
+            Out-Null
+    }
+    catch {
+    }
 
-    $StdOutLines = [System.Collections.Generic.List[string]]::new()
-    $StdErrLines = [System.Collections.Generic.List[string]]::new()
+    try {
+        $Start =
+            Get-Date
 
-    & $Command 2>&1 |
-        ForEach-Object {
-            $Line = $_.ToString()
-            if ($_ -is [System.Management.Automation.ErrorRecord]) {
-                $StdErrLines.Add($Line)
+        Write-Host ''
+        Write-Host "=== K8 STEP: $Description ===" -ForegroundColor Cyan
+        Write-Host "Command: $Command"
+
+        $global:LASTEXITCODE =
+            0
+
+        # Formal, process-independent evidence: every combined
+        # stdout/stderr line is both shown to the operator (Write-Host,
+        # same as before) and appended to this step's own raw artifact
+        # file, line by line, as it arrives -- not buffered in memory
+        # and written once at the end, so a step that is killed mid-run
+        # still leaves whatever output it produced on disk.
+        #
+        # The command block is allowed to throw, and must not escape
+        # before this step is recorded. protocol/'s literal commands --
+        # the ones Study01/README.md tells the operator to use verbatim
+        # -- routinely end in their own guard, e.g.
+        # `if ($LASTEXITCODE -ne 0) { throw "execution preflight failed" }`,
+        # and there are sixteen such guards across the capture,
+        # derivation, and sender procedures. Before this catch, such a
+        # throw unwound straight past the steps.jsonl append below:
+        # steps-raw/NNNN.log existed with the real output, but the step
+        # had no record at all, so Get-K8LastStep (and therefore
+        # Stop-K8.ps1's auto-populated final-status) saw the previous,
+        # passing step instead of the failure. Formal attempt
+        # k8-repro-20260918-001 lost its failing step exactly this way.
+        # The exception is captured here, written to the raw artifact,
+        # recorded as a failed step below, and only then re-raised.
+        $CommandError =
+            $null
+
+        try {
+            & $Command 2>&1 |
+                ForEach-Object {
+                    $Line = $_.ToString()
+                    Write-Host $Line
+                    Add-Content -Path $RawOutputPath -Value $Line -Encoding utf8
+
+                    # G7 v5 per-channel split, additive: PowerShell wraps
+                    # stderr content in an ErrorRecord when merged via
+                    # 2>&1 -- confirmed for both native executables and
+                    # PowerShell-native Write-Error content.
+                    if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                        Add-Content -Path $StdErrRawPath -Value $Line -Encoding utf8
+                    }
+                    else {
+                        Add-Content -Path $StdOutRawPath -Value $Line -Encoding utf8
+                    }
+                }
+        }
+        catch {
+            $CommandError = $_
+
+            $ErrorLine =
+                "[k8-harness] command block threw: $($_.Exception.Message)"
+            Write-Host $ErrorLine -ForegroundColor Red
+            Add-Content -Path $RawOutputPath -Value $ErrorLine -Encoding utf8
+            Add-Content -Path $StdErrRawPath -Value $ErrorLine -Encoding utf8
+        }
+
+        if (-not (Test-Path $RawOutputPath)) {
+            # The command produced no output at all -- retain an empty,
+            # present file rather than no file, so "no output" and "step
+            # never ran" stay distinguishable on disk (same discipline
+            # EVD-03 already requires of other empty-output evidence).
+            New-Item -ItemType File -Path $RawOutputPath -Force | Out-Null
+        }
+        if (-not (Test-Path $StdOutRawPath)) {
+            New-Item -ItemType File -Path $StdOutRawPath -Force | Out-Null
+        }
+        if (-not (Test-Path $StdErrRawPath)) {
+            New-Item -ItemType File -Path $StdErrRawPath -Force | Out-Null
+        }
+
+        $ExitCode =
+            $LASTEXITCODE
+
+        # A step whose command block threw never passes, whatever
+        # $LASTEXITCODE says -- a guard that throws on a non-zero native
+        # exit leaves the real exit code here, but a guard that throws
+        # on a failed string comparison (the sender hash check, say)
+        # leaves the last successful native exit code, which would
+        # otherwise read as a pass.
+        $Passed =
+            ($null -eq $CommandError) -and ($ExpectedExitCode -contains $ExitCode)
+
+        $CommandText =
+            $Command.ToString().Trim()
+
+        # G7 v5 SECTION A.1a.1a canonical command_identity.
+        $CommandIdentity =
+            Get-K8CommandIdentity -Command $CommandText
+
+        $Record =
+            [ordered]@{
+                step_index        = $StepIndex
+                timestamp         = $Start.ToUniversalTime().ToString('o')
+                description       = $Description
+                command           = $CommandText
+                command_identity  = $CommandIdentity
+                exit_code         = $ExitCode
+                expected          = $ExpectedExitCode
+                passed            = $Passed
+                raw_output        = $RawOutputRelativePath
+            }
+
+        if ($null -ne $CommandError) {
+            $Record['command_error'] =
+                $CommandError.Exception.Message
+        }
+
+        # G7 v5 SECTION A.1a.1 / A.3: if a pre-execution-bound expectation
+        # exists for this step_index, validate against it and record the
+        # verdict as retained data -- never a throw (see this function's
+        # own doc comment above).
+        $Expectation =
+            Get-K8ExpectationForStep -ExpectationsPath $Paths.ExpectationsJsonl -StepIndex $StepIndex
+
+        if ($null -ne $Expectation) {
+            $Record['expectation_command_identity_bound'] =
+                ($Expectation.command_identity -eq $CommandIdentity)
+
+            $StdOutBytes = [System.IO.File]::ReadAllBytes($StdOutRawPath)
+            $StdErrBytes = [System.IO.File]::ReadAllBytes($StdErrRawPath)
+
+            $Record['stdout_verdict'] = Get-K8ChannelVerdict -Expectation $Expectation.stdout_expectation `
+                -CapturePresent $true -CaptureBytes $StdOutBytes -StepChronologyProven $true -HasExpectationRecord $true
+            $Record['stderr_verdict'] = Get-K8ChannelVerdict -Expectation $Expectation.stderr_expectation `
+                -CapturePresent $true -CaptureBytes $StdErrBytes -StepChronologyProven $true -HasExpectationRecord $true
+        }
+
+        ($Record | ConvertTo-Json -Compress) |
+            Add-Content -Path $Paths.StepsLog -Encoding utf8
+
+        if ($Passed) {
+            Write-Host "=== STEP OK (exit $ExitCode) ===" -ForegroundColor Green
+        }
+        else {
+            if ($null -ne $CommandError) {
+                Write-Host (
+                    "=== STEP FAILED (command block threw; last exit " +
+                    "$ExitCode) ==="
+                ) -ForegroundColor Red
             }
             else {
-                $StdOutLines.Add($Line)
+                Write-Host (
+                    "=== STEP FAILED (exit $ExitCode, expected " +
+                    "$($ExpectedExitCode -join ',')) ==="
+                ) -ForegroundColor Red
             }
-            Write-Host $Line
+            Write-Host (
+                'Do not work around this from memory. Close this attempt: ' +
+                "Stop-K8.ps1 `"<why>`""
+            ) -ForegroundColor Yellow
+
+            if (-not $ContinueOnFailure) {
+                # Recorded first, then re-raised: the failure still stops
+                # the operator's script exactly as before.
+                if ($null -ne $CommandError) {
+                    throw $CommandError
+                }
+                throw "K8 step failed: $Description (exit $ExitCode)"
+            }
         }
 
-    $ExitCode =
-        $LASTEXITCODE
-
-    $Passed =
-        $ExpectedExitCode -contains $ExitCode
-
-    if (-not (Test-Path $Paths.StepsRawDir)) {
-        New-Item -ItemType Directory -Force -Path $Paths.StepsRawDir | Out-Null
+        return $Record
     }
-
-    $StdOutRawPath = Join-Path $Paths.StepsRawDir ('{0:D4}.stdout.log' -f $StepIndex)
-    $StdErrRawPath = Join-Path $Paths.StepsRawDir ('{0:D4}.stderr.log' -f $StepIndex)
-
-    $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    # Written unconditionally, even when empty -- a 0-byte capture is
-    # itself the retained fact "this channel produced nothing" (SECTION
-    # A.4's zero-byte-capture case), never a missing file.
-    $StdOutContent = if ($StdOutLines.Count -gt 0) { ($StdOutLines -join "`n") + "`n" } else { '' }
-    $StdErrContent = if ($StdErrLines.Count -gt 0) { ($StdErrLines -join "`n") + "`n" } else { '' }
-    [System.IO.File]::WriteAllText($StdOutRawPath, $StdOutContent, $Utf8NoBom)
-    [System.IO.File]::WriteAllText($StdErrRawPath, $StdErrContent, $Utf8NoBom)
-
-    $CommandText =
-        $Command.ToString().Trim()
-
-    $CommandIdentity =
-        Get-K8CommandIdentity -Command $CommandText
-
-    $Record =
-        [ordered]@{
-            timestamp         = $Start.ToUniversalTime().ToString('o')
-            step_index        = $StepIndex
-            description       = $Description
-            command           = $CommandText
-            command_identity  = $CommandIdentity
-            exit_code         = $ExitCode
-            expected          = $ExpectedExitCode
-            passed            = $Passed
-        }
-
-    $Expectation =
-        Get-K8ExpectationForStep -ExpectationsPath $Paths.ExpectationsJsonl -StepIndex $StepIndex
-
-    if ($null -ne $Expectation) {
-        $Record['expectation_command_identity_bound'] = ($Expectation.command_identity -eq $CommandIdentity)
-
-        $StdOutBytes = [System.IO.File]::ReadAllBytes($StdOutRawPath)
-        $StdErrBytes = [System.IO.File]::ReadAllBytes($StdErrRawPath)
-
-        $Record['stdout_verdict'] = Get-K8ChannelVerdict -Expectation $Expectation.stdout_expectation `
-            -CapturePresent $true -CaptureBytes $StdOutBytes -StepChronologyProven $true -HasExpectationRecord $true
-        $Record['stderr_verdict'] = Get-K8ChannelVerdict -Expectation $Expectation.stderr_expectation `
-            -CapturePresent $true -CaptureBytes $StdErrBytes -StepChronologyProven $true -HasExpectationRecord $true
+    finally {
+        try { Stop-Transcript | Out-Null } catch { }
     }
-
-    ($Record | ConvertTo-Json -Compress) |
-        Add-Content -Path $Paths.StepsLog -Encoding utf8
-
-    if ($Passed) {
-        Write-Host "=== STEP OK (exit $ExitCode) ===" -ForegroundColor Green
-    }
-    else {
-        Write-Host (
-            "=== STEP FAILED (exit $ExitCode, expected " +
-            "$($ExpectedExitCode -join ',')) ==="
-        ) -ForegroundColor Red
-        Write-Host (
-            'Do not work around this from memory. Close this attempt: ' +
-            "Stop-K8.ps1 `"<why>`""
-        ) -ForegroundColor Yellow
-
-        if (-not $ContinueOnFailure) {
-            throw "K8 step failed: $Description (exit $ExitCode)"
-        }
-    }
-
-    return $Record
 }
 
 function Get-K8LastStep {
@@ -912,6 +1073,97 @@ function Add-K8KnowledgeLeak {
     return $Entry
 }
 
+function Test-K8TranscriptCoverage {
+    <#
+        Judges whether transcript.txt actually covers this attempt's
+        recorded steps -- from the text of the finished transcript.txt
+        file and steps.jsonl's own step count, never by inspecting live
+        PowerShell transcript/session state. This is what lets
+        docs/k8-independent-reproduction-plan.md section 10's Gate K8
+        exit criterion ("complete transcript") be checked from retained
+        evidence after the fact, instead of silently trusting that every
+        step's best-effort Start-Transcript -Append (see Invoke-K8Step)
+        actually succeeded. It does not reintroduce a dependency on
+        Start-/Stop-Transcript's nested/reference-counting behaviour for
+        *correctness* -- it only reads the resulting file's content,
+        which is safe and behaviour-independent by construction.
+
+        Each Invoke-K8Step call writes a "=== K8 STEP: <description> ==="
+        banner via Write-Host before running its command. Write-Host goes
+        to the host UI, which a currently-active transcript session
+        captures verbatim -- so that banner lands in transcript.txt if
+        and only if this step's transcript re-attach actually worked.
+        Counting those banners against steps.jsonl's own step count is
+        therefore an accurate, after-the-fact completeness signal that
+        needs nothing beyond the two artifacts this module already
+        writes: no new evidence type, no new file.
+
+        Does not change what step-level formal evidence *is* -- steps.jsonl
+        and steps-raw/*.log remain the sole formal evidence authority for
+        step completeness; this function and Invoke-K8Step do not call
+        each other. This only adds a second, independent judgement about
+        transcript.txt specifically, so transcript.txt's own retention
+        requirement (plan section 6 and section 10) is not left to
+        silently pass or fail on faith.
+
+        Uses -ge, not -eq, when comparing marker count to step count: the
+        marker text can in principle also appear inside a step's own
+        captured output (e.g. a command that happens to echo it back),
+        which could only ever inflate the marker count, never deflate it
+        -- so real incompleteness (a missing re-attach) is still caught,
+        while that coincidence cannot manufacture a false incompleteness
+        finding.
+    #>
+    param(
+        [Parameter(Mandatory)] $Paths
+    )
+
+    $StepCount = 0
+    if (Test-Path $Paths.StepsLog) {
+        $StepCount =
+            @(Get-Content -Path $Paths.StepsLog | Where-Object { $_.Trim() }).Count
+    }
+
+    if (-not (Test-Path $Paths.Transcript)) {
+        return [pscustomobject]@{
+            Complete    = $false
+            StepCount   = $StepCount
+            MarkerCount = 0
+            Reason      = 'transcript.txt does not exist'
+        }
+    }
+
+    $TranscriptText =
+        Get-Content -Path $Paths.Transcript -Raw -ErrorAction Stop
+
+    $MarkerCount =
+        [regex]::Matches($TranscriptText, [regex]::Escape('=== K8 STEP: ')).Count
+
+    $Complete =
+        $MarkerCount -ge $StepCount
+
+    $Reason =
+        if ($Complete) {
+            'transcript.txt contains a step marker for every steps.jsonl entry'
+        }
+        else {
+            "transcript.txt has $MarkerCount step marker(s) but steps.jsonl " +
+            "records $StepCount step(s) -- transcript.txt is incomplete, " +
+            'most likely because a mid-attempt Start-Transcript -Append ' +
+            'failed silently (see Invoke-K8Step). This does not affect ' +
+            'step-level formal evidence (steps.jsonl / steps-raw/ are ' +
+            'unaffected), but it does mean transcript.txt itself does not ' +
+            'satisfy the "complete transcript" retention requirement.'
+        }
+
+    return [pscustomobject]@{
+        Complete    = $Complete
+        StepCount   = $StepCount
+        MarkerCount = $MarkerCount
+        Reason      = $Reason
+    }
+}
+
 function Complete-K8Attempt {
     <#
         Runs on both success and failure. Always attempts every step
@@ -977,17 +1229,30 @@ function Complete-K8Attempt {
         Write-Warning "Failed to capture final repository state: $($_.Exception.Message)"
     }
 
-    # 3. final-status.json, including SECTION D.1's canonical knowledge_leak
-    #    object -- always generated, never lazy-create-only, so a zero-leak
-    #    attempt retains positive contemporaneous evidence of that zero
-    #    (this is the gap k8-repro-20260922-001's historical record exposed:
-    #    absence of a standalone log is not evidence of zero). Also verifies
-    #    the SECTION A.1a.2 expectation-manifest binding, if one was made.
-    #    Neither of these throws -- a fail-closed/insufficient verdict here
-    #    is retained as data for an independent reviewer to certify against
-    #    later, not a crash of the close sequence that would destroy
-    #    evidence already collected (this function's own stated contract).
+    # 3. Stop transcript -- moved ahead of final-status.json (was step 4)
+    #    so that step 4 below reads a fully flushed, closed transcript.txt,
+    #    not one PowerShell may still be buffering. After this point, no
+    #    more Write-Host output is captured by it, so this still runs
+    #    after the console-visible steps above.
     try {
+        Stop-Transcript | Out-Null
+    }
+    catch {
+        Write-Warning "Failed to stop transcript (may not have been running): $($_.Exception.Message)"
+    }
+
+    # 4. transcript.txt completeness judgement, G7 v5 knowledge-leak
+    #    zero-state (SECTION D.1) and expectation-manifest binding
+    #    verification, then final-status.json. See Test-K8TranscriptCoverage's
+    #    own doc comment for why the transcript judgement does not depend
+    #    on Start-/Stop-Transcript's internal behaviour for its own
+    #    correctness. The G7 additions are the same kind of best-effort,
+    #    fail-closed-as-data (never as a throw) judgement: a failure here
+    #    must not stop the attempt from closing and being archived.
+    try {
+        $TranscriptCoverage =
+            Test-K8TranscriptCoverage -Paths $Paths
+
         $GeneratedAtUtc =
             (Get-Date).ToUniversalTime().ToString('o')
 
@@ -1008,8 +1273,8 @@ function Complete-K8Attempt {
 
         # ConvertFrom-K8JsonLine, not the ConvertFrom-Json cmdlet: the
         # cmdlet silently upgrades an ISO-8601-shaped JSON string (this
-        # entry's own `timestamp` field) to a .NET [DateTime], which is
-        # not the string value SECTION D.1a.1 requires re-serializing.
+        # entry's own timestamp field) to a .NET [DateTime], which is not
+        # the string value SECTION D.1a.1 requires re-serializing.
         $JsonlEntries = @()
         if (Test-Path $Paths.KnowledgeLeakJsonl) {
             $JsonlEntries = @(
@@ -1030,35 +1295,38 @@ function Complete-K8Attempt {
 
         $FinalStatus =
             [ordered]@{
-                attempt_id            = $Paths.AttemptId
-                outcome               = $Outcome
-                reason                = $Reason
-                failing_command       = $FailingCommand
-                failing_exit_code     = $FailingExitCode
-                stop_time_utc         = $GeneratedAtUtc
-                final_head            = $FinalHead
-                final_status_short    = $FinalStatusShort
-                final_status_clean    = if ($null -ne $FinalStatusShort) { $FinalStatusShort.Count -eq 0 } else { $null }
-                gate_k8               = 'NOT DETERMINED BY THIS TOOL -- Gate K8 is independent review, not self-certified.'
-                knowledge_leak                    = $KnowledgeLeak
-                knowledge_leak_consistency        = $KnowledgeLeakConsistency
-                expectation_manifest_present      = if ($null -ne $ExpectationBinding) { $ExpectationBinding.Present } else { $false }
-                expectation_manifest_bound        = if ($null -ne $ExpectationBinding) { $ExpectationBinding.Bound } else { $null }
+                attempt_id                     = $Paths.AttemptId
+                outcome                        = $Outcome
+                reason                         = $Reason
+                failing_command                = $FailingCommand
+                failing_exit_code              = $FailingExitCode
+                stop_time_utc                  = $GeneratedAtUtc
+                final_head                     = $FinalHead
+                final_status_short             = $FinalStatusShort
+                final_status_clean             = if ($null -ne $FinalStatusShort) { $FinalStatusShort.Count -eq 0 } else { $null }
+                transcript_complete             = $TranscriptCoverage.Complete
+                transcript_step_markers         = $TranscriptCoverage.MarkerCount
+                transcript_expected_steps       = $TranscriptCoverage.StepCount
+                transcript_completeness_reason  = $TranscriptCoverage.Reason
+                knowledge_leak                  = $KnowledgeLeak
+                knowledge_leak_consistency      = $KnowledgeLeakConsistency
+                expectation_manifest_present    = if ($null -ne $ExpectationBinding) { $ExpectationBinding.Present } else { $false }
+                expectation_manifest_bound      = if ($null -ne $ExpectationBinding) { $ExpectationBinding.Bound } else { $null }
+                gate_k8                         = 'NOT DETERMINED BY THIS TOOL -- Gate K8 is independent review, not self-certified.'
             }
 
         Write-K8Json -Object $FinalStatus -Path $Paths.FinalStatusJson
-    }
-    catch {
-        Write-Warning "Failed to write final-status.json: $($_.Exception.Message)"
-    }
 
-    # 4. Stop transcript (after this, no more Write-Host output is captured
-    #    by it, so do it after the console-visible steps above).
-    try {
-        Stop-Transcript | Out-Null
+        if (-not $TranscriptCoverage.Complete) {
+            # Explicit, visible signal -- not a silent pass. Does not throw:
+            # a closed attempt with an honestly-recorded incomplete
+            # transcript is still better evidence than one that failed to
+            # close at all (see this function's own top-level doc comment).
+            Write-Warning "transcript.txt is INCOMPLETE for attempt '$($Paths.AttemptId)': $($TranscriptCoverage.Reason)"
+        }
     }
     catch {
-        Write-Warning "Failed to stop transcript (may not have been running): $($_.Exception.Message)"
+        Write-Warning "Failed to judge transcript/G7 evidence completeness or write final-status.json: $($_.Exception.Message)"
     }
 
     # 5. Manifest: sha256 of every file now in the attempt directory,
@@ -1151,5 +1419,6 @@ Export-ModuleMember -Function @(
     'Invoke-K8Step',
     'Get-K8LastStep',
     'Add-K8KnowledgeLeak',
+    'Test-K8TranscriptCoverage',
     'Complete-K8Attempt'
 )

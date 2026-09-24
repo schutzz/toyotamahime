@@ -28,6 +28,53 @@ _BIND = re.compile(
     re.M,
 )
 
+# AMEND-005 prospective Range A/B provisioning: the exact 13 protocol-image
+# services replaced by --image-override/--no-build, and the exact digest each
+# must resolve to. Source of truth is protocol/c2-dnp3-range-derivation.md
+# section 2's Range A provisioning command (Range B repeats it verbatim) --
+# this is that closed, explicit set transcribed here, not a generalized
+# ghcr.io/* pattern rule. Update only if that document's own
+# --image-override list changes.
+AMEND_005_IMAGE_OVERRIDES = {
+    "wan_router": "ghcr.io/schutzz/amenonuboco-network-tools@sha256:1b8eb24e78a5b9ec1048e14db69e60a59509dda72dba847a1269a270f5fc01a3",
+    "tap_observer": "ghcr.io/schutzz/amenonuboco-network-tools@sha256:1b8eb24e78a5b9ec1048e14db69e60a59509dda72dba847a1269a270f5fc01a3",
+    "log_structurer": "ghcr.io/schutzz/amenonuboco-network-tools-structurer@sha256:efc9e6a2540ae492bfc646f3ebf59d1dc1e2ccff9c39c1224468b6214253097e",
+    "cc_scada_master": "ghcr.io/schutzz/amenonuboco-dnp3@sha256:d517cbb9e234b69d192b4808c843e0e5a629385566d3b6a88260659ee4785e55",
+    "sub_c_rtu": "ghcr.io/schutzz/amenonuboco-dnp3@sha256:d517cbb9e234b69d192b4808c843e0e5a629385566d3b6a88260659ee4785e55",
+    "sub_b_process_points": "ghcr.io/schutzz/amenonuboco-opcua@sha256:7268abe37e31d601c550f1f5a29e374a5bd7f055f8746f1b4ef4d30b90318afe",
+    "historian": "ghcr.io/schutzz/amenonuboco-opcua@sha256:7268abe37e31d601c550f1f5a29e374a5bd7f055f8746f1b4ef4d30b90318afe",
+    "sub_b_rtu_hmi": "ghcr.io/schutzz/amenonuboco-power-grid-nodered-tools@sha256:13c665ed2532b36dd925b3158809ec38ccdef048fa1d671e0b8815c3bb7a956e",
+    "sub_c_hmi": "ghcr.io/schutzz/amenonuboco-power-grid-nodered-tools@sha256:13c665ed2532b36dd925b3158809ec38ccdef048fa1d671e0b8815c3bb7a956e",
+    "sub_a_ied_02": "ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8",
+    "ups_attacker": "ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8",
+    "sub_d_ied_01": "ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8",
+    "cc_ups": "ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8",
+}
+_SERVICE_IMAGE = re.compile(r"^[ \t]{4,}image:[ \t]+(\S[^\n]*?)[ \t]*$", re.M)
+_SERVICE_BUILD = re.compile(r"^[ \t]{4,}build:", re.M)
+
+
+def _service_block(text, name):
+    """The indented body belonging to one `services:` child by name, or None.
+
+    Services are rendered at 2-space indent immediately under `services:`
+    (stable, machine-written formatting -- see the module docstring); the
+    body is every following line indented 4 or more spaces, or blank.
+    """
+    lines = text.split("\n")
+    heading = "  %s:" % name
+    start = None
+    for i, line in enumerate(lines):
+        if line == heading:
+            start = i
+            break
+    if start is None:
+        return None
+    end = start + 1
+    while end < len(lines) and (lines[end].startswith("    ") or lines[end].strip() == ""):
+        end += 1
+    return "\n".join(lines[start + 1:end])
+
 
 class Check:
     """One acceptance check outcome."""
@@ -104,23 +151,67 @@ def run_workspace_placement(compose, worktree):
 
 
 def compose_build_contexts(compose):
-    """Every build context must resolve, from the Compose file's own directory.
+    """Every build context must resolve; or, if the AMEND-005 published-image
+    path is in use, every one of its 13 protocol-image services must be
+    exactly what protocol/c2-dnp3-range-derivation.md section 2 defines.
 
-    A generated Range A/B Compose file always declares local protocol-image
-    builds, so extracting none of them means the file is empty, truncated, or
-    otherwise unreadable rather than build-free.  That is a failure: an
-    unparseable file must not be able to satisfy this gate.
+    A generated Range A/B Compose file historically always declared local
+    protocol-image builds for those 13 services. AMEND-005 adds a second
+    legitimate shape for them: image-overridden via --image-override/--no-build,
+    each with no `build:` and an `image:` matching its known accepted exact
+    digest. Which shape applies is decided per file, not assumed: if any of
+    the 13 is currently image-only (not building), the whole set is held to
+    the AMEND-005 shape -- a lone straggler still declaring `build:` there is
+    exactly the partial-override failure this exists to catch, not silently
+    passed through the historical path because *a* build context happens to
+    resolve. Otherwise (none of the 13 is image-only -- the pure historical
+    case, or a file naming none of them at all) the original flat check
+    applies unchanged: zero build contexts is never passed unconditionally.
     """
     text = compose.read_text(encoding="utf-8")
-    contexts = _BUILD_SHORT.findall(text) + _BUILD_CONTEXT.findall(text)
-    if not contexts:
+    blocks = {name: _service_block(text, name) for name in AMEND_005_IMAGE_OVERRIDES}
+    amend_005_shape = any(
+        block is not None and not _SERVICE_BUILD.search(block) for block in blocks.values()
+    )
+
+    if not amend_005_shape:
+        contexts = _BUILD_SHORT.findall(text) + _BUILD_CONTEXT.findall(text)
+        if not contexts:
+            return Check("compose build contexts", False,
+                         "no build context could be parsed; a generated Range A/B Compose file always declares them")
+        missing = [c for c in contexts if not (compose.parent / c).resolve().is_dir()]
+        if missing:
+            shown = ", ".join(f"{c} -> {(compose.parent / c).resolve()}" for c in sorted(set(missing)))
+            return Check("compose build contexts", False, f"{len(missing)} unresolved: {shown}")
+        return Check("compose build contexts", True, f"{len(contexts)} contexts resolve")
+
+    missing_service, still_building, wrong_image = [], [], []
+    for name, expected_image in AMEND_005_IMAGE_OVERRIDES.items():
+        block = blocks[name]
+        if block is None:
+            missing_service.append(name)
+            continue
+        if _SERVICE_BUILD.search(block):
+            still_building.append(name)
+            continue
+        image_match = _SERVICE_IMAGE.search(block)
+        got_image = image_match.group(1) if image_match else None
+        if got_image != expected_image:
+            wrong_image.append(f"{name}: {got_image!r} != {expected_image!r}")
+
+    if missing_service or still_building or wrong_image:
+        parts = []
+        if missing_service:
+            parts.append(f"missing service(s): {', '.join(missing_service)}")
+        if still_building:
+            parts.append(f"still declares a build (expected image-override): {', '.join(still_building)}")
+        if wrong_image:
+            parts.append("; ".join(wrong_image))
         return Check("compose build contexts", False,
-                     "no build context could be parsed; a generated Range A/B Compose file always declares them")
-    missing = [c for c in contexts if not (compose.parent / c).resolve().is_dir()]
-    if missing:
-        shown = ", ".join(f"{c} -> {(compose.parent / c).resolve()}" for c in sorted(set(missing)))
-        return Check("compose build contexts", False, f"{len(missing)} unresolved: {shown}")
-    return Check("compose build contexts", True, f"{len(contexts)} contexts resolve")
+                     "no build context; AMEND-005 published-image path check failed -- " + "; ".join(parts))
+    return Check("compose build contexts", True,
+                 f"0 build contexts; all {len(AMEND_005_IMAGE_OVERRIDES)} AMEND-005 protocol-image services "
+                 "resolve to their accepted exact-digest image (published-image path)")
 
 
 def compose_bind_sources(compose):

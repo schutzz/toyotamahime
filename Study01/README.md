@@ -53,26 +53,26 @@ Study01/
 | Shell | **PowerShell 7**. The apparatus rejects other shells at preflight — Git Bash / MSYS rewrites bare in-container paths, which silently breaks capture and sender steps. This is enforced, not advisory. |
 | OS | Windows with Docker Desktop. The original runs used Windows 11. |
 | Docker | Docker Engine with Compose v2 (`docker compose`, not `docker-compose`). |
-| Python | 3.10 or later. `pytest` is required — §3.1's apparatus-integrity check is mandatory, not optional, before you use the apparatus. Range C additionally needs `pydantic` 2.x and `PyYAML`; §4.1 installs them from the validator's own declared requirements. |
+| Python | 3.10 or later. `pytest` is required, pinned to the exact version in [`studies/study-01-negative-result/scripts/tests/requirements.txt`](./studies/study-01-negative-result/scripts/tests/requirements.txt) — §3.1's apparatus-integrity check is mandatory, not optional, before you use the apparatus, and its pass/fail wording below assumes that pinned version. Range C additionally needs `pydantic` 2.x and `PyYAML`; §4.1 installs them from the validator's own declared requirements. |
 | `git` | any recent version |
 
 Record your own versions before you start; the original runs used Python 3.10.11, pydantic 2.12.5, PyYAML 6.0.3.
 
-Install `pytest`, then confirm the apparatus is intact before using it. **You are already at `Study01/`** per §2 — do not prefix any path below with `Study01/` again; that includes the repo-local tools in §3.2, which live at `.\tools\...` from here, not `.\Study01\tools\...`. `Push-Location`/`Pop-Location` below returns you to `Study01/` when it's done, rather than leaving you three directories deeper — important if you continue on to §3.2's tools next, which need to be run from `Study01/`:
+Install pytest from the pinned requirements file, then confirm the apparatus is intact before using it. **You are already at `Study01/`** per §2 — do not prefix any path below with `Study01/` again; that includes the repo-local tools in §3.2, which live at `.\tools\...` from here, not `.\Study01\tools\...`. `Push-Location`/`Pop-Location` below returns you to `Study01/` when it's done, rather than leaving you three directories deeper — important if you continue on to §3.2's tools next, which need to be run from `Study01/`:
 
 <!-- k8-test:id=apparatus-check mode=exec cwd=Study01 -->
 ```powershell
-python -m pip install pytest
+python -m pip install -r studies/study-01-negative-result/scripts/tests/requirements.txt
 Push-Location studies/study-01-negative-result/scripts
 python -m pytest tests -q
 Pop-Location
 ```
 
-69 tests should pass. If they do not, stop and record the failure; do not continue. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (69 passed):
+99 tests should pass. If they do not, stop and record the failure; do not continue. This exact count is machine-checked, not just documented here: `Study01/tools/Test-Study01Packaging.ps1`'s packaging certification runs this same check against this repository's own shipped test suite before every bootstrap release and fails certification if the actual collected/passed count and this paragraph's stated count disagree, so a future apparatus change that adds or removes tests cannot ship without this paragraph being updated in the same commit. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (99 passed):
 
 <!-- k8-test:id=apparatus-check-via-harness mode=exec cwd=Study01 -->
 ```powershell
-.\tools\Invoke-K8Step.ps1 -Description 'install pytest' -Command { python -m pip install pytest }
+.\tools\Invoke-K8Step.ps1 -Description 'install pytest' -Command { python -m pip install -r studies/study-01-negative-result/scripts/tests/requirements.txt }
 .\tools\Invoke-K8Step.ps1 -Description 'apparatus integrity test' -Command { python -m pytest studies/study-01-negative-result/scripts/tests -q }
 ```
 
@@ -88,9 +88,9 @@ This section adds an **optional harness** that automates the bookkeeping around 
 
 <!-- k8-test:id=bootstrap-fetch-verify-run mode=parse cwd=repo-root -->
 ```powershell
-$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v4/bootstrap/Start-Study01.ps1'
+$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v14/bootstrap/Start-Study01.ps1'
 $Dest     = Join-Path $env:TEMP 'Start-Study01.ps1'
-$Expected = '8bc564eda104e058e2d6ef1033c3073f831bbedfe0ff046ceefee13b2c5fccd9'
+$Expected = 'cc6ebf68bbd3a07e227b239de0f0381c3be06d2d981d70bf79583fafff5f2d3f'
 
 Invoke-WebRequest -Uri $Url -OutFile $Dest
 $Actual = (Get-FileHash -Path $Dest -Algorithm SHA256).Hash.ToLower()
@@ -101,7 +101,7 @@ if ($Actual -ne $Expected) {
 & $Dest
 ```
 
-The tag `k8-bootstrap-v4` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. `Start-Study01.ps1` also checks out that same tag by default when it clones Toyotamahime (its `-Ref` parameter defaults to `k8-bootstrap-v4`), so the commit you fetched this script from and the commit your attempt actually reproduces are the same one, even if `main` has moved on by the time you run this. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
+The tag `k8-bootstrap-v14` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. `Start-Study01.ps1` also checks out that same tag by default when it clones Toyotamahime (its `-Ref` parameter defaults to `k8-bootstrap-v14`), so the commit you fetched this script from and the commit your attempt actually reproduces are the same one, even if `main` has moved on by the time you run this. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
 
 **What it executes and where it writes.** `Start-Study01.ps1` creates a new attempt directory under `C:\K8\attempts\<attempt-id>\` (override with `-AttemptRoot`), starts a transcript there, clones `https://github.com/schutzz/toyotamahime` into it, records the exact clone `HEAD`, and captures a small environment record. It writes only under `-AttemptRoot`; it does not touch anything outside it, and it does not send anything over the network beyond the clone itself.
 
@@ -111,14 +111,18 @@ The tag `k8-bootstrap-v4` points at a specific commit in this repository's histo
 
 ```text
 C:\K8\attempts\k8-repro-YYYYMMDD-NNN\
-  transcript.txt             one ordered log, from before the clone onward
+  transcript.txt             best-effort, human-readable aggregate log, from before the
+                              clone onward -- retained, but not what step-level evidence
+                              completeness is proven from; see steps.jsonl / steps-raw/
   attempt.json                \
   repository.json              small, machine-readable identity records
   environment.json            /
-  steps.jsonl                 one line per Invoke-K8Step.ps1 call, with exit codes,
+  steps.jsonl                 one line per Invoke-K8Step.ps1 call: step_index, exit code,
+                               a raw_output path into steps-raw/ (process-independent),
                                a canonical command_identity, and (if an expectation
                                manifest is bound) that step's expectation-binding result
-  steps-raw\NNNN.stdout.log   \  every step's stdout/stderr, captured separately,
+  steps-raw\NNNN.log          this step's own combined stdout/stderr, in step_index order
+  steps-raw\NNNN.stdout.log   \  the same step's stdout/stderr, captured separately,
   steps-raw\NNNN.stderr.log   /  always written (0 bytes is itself a retained fact)
   expectations.jsonl          optional: per-step output expectations, pinned into
                                attempt.json.expectation_manifest_sha256 before the
@@ -126,9 +130,11 @@ C:\K8\attempts\k8-repro-YYYYMMDD-NNN\
   knowledge-leak-log.md        \  Sec6.2 knowledge-leak log, human + machine forms
   knowledge-leak-log.jsonl     /
   stop-reason.txt             written by Stop-K8.ps1
-  final-status.json           outcome, reason, final HEAD/status, and an explicit
-                               knowledge_leak object (leak_count, always present, even
-                               when 0) -- not a Gate K8 verdict
+  final-status.json           outcome, reason, final HEAD/status, transcript_complete
+                               (whether transcript.txt actually covers every step recorded
+                               in steps.jsonl), and an explicit knowledge_leak object
+                               (leak_count, always present, even when 0) -- not a Gate K8
+                               verdict
   manifest.sha256             sha256 of every file above, before archiving
 
 C:\K8\attempts\k8-repro-YYYYMMDD-NNN.zip           the attempt directory, archived
@@ -136,7 +142,7 @@ C:\K8\attempts\k8-repro-YYYYMMDD-NNN.zip.sha256    sha256 of that archive
 C:\K8\attempts\current-attempt.txt                 pointer to the current attempt directory
 ```
 
-**Accepted-authority evidence generation (optional for now).** The step-raw capture, `command_identity`, explicit `knowledge_leak` zero-state, and expectation-manifest binding above implement Kakuriyo's accepted G7 v5 evidence-semantics specification (`studies/study-01-negative-result/G7-GATE-K8-EVIDENCE-SEMANTICS-CLARIFICATION-PROPOSAL.md`, ACCEPTED / AUTHORITY INCORPORATED). Step-raw capture and the `knowledge_leak` object are automatic and always on. The `expectations.jsonl` pre-execution binding is opt-in: pass `-StepPlanPath` to `Start-Study01.ps1` naming a JSON file of per-step `{description, command, output_class, stdout_expectation, stderr_expectation}` records; omitting it leaves this attempt's evidence exactly as before. This README's own step-by-step commands below do not yet ship a pre-authored step plan of their own -- wiring one up, if wanted, is a separate task.
+**Accepted-authority evidence generation (optional for now).** The per-channel step-raw capture, `command_identity`, explicit `knowledge_leak` zero-state, and expectation-manifest binding above implement Kakuriyo's accepted G7 v5 evidence-semantics specification (`studies/study-01-negative-result/G7-GATE-K8-EVIDENCE-SEMANTICS-CLARIFICATION-PROPOSAL.md`, ACCEPTED / AUTHORITY INCORPORATED). Per-channel step-raw capture and the `knowledge_leak` object are automatic and always on, additive to this lineage's own existing combined `steps-raw\NNNN.log` and `transcript_complete` judgement. The `expectations.jsonl` pre-execution binding is opt-in: pass `-StepPlanPath` to `Start-Study01.ps1` naming a JSON file of per-step `{description, command, output_class, stdout_expectation, stderr_expectation}` records; omitting it leaves this attempt's evidence exactly as before. This README's own step-by-step commands below do not yet ship a pre-authored step plan of their own -- wiring one up, if wanted, is a separate task.
 
 **Using it while you follow this README** — every command below runs from `Study01/`, and none of them take an attempt path:
 
@@ -180,27 +186,27 @@ This must print `PACKAGE CERTIFICATION: PASS` and exit `0`, on the commit you ar
 
 Two different pinned commits of the same public repository, `https://github.com/schutzz/ot-range-amenonuboco`.
 
-**Range generation** (Ranges A and B), pinned to `78fc17746b5d663fafec9dffe563d79fe9ea02b7`:
+**Range generation** (Ranges A and B), pinned to `80e550ffeab8daa6583590add490433a0305bb53` (annotated tag `v0.13.5`; the underlying repository publishes it as a Git tag with published GHCR images, not a GitHub Release object). This is the AMEND-005 prospective pin for this K8 candidate — it replaces the historical `v0.12.0` / `78fc17746b5d663fafec9dffe563d79fe9ea02b7` pin that K6/K7 and prior K8 attempts were run against; see `protocol/dependencies.md` §2.2 and `protocol/amendments.md`'s Amendment 005 entry for the exact scope of that change:
 
 <!-- k8-test:id=amenonuboco-range-gen-clone mode=parse cwd=repo-root -->
 ```powershell
 git init amenonuboco-gen
 cd amenonuboco-gen
 git remote add origin https://github.com/schutzz/ot-range-amenonuboco
-git fetch --depth=1 origin 78fc17746b5d663fafec9dffe563d79fe9ea02b7
+git fetch --depth=1 origin 80e550ffeab8daa6583590add490433a0305bb53
 git checkout FETCH_HEAD
 cd ..
 ```
 
-**Contract validation** (Range C), pinned to tag `v0.13.0` = `0378f8a32701b481e030f3db3d5f66ea471a4675`:
+**Contract validation** (Range C), pinned to tag `v0.13.1` = `1d0fa75725078100e9da2e8492ca977ba8e89d95` — a packaging-only patch of `v0.13.0` (`0378f8a32701b481e030f3db3d5f66ea471a4675`) that adds a PEP 263 `# -*- coding: utf-8 -*-` line to `requirements.txt` so `pip` does not need to guess this file's encoding on a non-UTF-8-locale host; the validator's own code, schema, and behavior are unchanged from `v0.13.0` (see `ot-range-amenonuboco`'s `v0.13.1` tag message and the `v0.13.0..v0.13.1` diff, which touches only that one line):
 
 <!-- k8-test:id=amenonuboco-range-c-clone mode=parse cwd=repo-root -->
 ```powershell
-git clone --branch v0.13.0 --depth=1 https://github.com/schutzz/ot-range-amenonuboco amenonuboco-v0.13.0
-python -m pip install -r amenonuboco-v0.13.0/requirements.txt
+git clone --branch v0.13.1 --depth=1 https://github.com/schutzz/ot-range-amenonuboco amenonuboco-v0.13.1
+python -m pip install -r amenonuboco-v0.13.1/requirements.txt
 ```
 
-That installs `pydantic` and `PyYAML` at the versions the validator's own repository declares (`pydantic>=2.0,<3.0`, `PyYAML>=6.0` as of `v0.13.0`) — do not pin different versions here.
+That installs `pydantic` and `PyYAML` at the versions the validator's own repository declares (`pydantic>=2.0,<3.0`, `PyYAML>=6.0` as of `v0.13.1`, unchanged from `v0.13.0`) — do not pin different versions here.
 
 Keep them as two separate checkouts. Do not reuse one for both.
 
@@ -213,17 +219,33 @@ The capture helper is pinned by digest and must be pulled by digest:
 docker pull corfr/tcpdump@sha256:3006b3bd9f041bf73f21e626b97cca5e78fd6ce271549ca95b8e6a508165512b
 ```
 
-Range A and Range B build their service images from the generated Compose file; `protocol/c2-dnp3-image-inventory.md` records what the original runs used. Record the digests you end up with.
+Range A and Range B's 13 protocol-image services use the exact-digest published images pinned in `protocol/c2-dnp3-range-derivation.md` §2 (via `--image-override`, `--no-build`) — they are not built locally. `protocol/c2-dnp3-image-inventory.md` records what the original (locally built) runs used; record the digests you end up with.
 
 ## 5. Running the three ranges
 
 The canonical procedures are in `protocol/`, and they are the authority — this section sequences them and tells you what each step must leave behind. **Where a protocol document gives a literal command, use that command.**
 
+**Where `<run-evidence>` (Range A/B) and `<static-validation-workspace>` (Range C) live.** If you are using §3.2's recorded-attempt harness, their base is `$env:K8_ATTEMPT_DIR`, a sibling of the `toyotamahime\` clone it also creates — not inside the clone:
+
+- Range A: `$env:K8_ATTEMPT_DIR\evidence\main-runs\range-a\<run-id>`
+- Range B: `$env:K8_ATTEMPT_DIR\evidence\main-runs\range-b\<run-id>`
+- Range C: `$env:K8_ATTEMPT_DIR\evidence\static-validations\range-c\<validation-id>`
+
+This fixes only where the evidence root sits relative to the attempt directory; the tree schema beneath it (`main-runs/`, `static-validations/`, and everything under a run or validation ID) is unchanged and is defined in `protocol/evidence-schema.md`. If you are not using the harness, place the same tree wherever you track attempt evidence — the schema, not this base path, is what the apparatus and the protocol documents depend on.
+
 ### 5.1 Range A — the observation-valid control
 
 1. Choose a fresh run ID. Use it as the Compose project name, the run-evidence directory name, and nowhere else. Never reuse one.
 2. Generate the Compose file into a run workspace **exactly one level below the Amenonuboco worktree root** — `protocol/c2-dnp3-range-derivation.md` §2.1 explains why this is load-bearing and what fails if it is not.
-3. Create the empty evidence tree, then run the **execution preflight** (`protocol/c2-dnp3-range-derivation.md` §2.3). It starts no container. Do not provision until it exits 0.
+3. Create the empty evidence tree **with the shipped wrapper**, then run the **execution preflight** (`protocol/c2-dnp3-range-derivation.md` §2.3). Neither starts a container. Do not provision until the preflight exits 0.
+
+<!-- k8-test:id=evidence-tree-create mode=parse cwd=Study01 -->
+```powershell
+python studies/study-01-negative-result/scripts/study01_evidence_tree.py `
+  --run-evidence "$env:K8_ATTEMPT_DIR\evidence\main-runs\range-a\<run-id>"
+```
+
+   Do not hand-build this tree from a directory listing. The wrapper calls the same definition the preflight gate checks against, so the two cannot disagree; it creates **eight** directories, including the two nested capture-export destinations `ground-truth/independent-capture/` and `sensor-input/mirror-capture/` that the capture procedure writes into. A formal attempt that hand-built the six top-level ones was stopped by the gate at 12/13.
 4. Provision, establish readiness, resolve the capture contexts, and start the capture helpers before the event window opens — `protocol/c2-dnp3-capture-procedure.md`.
 5. Place and hash the sender asset, then invoke it **exactly once** through `study01_sender.py` — `protocol/c2-dnp3-sender-procedure.md`. The invocation defines T0, and the frozen window is `[T0 − 5 s, T0 + 15 s]`.
 6. Cover the window, stop and export both captures, decode them, and retain the Collector and Rule queries with their responses and mappings.
@@ -237,7 +259,21 @@ Expected, not forced: Ground Truth / Sensor / Collector Pass, runtime contract P
 
 Identical to Range A, under a **new** run ID, with exactly one difference: before the capture and trigger, delete the ingress qdisc on the interface carrying `10.1.20.254/24`. Resolve that interface by address, never by ordinal.
 
+Its evidence tree is created the same way, under `range-b`: `--run-evidence "$env:K8_ATTEMPT_DIR\evidence\main-runs\range-b\<run-id>"`.
+
 Additionally, Range B must capture and retain the R-OBS-05 unrelated-flow liveness evidence end to end — the contract is `protocol/k6-r-obs-05-collector-query-contract.md`. Without it the run is `Inconclusive experiment`, not `Invalid negative result`.
+
+**Range B runs a third capture stage, `robs05-liveness`** (AMEND-006), alongside `ground-truth` and `sensor` and over the same frozen window. It exists because the two target-event stages are filtered on the target event and structurally cannot retain the unrelated flow R-OBS-05 is evaluated against — a formal attempt failed for exactly that reason. Do not read R-OBS-05 out of the Sensor pcap.
+
+| | R-OBS-05 auxiliary liveness capture |
+| --- | --- |
+| Stage | `robs05-liveness` (Range B only; Range A never runs it) |
+| Observation point | `tap_observer`, `eth0` — the same mirror point the Sensor stage uses |
+| Filter | `host 10.1.10.10 and host 10.1.40.10 and tcp port 20000` (the contract's own §3 selector) |
+| pcap used for correlation | `contract-output/c2-robs05-liveness.pcap` — **not** `sensor-input/mirror-capture/c2-mirror-sensor.pcap` |
+| Lifecycle / context records | `contract-output/robs05-liveness-capture-lifecycle.json`, `contract-output/robs05-liveness-capture-context.json` |
+
+Its `resolve` / `start` / `stop-export` commands are in `protocol/c2-dnp3-capture-procedure.md` §7, run with `--stage robs05-liveness` in the same order and window as the other two stages.
 
 Expected, not forced: Ground Truth Pass; Sensor and Collector Fail; rule output `No alert`; R-OBS-05 Pass; runtime contract Fail; classification `Invalid negative result`.
 
@@ -245,7 +281,7 @@ Expected, not forced: Ground Truth Pass; Sensor and Collector Fail; rule output 
 
 Range C is **never provisioned**. `docker compose up` is not part of this step in any form.
 
-1. Create a disposable worktree from the `v0.13.0` checkout, detached at `0378f8a`, and confirm it is clean **before** placing anything into it.
+1. Create a disposable worktree from the `v0.13.1` checkout, detached at `1d0fa75`, and confirm it is clean **before** placing anything into it.
 2. Derive the negative manifest from the pinned base manifest by the substitution recorded in `experiments/range-c-negative-manifest/` — a segment required by `observability_contract.required_segments` while `instrumentation.exclude` removes it. Preserve the base manifest's own line terminators; the original base is CRLF in the worktree.
 3. Run only `python platform/cli.py validate manifests/power-grid-reference.range-c-negative.yaml`.
 4. Retain the derived manifest, the derivation, the command, stdout, stderr, the exit code, and tool versions as raw bytes without newline translation.

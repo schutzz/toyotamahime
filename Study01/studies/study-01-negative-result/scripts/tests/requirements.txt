@@ -1,0 +1,18 @@
+# Pinned dependency for the §3.1 apparatus-integrity check only.
+#
+# The frozen apparatus and its scientific behaviour (Range A/B/C,
+# scoring, semantics) do not depend on pytest at all -- pytest only
+# runs this test suite as a pre-flight sanity check before you use the
+# apparatus. It is pinned exactly (not a >=/<= range) because pytest's
+# own collection and summary-reporting behaviour (subtest counting in
+# particular) is what the K8-3 apparatus-integrity gate in
+# Study01/README.md §3.1 checks against, and no existing normative
+# source in this repository licenses tolerating a different pytest
+# version's collection/reporting output as an acceptable difference for
+# that gate the way K8-4 §7.2 licenses run-specific differences in
+# Range A/B/C results. Confirmed working against this exact frozen
+# candidate by two independent sources: this file's own resolved
+# version on a clean K8-3 host, and the runtime recorded by the
+# independent review of the commit that last changed this test suite's
+# collected count (AMEND-004 transcription).
+pytest==9.1.1
