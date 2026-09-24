@@ -118,20 +118,31 @@ C:\K8\attempts\k8-repro-YYYYMMDD-NNN\
   repository.json              small, machine-readable identity records
   environment.json            /
   steps.jsonl                 one line per Invoke-K8Step.ps1 call: step_index, exit code,
-                               and a raw_output path into steps-raw/, process-independent
+                               a raw_output path into steps-raw/ (process-independent),
+                               a canonical command_identity, and (if an expectation
+                               manifest is bound) that step's expectation-binding result
   steps-raw\NNNN.log          this step's own combined stdout/stderr, in step_index order
+  steps-raw\NNNN.stdout.log   \  the same step's stdout/stderr, captured separately,
+  steps-raw\NNNN.stderr.log   /  always written (0 bytes is itself a retained fact)
+  expectations.jsonl          optional: per-step output expectations, pinned into
+                               attempt.json.expectation_manifest_sha256 before the
+                               first step runs -- see accepted-authority note below
   knowledge-leak-log.md        \  Sec6.2 knowledge-leak log, human + machine forms
   knowledge-leak-log.jsonl     /
   stop-reason.txt             written by Stop-K8.ps1
-  final-status.json           outcome, reason, final HEAD/status, and transcript_complete
+  final-status.json           outcome, reason, final HEAD/status, transcript_complete
                                (whether transcript.txt actually covers every step recorded
-                               in steps.jsonl) -- not a Gate K8 verdict
+                               in steps.jsonl), and an explicit knowledge_leak object
+                               (leak_count, always present, even when 0) -- not a Gate K8
+                               verdict
   manifest.sha256             sha256 of every file above, before archiving
 
 C:\K8\attempts\k8-repro-YYYYMMDD-NNN.zip           the attempt directory, archived
 C:\K8\attempts\k8-repro-YYYYMMDD-NNN.zip.sha256    sha256 of that archive
 C:\K8\attempts\current-attempt.txt                 pointer to the current attempt directory
 ```
+
+**Accepted-authority evidence generation (optional for now).** The per-channel step-raw capture, `command_identity`, explicit `knowledge_leak` zero-state, and expectation-manifest binding above implement Kakuriyo's accepted G7 v5 evidence-semantics specification (`studies/study-01-negative-result/G7-GATE-K8-EVIDENCE-SEMANTICS-CLARIFICATION-PROPOSAL.md`, ACCEPTED / AUTHORITY INCORPORATED). Per-channel step-raw capture and the `knowledge_leak` object are automatic and always on, additive to this lineage's own existing combined `steps-raw\NNNN.log` and `transcript_complete` judgement. The `expectations.jsonl` pre-execution binding is opt-in: pass `-StepPlanPath` to `Start-Study01.ps1` naming a JSON file of per-step `{description, command, output_class, stdout_expectation, stderr_expectation}` records; omitting it leaves this attempt's evidence exactly as before. This README's own step-by-step commands below do not yet ship a pre-authored step plan of their own -- wiring one up, if wanted, is a separate task.
 
 **Using it while you follow this README** — every command below runs from `Study01/`, and none of them take an attempt path:
 
