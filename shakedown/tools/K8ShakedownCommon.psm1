@@ -4009,14 +4009,14 @@ $script:K8CommandContractSchema = 'k8shakedown-command-contract/1'
 # the identity. Paths are Study01-relative; the resolver joins them to the
 # packaged Study01 root, never to an absolute path (C-9 lesson, kept here too).
 $script:K8FrozenSourceIdentity = @{
-    'README.md'                                                              = '7ce29248f1124071a3db3e7a142cb986bc2286cfe23c2911ae43ea38ce526a66'
+    'README.md'                                                              = '5435e19ebd69cd9d07f07824835f97f3ffbd9e6405b4d8a90eeff87499e471b6'
     'studies/study-01-negative-result/protocol/freeze-decision-table.md'     = 'f90e687275dc0098e4de11377fe7f2ce46eadb494bcc1e1e913a8daf0977801d'
-    'studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md'  = 'ded5e1ea4019e800567b7de3b13215be9f80be5e15e83da83cc6715be24a8fe2'
+    'studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md'  = '51fc89804fa543807630f6a25be2c849fcc5c0116ea9b1fbd8a338a7ca3e579d'
     'studies/study-01-negative-result/protocol/c2-dnp3-step4-range-b-fault-pilot.md' = '563e664ddde408a2136019b8dffe0ca911f5f144e2407aa1dbc15188a4e70d0c'
-    'studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md' = 'ea657a995535414167ecb16c62d6f1897147f1f77745a13d1b52b137fd17a84b'
-    'studies/study-01-negative-result/protocol/c2-dnp3-capture-procedure.md' = '54cf70c6329e71356b394ac4829818eaa8b5c44db49c5c852cb386326c69b80e'
+    'studies/study-01-negative-result/protocol/k6-r-obs-05-collector-query-contract.md' = '66504e3d300dbf5a9396abeccb445c4cebcf3f6883005169a62893d28a4ae270'
+    'studies/study-01-negative-result/protocol/c2-dnp3-capture-procedure.md' = '888e5b455d4d047f278eafe24b1b7df4cc32c1f260953f41895eca4231f293d6'
     'studies/study-01-negative-result/protocol/c2-dnp3-image-inventory.md'   = '9a306601c326f15f8b6d7e80ba2d7933037be322eedb125c546ecb7ef6a35b98'
-    'studies/study-01-negative-result/protocol/evidence-schema.md'           = 'b0c670734f9bab9d925e1591173f1fbe7f85209f84d315e08d5bcd2250f51137'
+    'studies/study-01-negative-result/protocol/evidence-schema.md'           = 'ee9eba1efb785900862201ff0f58ff7c0003d830cd8883a9bf059c1f03e070d7'
     'studies/study-01-negative-result/protocol/c2-dnp3-sender-procedure.md'  = '35b47f7d31973f84273a0283209def0b071614799ba362ee6b3fd105c0799683'
 }
 
@@ -4191,7 +4191,7 @@ $script:K8CommandContract = @(
     @{ step_id = 'F-19'; class = 'F'; ranges = 'ab'
        source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'python'"; call_ordinal = 2
        governing_sources = @((New-K8GoverningSource -Path 'studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md' -Clause 'SS2 provisioning'))
-       argv_shape = @('python','platform/cli.py','provision','manifests/power-grid-reference.yaml','-o','<generated-compose>')
+       argv_shape = @('python','platform/cli.py','provision','manifests/power-grid-reference.yaml','-o','<generated-compose>','--image-override','wan_router=ghcr.io/schutzz/amenonuboco-network-tools@sha256:1b8eb24e78a5b9ec1048e14db69e60a59509dda72dba847a1269a270f5fc01a3','--image-override','tap_observer=ghcr.io/schutzz/amenonuboco-network-tools@sha256:1b8eb24e78a5b9ec1048e14db69e60a59509dda72dba847a1269a270f5fc01a3','--image-override','log_structurer=ghcr.io/schutzz/amenonuboco-network-tools-structurer@sha256:efc9e6a2540ae492bfc646f3ebf59d1dc1e2ccff9c39c1224468b6214253097e','--image-override','cc_scada_master=ghcr.io/schutzz/amenonuboco-dnp3@sha256:d517cbb9e234b69d192b4808c843e0e5a629385566d3b6a88260659ee4785e55','--image-override','sub_c_rtu=ghcr.io/schutzz/amenonuboco-dnp3@sha256:d517cbb9e234b69d192b4808c843e0e5a629385566d3b6a88260659ee4785e55','--image-override','sub_b_process_points=ghcr.io/schutzz/amenonuboco-opcua@sha256:7268abe37e31d601c550f1f5a29e374a5bd7f055f8746f1b4ef4d30b90318afe','--image-override','historian=ghcr.io/schutzz/amenonuboco-opcua@sha256:7268abe37e31d601c550f1f5a29e374a5bd7f055f8746f1b4ef4d30b90318afe','--image-override','sub_b_rtu_hmi=ghcr.io/schutzz/amenonuboco-power-grid-nodered-tools@sha256:13c665ed2532b36dd925b3158809ec38ccdef048fa1d671e0b8815c3bb7a956e','--image-override','sub_c_hmi=ghcr.io/schutzz/amenonuboco-power-grid-nodered-tools@sha256:13c665ed2532b36dd925b3158809ec38ccdef048fa1d671e0b8815c3bb7a956e','--image-override','sub_a_ied_02=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8','--image-override','ups_attacker=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8','--image-override','sub_d_ied_01=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8','--image-override','cc_ups=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8')
        stream_expectation = 'separated'; accepted_exit_codes = @(0)
        exit_note = 'The base manifest path is a frozen literal.' }
 
@@ -4205,7 +4205,7 @@ $script:K8CommandContract = @(
     @{ step_id = 'F-21'; class = 'F'; ranges = 'ab'
        source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'docker'"; call_ordinal = 1
        governing_sources = @((New-K8GoverningSource -Path 'README.md' -Clause 'SS5.1 bring-up'))
-       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','up','-d','--build')
+       argv_shape = @('docker','compose','-p','<run-id>','-f','<compose>','up','-d','--no-build')
        stream_expectation = 'separated'; accepted_exit_codes = @(0)
        exit_note = 'Bring-up. Application readiness is a separate gate (C-06/C-10/C-12..C-16), deliberately not folded into this exit code.' }
 
@@ -7882,7 +7882,7 @@ function Get-K8FrozenCandidateRangeGenCommit {
         throw "C-8: Study01/README.md not found at $readmePath; cannot independently verify the frozen candidate RangeGen pin."
     }
     $readme = Get-Content -LiteralPath $readmePath -Raw
-    if ($readme -notmatch '(?m)^\*\*Range generation\*\* \(Ranges A and B\), pinned to `([0-9a-f]{40})`:') {
+    if ($readme -notmatch '(?m)^\*\*Range generation\*\* \(Ranges A and B\), pinned to `([0-9a-f]{40})`[^\r\n]*:') {
         throw "C-8: Study01/README.md's 'Range generation (Ranges A and B), pinned to ...' line was not found or has changed shape; refusing to guess the frozen candidate RangeGen pin."
     }
     return $Matches[1]
@@ -8083,7 +8083,22 @@ function Invoke-K8ShakedownRangeABBody {
     Set-K8ShakedownRunStage -Stage 'compose-generate'
     Push-Location $WorktreeDir
     try {
-        Invoke-K8ShakedownCommand -StepId 'F-19' -FilePath 'python' -ArgumentList @('platform/cli.py', 'provision', 'manifests/power-grid-reference.yaml', '-o', "manifests/$ComposeFile") `
+        $imageOverrideArgs = @(
+            '--image-override', 'wan_router=ghcr.io/schutzz/amenonuboco-network-tools@sha256:1b8eb24e78a5b9ec1048e14db69e60a59509dda72dba847a1269a270f5fc01a3',
+            '--image-override', 'tap_observer=ghcr.io/schutzz/amenonuboco-network-tools@sha256:1b8eb24e78a5b9ec1048e14db69e60a59509dda72dba847a1269a270f5fc01a3',
+            '--image-override', 'log_structurer=ghcr.io/schutzz/amenonuboco-network-tools-structurer@sha256:efc9e6a2540ae492bfc646f3ebf59d1dc1e2ccff9c39c1224468b6214253097e',
+            '--image-override', 'cc_scada_master=ghcr.io/schutzz/amenonuboco-dnp3@sha256:d517cbb9e234b69d192b4808c843e0e5a629385566d3b6a88260659ee4785e55',
+            '--image-override', 'sub_c_rtu=ghcr.io/schutzz/amenonuboco-dnp3@sha256:d517cbb9e234b69d192b4808c843e0e5a629385566d3b6a88260659ee4785e55',
+            '--image-override', 'sub_b_process_points=ghcr.io/schutzz/amenonuboco-opcua@sha256:7268abe37e31d601c550f1f5a29e374a5bd7f055f8746f1b4ef4d30b90318afe',
+            '--image-override', 'historian=ghcr.io/schutzz/amenonuboco-opcua@sha256:7268abe37e31d601c550f1f5a29e374a5bd7f055f8746f1b4ef4d30b90318afe',
+            '--image-override', 'sub_b_rtu_hmi=ghcr.io/schutzz/amenonuboco-power-grid-nodered-tools@sha256:13c665ed2532b36dd925b3158809ec38ccdef048fa1d671e0b8815c3bb7a956e',
+            '--image-override', 'sub_c_hmi=ghcr.io/schutzz/amenonuboco-power-grid-nodered-tools@sha256:13c665ed2532b36dd925b3158809ec38ccdef048fa1d671e0b8815c3bb7a956e',
+            '--image-override', 'sub_a_ied_02=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8',
+            '--image-override', 'ups_attacker=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8',
+            '--image-override', 'sub_d_ied_01=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8',
+            '--image-override', 'cc_ups=ghcr.io/schutzz/amenonuboco-power-grid-python-tools@sha256:9c55fa6c07ac76e75575826c03902a2335e1783dbdee07abc62fce8837e81cd8'
+        )
+        Invoke-K8ShakedownCommand -StepId 'F-19' -FilePath 'python' -ArgumentList (@('platform/cli.py', 'provision', 'manifests/power-grid-reference.yaml', '-o', "manifests/$ComposeFile") + $imageOverrideArgs) `
             -Description "generate Range $($Range.ToUpper()) Compose file"
     }
     finally { Pop-Location }
@@ -8125,7 +8140,7 @@ function Invoke-K8ShakedownRangeABBody {
     # scientific evidence tree as a per-run Shakedown runtime/debug log.
     Set-K8ShakedownRunStage -Stage 'provision'
     $buildLog = Join-Path $state.shakedown_root "runtime-logs\$RunId\docker-compose-up-build.log"
-    Invoke-K8ShakedownLoggedCommand -StepId 'F-21' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'up', '-d', '--build') `
+    Invoke-K8ShakedownLoggedCommand -StepId 'F-21' -FilePath 'docker' -ArgumentList @('compose', '-p', $RunId, '-f', $ComposePath, 'up', '-d', '--no-build') `
         -LogPath $buildLog -Description "provision Range $($Range.ToUpper())" | Out-Null
 
     # 4a. Environment readiness: wait for every defined service to report a

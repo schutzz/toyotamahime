@@ -247,7 +247,7 @@ Assert-K8Test 'RangeGenCommit is a declared K8-S2 execution-only override, disti
     # unnoticed.
     $readme = Get-Content (Join-Path $Study01 'README.md') -Raw
     $common = Get-Content (Join-Path $ToolsDir 'K8ShakedownCommon.psm1') -Raw
-    $candidatePin = '78fc17746b5d663fafec9dffe563d79fe9ea02b7'
+    $candidatePin = '80e550ffeab8daa6583590add490433a0305bb53'
     $executionOverridePin = '16ec5a00d99efd26ddddfbbdb47712866861386f'
     if ($readme -notlike "*$candidatePin*") { throw "candidate range-gen pin '$candidatePin' not found in Study01/README.md" }
     if ($common -notlike "*$executionOverridePin*") { throw "K8-S2 execution-only override pin '$executionOverridePin' not found in K8ShakedownCommon.psm1's RangeGenCommit" }
@@ -259,7 +259,7 @@ Assert-K8Test 'RangeGenCommit is a declared K8-S2 execution-only override, disti
 # Reproduces the REAL Range A termination observed under the K8-S2
 # execution-only override: study01_preflight.py's frozen worktree_git()
 # check fails ONLY because the worktree sits at RangeGenCommit
-# (3d8ca2d...) instead of Study01/README.md's candidate pin (78fc177...) --
+# (16ec5a0...) instead of Study01/README.md's candidate pin (80e550f...) --
 # every other check passes. F-20's accepted_exit_codes now includes 1, so
 # these tests exercise Assert-K8ExecutionOverridePreflightAcceptance
 # directly: it must accept EXACTLY that one shape and fail closed on every
@@ -275,7 +275,7 @@ function New-K8SyntheticPreflightLines {
        'worktree git usable' line and its PASS/FAIL swappable for each test. #>
     param(
         [bool] $WorktreeOk = $false,
-        [string] $WorktreeDetail = 'worktree is at 16ec5a00d99efd26ddddfbbdb47712866861386f, frozen baseline is 78fc17746b5d663fafec9dffe563d79fe9ea02b7'
+        [string] $WorktreeDetail = 'worktree is at 16ec5a00d99efd26ddddfbbdb47712866861386f, frozen baseline is 80e550ffeab8daa6583590add490433a0305bb53'
     )
     $names = @(
         'canonical shell', 'container path probes', 'worktree git usable', 'run workspace placement',
@@ -316,7 +316,7 @@ Assert-K8Test 'Assert-K8ExecutionOverridePreflightAcceptance: the REAL K8-S2 ove
     $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
     if ($record.failed_check_name -ne 'worktree git usable') { throw "record failed_check_name = '$($record.failed_check_name)'" }
     if ($record.observed_worktree_head -ne '16ec5a00d99efd26ddddfbbdb47712866861386f') { throw "record observed_worktree_head = '$($record.observed_worktree_head)'" }
-    if ($record.frozen_candidate_pin -ne '78fc17746b5d663fafec9dffe563d79fe9ea02b7') { throw "record frozen_candidate_pin = '$($record.frozen_candidate_pin)'" }
+    if ($record.frozen_candidate_pin -ne '80e550ffeab8daa6583590add490433a0305bb53') { throw "record frozen_candidate_pin = '$($record.frozen_candidate_pin)'" }
     if ($record.total_checks -ne 13 -or $record.pass_count -ne 12) { throw "record total_checks/pass_count = $($record.total_checks)/$($record.pass_count)" }
     if ($record.schema -ne 'k8shakedown-execution-override-acceptance/1') { throw "unexpected schema '$($record.schema)'" }
     Remove-Item -LiteralPath $recordPath -Force
@@ -360,7 +360,7 @@ Assert-K8Test 'Assert-K8ExecutionOverridePreflightAcceptance: the single failure
 
 Assert-K8Test 'Assert-K8ExecutionOverridePreflightAcceptance: worktree HEAD not at the authorized override commit is fail-closed (a real, unrelated drift must still STOP)' {
     $run = New-K8TestRun
-    $result = [pscustomobject]@{ ExitCode = 1; Output = (New-K8SyntheticPreflightLines -WorktreeOk $false -WorktreeDetail 'worktree is at 1111111111111111111111111111111111111111, frozen baseline is 78fc17746b5d663fafec9dffe563d79fe9ea02b7') }
+    $result = [pscustomobject]@{ ExitCode = 1; Output = (New-K8SyntheticPreflightLines -WorktreeOk $false -WorktreeDetail 'worktree is at 1111111111111111111111111111111111111111, frozen baseline is 80e550ffeab8daa6583590add490433a0305bb53') }
     $threw = $false
     try { Assert-K8ExecutionOverridePreflightAcceptance -Run $run -Argv @('python') -CommandResult $result }
     catch { $threw = $true; if ($_.Exception.Message -notmatch 'is not the authorized K8-S2 override commit') { throw "wrong rejection reason: $($_.Exception.Message)" } }
@@ -629,12 +629,12 @@ Assert-K8Test 'image row resolution rejects substring ambiguity, missing rows, d
     if (-not $stopped) { throw 'invalid image JSON did not STOP' }
 }
 
-Assert-K8Test 'compose build output is redirected to a per-run runtime log with failure-only bounded tail' {
+Assert-K8Test 'compose up output is redirected to a per-run runtime log with failure-only bounded tail' {
     foreach ($needle in @('Invoke-K8ShakedownLoggedCommand', '*> $LogPath', '-Tail $FailureTailLines', 'runtime-logs\$RunId\docker-compose-up-build.log')) {
         if ($commonSource -notlike "*$needle*") { throw "quiet build logging marker missing: $needle" }
     }
-    $upCall = [regex]::Match($commonSource, "Invoke-K8ShakedownLoggedCommand[^\r\n]+[\s\S]{0,300}?'up', '-d', '--build'")
-    if (-not $upCall.Success) { throw 'docker compose up --build is not routed through the quiet logged command' }
+    $upCall = [regex]::Match($commonSource, "Invoke-K8ShakedownLoggedCommand[^\r\n]+[\s\S]{0,300}?'up', '-d', '--no-build'")
+    if (-not $upCall.Success) { throw 'docker compose up --no-build is not routed through the quiet logged command' }
 }
 
 Assert-K8Test 'Elasticsearch request uses old-curl-compatible single request status/body separation' {
@@ -1809,7 +1809,7 @@ Assert-K8Test 'Test-K8ShakedownNetworkPreflight never calls network rm/prune, an
     }
     $rangeAbBody = Get-K8FunctionBodyText -Path $CommonPath -Name 'Invoke-K8ShakedownRangeABBody'
     $preflightCallIndex = $rangeAbBody.IndexOf('Test-K8ShakedownNetworkPreflight -RunId')
-    $upCallIndex = $rangeAbBody.IndexOf("'up', '-d', '--build'")
+    $upCallIndex = $rangeAbBody.IndexOf("'up', '-d', '--no-build'")
     if ($preflightCallIndex -lt 0) { throw 'Test-K8ShakedownNetworkPreflight is not called from Invoke-K8ShakedownRangeAB' }
     if ($upCallIndex -lt 0) { throw 'could not locate the docker compose up call site' }
     if ($preflightCallIndex -gt $upCallIndex) { throw 'the network preflight runs AFTER docker compose up -- it must run BEFORE, or it cannot prevent the pool-overlap failure it exists to catch' }
@@ -2800,13 +2800,15 @@ Assert-K8Test 'Frozen SS5 contract reference is retained and identifies the exac
     finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
-Assert-K8Test 'Frozen apparatus is untouched: CAPTURE_FILTER, its enforcement, and the two-stage capture set are unchanged' {
+Assert-K8Test 'Frozen target apparatus is untouched: CAPTURE_FILTER, its enforcement, and the two-stage target capture set are unchanged' {
     $apparatus = Get-Content (Join-Path $Study01 'studies\study-01-negative-result\scripts\study01\frozen\apparatus.py') -Raw
     if ($apparatus -notmatch [regex]::Escape('CAPTURE_FILTER = "host 10.1.20.11 and host 10.1.10.10 and tcp port 20000"')) { throw 'the frozen CAPTURE_FILTER changed' }
-    foreach ($stage in @('"ground-truth"', '"sensor"')) { if ($apparatus -notmatch [regex]::Escape($stage)) { throw "frozen capture stage missing: $stage" } }
-    if ($apparatus -match 'r-obs-05' -or $apparatus -match 'liveness') { throw 'the auxiliary capture must NOT have been added to the frozen apparatus as a third scientific stage' }
+    $targetStageBlock = [regex]::Match($apparatus, '(?s)CAPTURE_STAGES\s*=\s*\{(.*?)\n\}').Groups[1].Value
+    foreach ($stage in @('"ground-truth"', '"sensor"')) { if ($targetStageBlock -notmatch [regex]::Escape($stage)) { throw "frozen target capture stage missing: $stage" } }
+    if ($targetStageBlock -match 'robs05-liveness') { throw 'the auxiliary capture was added to CAPTURE_STAGES as a third target-event stage' }
+    if ($apparatus -notmatch 'AUXILIARY_CAPTURE_STAGES' -or $apparatus -notmatch '"robs05-liveness"') { throw 'the accepted separate auxiliary liveness stage is missing' }
     $lifecycle = Get-Content (Join-Path $Study01 'studies\study-01-negative-result\scripts\study01\capture_lifecycle.py') -Raw
-    if ($lifecycle -notmatch [regex]::Escape('raise CaptureLifecycleError("capture filter is not the frozen filter")')) { throw 'the frozen filter enforcement was weakened' }
+    if ($lifecycle -notmatch [regex]::Escape('raise CaptureLifecycleError("capture filter is not the frozen filter for this stage")')) { throw 'the stage-specific frozen filter enforcement was weakened' }
 }
 
 # --- 26. Range B fault-boundary evidence retention --------------------------
