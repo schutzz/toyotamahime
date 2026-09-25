@@ -354,14 +354,14 @@ never be confused, and Shakedown never writes into `C:\K8\attempts\`.
 
 `Study01/studies/study-01-negative-result` evidence
 (`k8-repro-20260828-001-v4` in Kakuriyo) recorded
-`pip install -r amenonuboco-v0.13.0/requirements.txt` failing with
+Historical `pip install -r amenonuboco-v0.13.0/requirements.txt` failed with
 `UnicodeDecodeError: 'cp932' codec can't decode byte 0x81 in position 39` on
 clean Windows. This was root-caused (not assumed) against the real pinned
 `requirements.txt` and the real `pip 23.0.1` recorded in that evidence: pip
 23.0.1's requirements-file decoder falls back straight to
 `locale.getpreferredencoding(False)` with no UTF-8 attempt when a file has
 neither a BOM nor a PEP263 `# coding:` line, and that call returns `cp932` on
-a Japanese-locale Windows host. Setting `PYTHONUTF8=1` makes that same call
+a Japanese-locale Windows host. Setting `PYTHONUTF8=1` made that historical call
 return `UTF-8` instead, on any pip version, without upgrading pip and without
 touching Amenonuboco's `requirements.txt` or its pin.
 
@@ -369,7 +369,9 @@ Verified end to end on a real Japanese-locale Windows host, with the real
 `amenonuboco-v0.13.0/requirements.txt` bytes and a real `pip 23.0.1`: the
 unmodified `pip install -r requirements.txt` fails with the exact recorded
 error without the fix, and succeeds (resolving `pydantic`/`PyYAML` from the
-unmodified file) with `PYTHONUTF8=1` set. See
+unmodified file) with `PYTHONUTF8=1` set. The accepted `v0.13.1` dependency
+adds its own UTF-8 coding declaration, so current Shakedown no longer sets
+`PYTHONUTF8`. See
 `Install-K8RangeCDependencies` in `tools/K8ShakedownCommon.psm1` for the
 implementation and full reasoning, and
 `tests/Test-K8ShakedownRegression.ps1` for the regression test.

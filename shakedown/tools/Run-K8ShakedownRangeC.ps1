@@ -65,7 +65,7 @@ Set-K8ShakedownRunEvidence -Path $RunEvidence | Out-Null
 
 Write-K8ShakedownLog -Level STEP -Message "=== Shakedown Range C starting: $RunId ==="
 
-# 1. Disposable worktree copied from the pinned v0.13.0 checkout; confirm clean before use.
+# 1. Disposable worktree copied from the pinned v0.13.1 checkout; confirm clean before use.
 Set-K8ShakedownRunStage -Stage 'source-worktree-check'
 $rangeCSource = $state.amenonuboco_rangec_dir
 $disposable = Join-Path $state.shakedown_root "runs\$RunId\worktree"

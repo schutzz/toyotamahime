@@ -47,22 +47,14 @@ if (Test-Path $script:K8AttemptCommonPath) {
 # ---------------------------------------------------------------------------
 # Pinned constants (copied verbatim from Study01/README.md SS4.1/4.2 and
 # Study01/studies/study-01-negative-result/protocol/c2-dnp3-range-derivation.md,
-# c2-dnp3-sender-procedure.md, c2-dnp3-capture-procedure.md) -- with ONE named
-# exception: RangeGenCommit. Study01/ is the frozen/candidate scientific tree
-# and must stay byte-identical to the authorized candidate (K8-S2 delegated
-# source identity), so it is not re-copied every time the Shakedown execution
-# tooling's own Amenonuboco runtime dependency moves. RangeGenCommit is a
-# K8-S2 execution-only runtime override (currently the bullseye snapshot apt
-# fix) and is intentionally allowed to differ from Study01/README.md's pin;
-# see Test-K8ShakedownRegression.ps1's "Pinned Amenonuboco/tcpdump values
-# match Study01/README.md" test for how that divergence is checked.
+# c2-dnp3-sender-procedure.md, c2-dnp3-capture-procedure.md).
 # ---------------------------------------------------------------------------
 
 $script:K8Shakedown = @{
     AmenonubocoUrl              = 'https://github.com/schutzz/ot-range-amenonuboco'
-    RangeGenCommit               = '16ec5a00d99efd26ddddfbbdb47712866861386f'   # K8-S2 execution-only runtime override (v0.12.0 + bullseye snapshot apt fix + tap_observer quote-collision fix); intentionally NOT copied from Study01/README.md, see note above
-    RangeCTag                    = 'v0.13.0'
-    RangeCCommit                 = '0378f8a32701b481e030f3db3d5f66ea471a4675'   # Range C validator
+    RangeGenCommit               = '80e550ffeab8daa6583590add490433a0305bb53'   # Range A/B accepted AMEND-005 dependency
+    RangeCTag                    = 'v0.13.1'
+    RangeCCommit                 = '1d0fa75725078100e9da2e8492ca977ba8e89d95'   # Range C validator
     TcpdumpImage                 = 'corfr/tcpdump'
     TcpdumpDigest                = 'sha256:3006b3bd9f041bf73f21e626b97cca5e78fd6ce271549ca95b8e6a508165512b'
     SenderAssetSha256            = '093FEFD5F1F36D715AAE4D7AB91DBAD2D7A93BFE212705D721C95B356A7C053B'
@@ -208,7 +200,6 @@ $script:K8CompletionSchema         = 'k8shakedown-completion/1'
 $script:K8RangeCEnvironmentSchema  = 'k8shakedown-range-c-environment/1'
 $script:K8DeviationCandidateSchema = 'k8shakedown-deviation-candidates/1'
 $script:K8SourceIdentitySchema     = 'k8shakedown-source-identity/1'
-$script:K8ExecutionOverrideAcceptanceSchema = 'k8shakedown-execution-override-acceptance/1'
 # criterion 4: the completion record's `stage` is ONE token in every range.
 # "the terminal stage name" is not one value -- Range A/B end at
 # 'finalize-identity-snapshot' and Range C at 'completeness-gate' -- so a field
@@ -237,7 +228,6 @@ function Get-K8RunProvenancePath { param([Parameter(Mandatory)][string] $RunId) 
 function Get-K8TerminationRecordPath { param([Parameter(Mandatory)][string] $RunId) Join-Path (Get-K8RunRecordDir -RunId $RunId) 'termination.json' }
 function Get-K8CompletionRecordPath { param([Parameter(Mandatory)][string] $RunId) Join-Path (Get-K8RunRecordDir -RunId $RunId) 'completion.json' }
 function Get-K8SourceIdentityPath { param([Parameter(Mandatory)][string] $SequenceId) Join-Path (Get-K8SequenceDir) "$SequenceId.source-identity.json" }
-function Get-K8ExecutionOverrideAcceptancePath { param([Parameter(Mandatory)][string] $RunId) Join-Path (Get-K8RunRecordDir -RunId $RunId) 'execution-override-acceptance.json' }
 
 function Get-K8UtcNow { (Get-Date).ToUniversalTime().ToString('o') }
 
@@ -4199,8 +4189,8 @@ $script:K8CommandContract = @(
        source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'python'"; call_ordinal = 3
        governing_sources = @((New-K8GoverningSource -Path 'README.md' -Clause 'SS5.1 preflight'))
        argv_shape = @('python','<study01-preflight>','--run-id','<run-id>','--worktree','<worktree>','--compose','<compose>','--run-evidence','<run-evidence>','--project-name','<run-id>','--teardown-target','<run-id>','--shell-probe','<shell-version>','--path-probe','/study/traffic/send_direct_operate.py','/data/c2-original-path.pcap','/data/c2-mirror-sensor.pcap')
-       stream_expectation = 'separated'; accepted_exit_codes = @(0, 1)
-       exit_note = 'exit 1 is a MEASURED, not unconditionally accepted, outcome (same pattern as F-35/C-65): Invoke-K8ShakedownRangeABBody calls Assert-K8ExecutionOverridePreflightAcceptance immediately after this row returns, which re-parses the frozen preflight''s own structured stdout and fails closed (throws) unless the narrow K8-S2 execution-only RangeGen override shape holds exactly -- see that function''s docstring. The three --path-probe values are frozen IN-CONTAINER paths, not host paths.' }
+       stream_expectation = 'separated'; accepted_exit_codes = @(0)
+       exit_note = 'The preflight must pass naturally against the accepted RangeGen pin. The three --path-probe values are frozen IN-CONTAINER paths, not host paths.' }
 
     @{ step_id = 'F-21'; class = 'F'; ranges = 'ab'
        source_file = 'K8ShakedownCommon.psm1'; producer_scope = 'Invoke-K8ShakedownRangeABBody'; callee = "'docker'"; call_ordinal = 1
@@ -5852,51 +5842,14 @@ function Assert-K8PinnedCommit {
     Write-K8ShakedownLog -Message "$Label pinned-commit check PASS ($actual)"
 }
 
-# ---------------------------------------------------------------------------
-# The cp932 dependency-decode fix
-#
-# Root cause (verified against the real pinned artifacts, not assumed):
-#   - amenonuboco-v0.13.0/requirements.txt is UTF-8 text with Japanese comment
-#     lines, no BOM, and no PEP263 `# coding:` declaration on either of its
-#     first two lines.
-#   - pip 23.0.1's requirements-file decoder (pip/_internal/utils/encoding.py,
-#     auto_decode()) checks only for a BOM or a PEP263 comment; failing both,
-#     it decodes straight to locale.getpreferredencoding(False) with NO UTF-8
-#     attempt at all. On a Japanese-locale Windows host that is cp932, and
-#     cp932 cannot decode the file's UTF-8 multi-byte sequences.
-#   - Newer pip (the vendored req_file._decode_req_file added after 23.0.1)
-#     tries UTF-8 first and only falls back to the locale encoding on
-#     UnicodeDecodeError, which is why this does not reproduce on every pip.
-#   - Setting the environment variable PYTHONUTF8=1 makes CPython's own
-#     locale.getpreferredencoding(False) return 'UTF-8' regardless of pip
-#     version or OS locale (verified: sys.flags.utf8_mode true => this call
-#     returns 'UTF-8'), which fixes pip's decode without upgrading pip and
-#     without touching Amenonuboco or its requirements.txt in any way.
-#   - Reproduced and the fix confirmed end-to-end with pip 23.0.1 (the exact
-#     version recorded in evidence/reproduction/k8-repro-20260828-001-v4's
-#     environment.json) against the real requirements.txt bytes, on a host
-#     whose default locale.getpreferredencoding(False) is itself cp932:
-#     without PYTHONUTF8=1 it fails with the exact observed
-#     "'cp932' codec can't decode byte 0x81 in position 39" error; with it,
-#     `pip install --dry-run -r requirements.txt` resolves pydantic and PyYAML
-#     cleanly.
-# ---------------------------------------------------------------------------
-
 function Install-K8RangeCDependencies {
     param([Parameter(Mandatory)][string] $RequirementsPath)
     if (-not (Test-Path $RequirementsPath)) {
         throw "Range C requirements file not found: $RequirementsPath"
     }
-    $previous = $env:PYTHONUTF8
-    try {
-        $env:PYTHONUTF8 = '1'
-        Write-K8ShakedownLog -Message "Installing Range C dependencies with PYTHONUTF8=1 (cp932 decode fix) from $RequirementsPath"
-        Invoke-K8ShakedownCommand -StepId 'C-45' -FilePath 'python' -ArgumentList @('-m', 'pip', 'install', '-r', $RequirementsPath) `
-            -Description 'Range C validator dependencies (locale-safe decode)'
-    }
-    finally {
-        if ($null -eq $previous) { Remove-Item Env:\PYTHONUTF8 -ErrorAction SilentlyContinue } else { $env:PYTHONUTF8 = $previous }
-    }
+    Write-K8ShakedownLog -Message "Installing Range C dependencies from the v0.13.1 requirements file with its own UTF-8 coding declaration: $RequirementsPath"
+    Invoke-K8ShakedownCommand -StepId 'C-45' -FilePath 'python' -ArgumentList @('-m', 'pip', 'install', '-r', $RequirementsPath) `
+        -Description 'Range C validator dependencies'
 }
 
 # ---------------------------------------------------------------------------
@@ -7820,198 +7773,6 @@ function Test-K8ScoringInputArtifactCompleteness {
     Assert-K8RunArtifactCompleteness -Range $Range -RunEvidence $RunEvidence
 }
 
-# ---------------------------------------------------------------------------
-# K8-S2 execution-only RangeGen override acceptance (Range A/B preflight,
-# F-20). Batch: 2026-09-13, per explicit human specification.
-#
-# Study01/'s frozen study01_preflight.py::worktree_git() requires the
-# Amenonuboco Range A/B worktree to sit EXACTLY at Study01/README.md's own
-# candidate RangeGen pin (SS4.1). K8ShakedownCommon.psm1's OWN RangeGenCommit
-# is a deliberate, documented K8-S2 execution-only runtime override of that
-# same worktree (see the note above $script:K8Shakedown) -- so under that
-# override, F-20 is now STRUCTURALLY guaranteed to fail that one check, every
-# time. That is a designed-in conflict between two frozen facts, not a
-# tooling defect, and study01_preflight.py is never touched to "fix" it:
-# Study01/ is out of scope, and its exit code / check semantics are exactly
-# what a REAL candidate-pin drift must also trip.
-#
-# What follows is NOT "accept exit 1 from F-20." F-20's accepted_exit_codes
-# below is widened to (0, 1) -- the same measured-non-zero pattern already
-# used at F-35/C-65 -- but Invoke-K8ShakedownRangeABBody calls
-# Assert-K8ExecutionOverridePreflightAcceptance immediately afterward, which
-# re-parses the frozen preflight's OWN structured stdout and fails closed
-# (throws a C-8-shaped exception, same as any other exit-domain violation)
-# unless ALL of the following measured facts hold:
-#   - exactly 13 checks ran and the summary line reports exactly 12 PASS
-#   - exactly 1 check reports FAIL, and its name is 'worktree git usable'
-#   - that check's own reported worktree HEAD equals the one commit this
-#     override is authorized for (16ec5a00d99efd26ddddfbbdb47712866861386f)
-#   - that check's own reported frozen baseline equals Study01/README.md's
-#     OWN candidate RangeGen pin -- read fresh from the document on every
-#     call, never duplicated here as a second unpinned literal
-#   - the module's configured RangeGenCommit equals that same authorized
-#     override commit
-# A different failing check, more than one failure, a worktree at neither
-# pinned commit, a missing/garbled summary line, or RangeGenCommit pointing
-# somewhere else -- any of these is fail-closed, exactly as if this whole
-# override did not exist.
-#
-# Acceptance is retained as a control-plane record
-# (run-records/<run_id>/execution-override-acceptance.json), never inside the
-# scientific evidence tree: it documents a TOOLING decision about which
-# frozen gate outcome was expected and why, not a scientific observation of
-# the study apparatus.
-# ---------------------------------------------------------------------------
-
-function Get-K8FrozenCandidateRangeGenCommit {
-    <#
-        Study01/README.md's OWN candidate RangeGen pin (SS4.1: "**Range
-        generation** (Ranges A and B), pinned to `<sha>`:"), read fresh on
-        every call. Never duplicated as a literal in this module: K8-S2's
-        RangeGenCommit is a DIFFERENT, deliberately divergent pin (see the
-        note above $script:K8Shakedown), and Test-K8ShakedownRegression.ps1
-        already asserts this module's own source text never carries the
-        candidate pin. This function exists only so
-        Assert-K8ExecutionOverridePreflightAcceptance can cross-check the
-        frozen preflight's OWN reported "frozen baseline" against Study01's
-        document itself, instead of trusting the preflight's stdout as its
-        own confirmation of itself.
-    #>
-    $readmePath = Get-K8FrozenSourcePath -RelativePath 'README.md'
-    if (-not (Test-Path -LiteralPath $readmePath)) {
-        throw "C-8: Study01/README.md not found at $readmePath; cannot independently verify the frozen candidate RangeGen pin."
-    }
-    $readme = Get-Content -LiteralPath $readmePath -Raw
-    if ($readme -notmatch '(?m)^\*\*Range generation\*\* \(Ranges A and B\), pinned to `([0-9a-f]{40})`[^\r\n]*:') {
-        throw "C-8: Study01/README.md's 'Range generation (Ranges A and B), pinned to ...' line was not found or has changed shape; refusing to guess the frozen candidate RangeGen pin."
-    }
-    return $Matches[1]
-}
-
-function ConvertFrom-K8PreflightCheckLines {
-    <#
-        Parses study01_preflight.py's own frozen output shape -- one line per
-        check, `[PASS] <name>: <detail>` or `[FAIL] <name>: <detail>` (see
-        Study01/studies/study-01-negative-result/scripts/study01/preflight.py
-        Check.__repr__), plus its trailing `K5 execution preflight: P/T PASS`
-        summary line. Never modifies or re-implements the frozen checks
-        themselves; only reads their already-fixed text shape. Every check
-        name observed by this parser so far contains no colon, so `name:
-        detail` splits unambiguously on the first ': '.
-    #>
-    param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]] $Lines)
-    $checks = @()
-    foreach ($line in $Lines) {
-        if ($line -match '^\[(PASS|FAIL)\] ([^:]+): (.*)$') {
-            $checks += [pscustomobject]@{ Name = $Matches[2]; Ok = ($Matches[1] -eq 'PASS'); Detail = $Matches[3] }
-        }
-    }
-    $summary = $null
-    foreach ($line in $Lines) {
-        if ($line -match '^K5 execution preflight: (\d+)/(\d+) PASS$') {
-            $summary = [pscustomobject]@{ PassCount = [int]$Matches[1]; TotalCount = [int]$Matches[2] }
-        }
-    }
-    return [pscustomobject]@{ Checks = @($checks); Summary = $summary }
-}
-
-function Assert-K8ExecutionOverridePreflightAcceptance {
-    <#
-        Called immediately after F-20 (study01_preflight.py) returns, for
-        BOTH Range A and Range B (Invoke-K8ShakedownRangeABBody is shared).
-        Exit 0 passes through untouched -- no override was needed. Any exit
-        other than 0 or 1 already threw inside Invoke-K8ShakedownCommand
-        (F-20's accepted_exit_codes is (0, 1)); nothing else reaches here.
-
-        Exit 1 is fail-closed UNLESS the frozen preflight's own structured
-        output is EXACTLY the one shape the K8-S2 execution-only RangeGen
-        override is authorized to produce. See the banner comment above this
-        function for the full condition list. This is a narrow, measured
-        exception to one frozen gate's exit code -- never a relaxation of
-        study01_preflight.py itself, which this change does not modify.
-    #>
-    param(
-        [Parameter(Mandatory)] $Run,
-        [Parameter(Mandatory)][string[]] $Argv,
-        [Parameter(Mandatory)] $CommandResult
-    )
-    if ($CommandResult.ExitCode -eq 0) { return }
-
-    # The ONE commit this override is authorized for. Deliberately a SEPARATE
-    # literal from $C.RangeGenCommit below, not read from it: a future
-    # RangeGenCommit change must not silently widen what this narrow
-    # acceptance path accepts.
-    $authorizedOverrideCommit = '16ec5a00d99efd26ddddfbbdb47712866861386f'
-
-    $C = Get-K8ShakedownConstants
-    $parsed = ConvertFrom-K8PreflightCheckLines -Lines @($CommandResult.Output)
-    $failed = @($parsed.Checks | Where-Object { -not $_.Ok })
-    $reasons = @()
-    $observedHead = $null
-    $observedBaseline = $null
-
-    if ($null -eq $parsed.Summary) {
-        $reasons += "no 'K5 execution preflight: P/T PASS' summary line found in F-20's output"
-    }
-    else {
-        if ($parsed.Summary.TotalCount -ne 13) { $reasons += "expected 13 total checks, summary line reports $($parsed.Summary.TotalCount)" }
-        if ($parsed.Summary.PassCount -ne 12) { $reasons += "expected 12 PASS, summary line reports $($parsed.Summary.PassCount)" }
-    }
-    if ($failed.Count -ne 1) {
-        $reasons += "expected exactly 1 FAIL, observed $($failed.Count) ($((@($failed | ForEach-Object { $_.Name })) -join ', '))"
-    }
-    elseif ($failed[0].Name -ne 'worktree git usable') {
-        $reasons += "the single failing check is '$($failed[0].Name)', not 'worktree git usable'"
-    }
-    else {
-        $detail = $failed[0].Detail
-        if ($detail -match '^worktree is at ([0-9a-f]{40}), frozen baseline is ([0-9a-f]{40})$') {
-            $observedHead = $Matches[1]
-            $observedBaseline = $Matches[2]
-            if ($observedHead -ne $authorizedOverrideCommit) {
-                $reasons += "observed worktree HEAD '$observedHead' is not the authorized K8-S2 override commit '$authorizedOverrideCommit'"
-            }
-            $frozenCandidatePin = Get-K8FrozenCandidateRangeGenCommit
-            if ($observedBaseline -ne $frozenCandidatePin) {
-                $reasons += "observed frozen baseline '$observedBaseline' does not equal Study01/README.md's own candidate RangeGen pin '$frozenCandidatePin'"
-            }
-        }
-        else {
-            $reasons += "'worktree git usable' failure detail does not match the expected 'worktree is at <sha>, frozen baseline is <sha>' shape: '$detail'"
-        }
-    }
-    if ($C.RangeGenCommit -ne $authorizedOverrideCommit) {
-        $reasons += "configured RangeGenCommit '$($C.RangeGenCommit)' is not the authorized K8-S2 override commit '$authorizedOverrideCommit'"
-    }
-
-    if ($reasons.Count -gt 0) {
-        throw (New-K8CommandFailure `
-            -Argv $Argv -ExitCode $CommandResult.ExitCode `
-            -CombinedOutput ((@($CommandResult.Output) | ForEach-Object { "$_" }) -join "`n") `
-            -Message ("K8-S2 execution-override REFUSED at F-20 (fail-closed, not an authorized override): {0}" -f ($reasons -join '; ')))
-    }
-
-    $record = [ordered]@{
-        schema                     = $script:K8ExecutionOverrideAcceptanceSchema
-        run_id                     = $Run.RunId
-        sequence_id                = $Run.SequenceId
-        tooling_head               = $Run.ToolingHead
-        step_id                    = 'F-20'
-        accepted_utc               = (Get-K8UtcNow)
-        exit_code                  = $CommandResult.ExitCode
-        total_checks               = $parsed.Summary.TotalCount
-        pass_count                 = $parsed.Summary.PassCount
-        failed_check_name          = $failed[0].Name
-        observed_worktree_head     = $observedHead
-        frozen_candidate_pin       = $observedBaseline
-        authorized_override_commit = $authorizedOverrideCommit
-        note                       = 'K8-S2 execution-only RangeGen override acceptance. Records a tooling-level exception to one frozen gate''s exit code; NOT a Study01 scientific pass, NOT a K8-3/Gate K8 authorization. study01_preflight.py was not modified.'
-    }
-    New-Item -ItemType Directory -Force -Path (Get-K8RunRecordDir -RunId $Run.RunId) | Out-Null
-    Write-K8AtomicFile -Path (Get-K8ExecutionOverrideAcceptancePath -RunId $Run.RunId) -Content (($record | ConvertTo-Json -Depth 12) + "`n")
-    Write-K8ShakedownLog -Level STEP -Message "K8-S2 execution-override ACCEPTED at F-20 for run $($Run.RunId): 12/13 PASS, sole FAIL='worktree git usable' (worktree $observedHead vs frozen candidate $observedBaseline)."
-}
-
 function Invoke-K8ShakedownRangeAB {
     <#
         Thin lifecycle shell around the Range A/B body.
@@ -8115,12 +7876,6 @@ function Invoke-K8ShakedownRangeABBody {
         '--path-probe', '/study/traffic/send_direct_operate.py', '/data/c2-original-path.pcap', '/data/c2-mirror-sensor.pcap'
     ) -Description 'execution preflight gate (Docker-free)'
     (@($preflightResult.Output) -join "`n") | Set-Content -Path (Join-Path $envDir 'preflight.txt') -Encoding utf8NoBOM
-    # F-20's accepted_exit_codes is (0, 1): exit 1 is not yet a pass. This gate
-    # re-checks the frozen preflight's own structured output and fails closed
-    # unless it is EXACTLY the one shape the K8-S2 execution-only RangeGen
-    # override is authorized to produce -- see the function's docstring.
-    Assert-K8ExecutionOverridePreflightAcceptance -Run $Run -Argv @('python', (Join-Path $ScriptsDir 'study01_preflight.py')) -CommandResult $preflightResult
-
     # The frozen preflight requires every runtime evidence directory to be
     # empty at invocation time. Retain the generated Compose hash only after
     # that freshness gate has passed; writing it earlier invalidates the run.

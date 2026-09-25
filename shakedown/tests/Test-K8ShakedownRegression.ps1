@@ -7,9 +7,8 @@
 
 .DESCRIPTION
     Checks:
-      1. cp932/UTF-8 dependency-decode fix, against a synthetic file with the
-         same decode-hazard shape as the real requirements.txt (no network
-         dependency on the real file).
+      1. Range C v0.13.1 owns its requirements-file UTF-8 declaration and
+         Shakedown carries no obsolete locale override.
       2. Pinned commits/tag/digest in K8ShakedownCommon.psm1 match
          Study01/README.md (catches copy-paste drift between the two).
       3. cwd/path: Start-K8Shakedown.ps1 refuses to run outside a real
@@ -168,67 +167,28 @@ function Assert-K8Test {
     }
 }
 
-# --- 1. cp932/UTF-8 dependency-decode fix -----------------------------------
+# --- 1. Range C v0.13.1 dependency-file encoding ---------------------------
 
-Assert-K8Test 'cp932 fix: PYTHONUTF8=1 makes locale.getpreferredencoding(False) return UTF-8' {
-    $withoutFlag = (python -c "import sys,locale; sys.stdout.write('1' if sys.flags.utf8_mode else '0')")
-    $withFlag = (python -X utf8 -c "import sys,locale; sys.stdout.write(locale.getpreferredencoding(False))")
-    if ($withFlag -ne 'UTF-8') {
-        throw "expected 'UTF-8' with -X utf8 / PYTHONUTF8=1, got '$withFlag' (utf8_mode without flag: $withoutFlag). Python version/behavior may have changed -- do not assume the fix still holds."
-    }
-}
+$CommonPath = Join-Path $ToolsDir 'K8ShakedownCommon.psm1'
+Import-Module $CommonPath -Force
 
-Assert-K8Test 'cp932 fix: reproduces + resolves on a synthetic file with the real decode-hazard shape (no BOM, no PEP263 line, UTF-8 non-ASCII)' {
-    $tmp = New-TemporaryFile
-    # Same shape as amenonuboco-v0.13.0/requirements.txt: a leading '#' comment
-    # line with Japanese text (so it can never be mistaken for a PEP263
-    # `# coding:` line), CRLF line endings, UTF-8 bytes, no BOM.
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes("# Amenonuboco プロビジョナ本体の実行時依存。`r`npydantic>=2.0,<3.0`r`n")
-    [System.IO.File]::WriteAllBytes($tmp.FullName, $bytes)
-    $checkScript = @"
-import sys, locale
-locale_enc = locale.getpreferredencoding(False)
-with open(r'$($tmp.FullName)', 'rb') as f:
-    data = f.read()
-try:
-    data.decode(locale_enc)
-    sys.stdout.write('DECODED:' + locale_enc)
-except UnicodeDecodeError as e:
-    sys.stdout.write('FAILED:' + locale_enc)
-"@
-    $result = python -c $checkScript
-    # This assertion only bites on a host whose default locale can't decode
-    # UTF-8 (e.g. cp932); elsewhere it degrades to an informational skip
-    # rather than a false failure, since the underlying pip decode-order bug
-    # is orthogonal to whether *this* host's locale happens to reproduce it.
-    if ($result -like 'FAILED:*') {
-        $withFix = python -X utf8 -c $checkScript
-        if ($withFix -notlike 'DECODED:*') {
-            throw "host locale ($result) fails to decode as expected, but -X utf8 did not fix it either ($withFix)"
-        }
-    }
-    else {
-        Write-Host "  (informational: this host's default locale is $result, which already decodes the synthetic file -- the cp932 hazard does not reproduce here, but the fix mechanism above is still verified independently)" -ForegroundColor DarkGray
-    }
-    Remove-Item $tmp.FullName -ErrorAction SilentlyContinue
-}
-
-Assert-K8Test 'Install-K8RangeCDependencies sets and restores PYTHONUTF8 around the pip call' {
+Assert-K8Test 'Range C v0.13.1 owns its UTF-8 declaration; Shakedown adds no PYTHONUTF8 override' {
     $src = Get-Content (Join-Path $ToolsDir 'K8ShakedownCommon.psm1') -Raw
-    if ($src -notmatch "function Install-K8RangeCDependencies") { throw 'function not found' }
-    if ($src -notmatch "\`$env:PYTHONUTF8 = '1'") { throw 'PYTHONUTF8=1 not set' }
-    if ($src -notmatch 'Remove-Item Env:\\PYTHONUTF8') { throw 'PYTHONUTF8 not restored/cleaned up in a finally block' }
+    if ($src -match 'PYTHONUTF8') { throw 'obsolete PYTHONUTF8 workaround remains in Shakedown tooling' }
+    $constants = Get-K8ShakedownConstants
+    if ($constants.RangeCTag -ne 'v0.13.1') { throw "RangeCTag = '$($constants.RangeCTag)'" }
+    if ($constants.RangeCCommit -ne '1d0fa75725078100e9da2e8492ca977ba8e89d95') { throw "RangeCCommit = '$($constants.RangeCCommit)'" }
 }
-
 # --- 2. Pinned values match Study01/README.md --------------------------------
 
 Assert-K8Test 'Pinned Amenonuboco/tcpdump values match Study01/README.md' {
     $readme = Get-Content (Join-Path $Study01 'README.md') -Raw
     $common = Get-Content (Join-Path $ToolsDir 'K8ShakedownCommon.psm1') -Raw
-    # These three stay copied verbatim from Study01/README.md, as before.
+    # These four stay copied verbatim from Study01/README.md.
     $pins = @(
-        '0378f8a32701b481e030f3db3d5f66ea471a4675',
-        'v0.13.0',
+        '80e550ffeab8daa6583590add490433a0305bb53',
+        '1d0fa75725078100e9da2e8492ca977ba8e89d95',
+        'v0.13.1',
         'sha256:3006b3bd9f041bf73f21e626b97cca5e78fd6ce271549ca95b8e6a508165512b'
     )
     foreach ($pin in $pins) {
@@ -237,174 +197,29 @@ Assert-K8Test 'Pinned Amenonuboco/tcpdump values match Study01/README.md' {
     }
 }
 
-Assert-K8Test 'RangeGenCommit is a declared K8-S2 execution-only override, distinct from Study01/README.md candidate pin' {
-    # Study01/ is the frozen/candidate scientific tree (K8-S2 delegated source
-    # identity) and must not be re-copied here just because the Shakedown
-    # execution tooling's own Amenonuboco runtime dependency moved -- see the
-    # note above $script:K8Shakedown in K8ShakedownCommon.psm1. This test
-    # checks the two pins are recorded EXACTLY where each is expected, rather
-    # than requiring them to be equal or silently allowing either to drift
-    # unnoticed.
+Assert-K8Test 'RangeGenCommit equals the accepted Study01 Range A/B dependency pin' {
     $readme = Get-Content (Join-Path $Study01 'README.md') -Raw
-    $common = Get-Content (Join-Path $ToolsDir 'K8ShakedownCommon.psm1') -Raw
-    $candidatePin = '80e550ffeab8daa6583590add490433a0305bb53'
-    $executionOverridePin = '16ec5a00d99efd26ddddfbbdb47712866861386f'
-    if ($readme -notlike "*$candidatePin*") { throw "candidate range-gen pin '$candidatePin' not found in Study01/README.md" }
-    if ($common -notlike "*$executionOverridePin*") { throw "K8-S2 execution-only override pin '$executionOverridePin' not found in K8ShakedownCommon.psm1's RangeGenCommit" }
-    if ($common -like "*$candidatePin*") { throw "K8ShakedownCommon.psm1 still carries the candidate pin '$candidatePin' -- RangeGenCommit override was not applied" }
+    $constants = Get-K8ShakedownConstants
+    $pin = '80e550ffeab8daa6583590add490433a0305bb53'
+    if ($readme -notlike "*$pin*") { throw "accepted RangeGen pin '$pin' not found in Study01/README.md" }
+    if ($constants.RangeGenCommit -ne $pin) { throw "RangeGenCommit = '$($constants.RangeGenCommit)', expected '$pin'" }
 }
 
-# --- 2a. K8-S2 execution-only RangeGen override acceptance at F-20 ----------
-#
-# Reproduces the REAL Range A termination observed under the K8-S2
-# execution-only override: study01_preflight.py's frozen worktree_git()
-# check fails ONLY because the worktree sits at RangeGenCommit
-# (16ec5a0...) instead of Study01/README.md's candidate pin (80e550f...) --
-# every other check passes. F-20's accepted_exit_codes now includes 1, so
-# these tests exercise Assert-K8ExecutionOverridePreflightAcceptance
-# directly: it must accept EXACTLY that one shape and fail closed on every
-# mutation of it. study01_preflight.py itself is not invoked here -- these
-# are synthetic reproductions of its own frozen output shape, never a second
-# implementation of its checks.
-
-$F20CommonPath = Join-Path $ToolsDir 'K8ShakedownCommon.psm1'
-Import-Module $F20CommonPath -Force
-
-function New-K8SyntheticPreflightLines {
-    <# 13 lines matching study01_preflight.py's Check.__repr__ shape, with the
-       'worktree git usable' line and its PASS/FAIL swappable for each test. #>
-    param(
-        [bool] $WorktreeOk = $false,
-        [string] $WorktreeDetail = 'worktree is at 16ec5a00d99efd26ddddfbbdb47712866861386f, frozen baseline is 80e550ffeab8daa6583590add490433a0305bb53'
-    )
-    $names = @(
-        'canonical shell', 'container path probes', 'worktree git usable', 'run workspace placement',
-        'compose build contexts', 'compose bind sources', 'sender asset', 'evidence tree',
-        'sender wrapper', 'capture wrapper', 'scorer wiring', 'project name binding', 'compose integrity (record only)'
-    )
-    $lines = foreach ($n in $names) {
-        if ($n -eq 'worktree git usable') { "[$(if ($WorktreeOk) {'PASS'} else {'FAIL'})] $n`: $WorktreeDetail" }
-        else { "[PASS] $n`: ok" }
+Assert-K8Test 'obsolete RangeGen execution-override machinery is absent and F-20 requires exit 0' {
+    $src = Get-Content (Join-Path $ToolsDir 'K8ShakedownCommon.psm1') -Raw
+    foreach ($obsolete in @(
+        'Assert-K8ExecutionOverridePreflightAcceptance',
+        'Get-K8ExecutionOverrideAcceptancePath',
+        'K8ExecutionOverrideAcceptanceSchema',
+        'k8shakedown-execution-override-acceptance/1',
+        '16ec5a00d99efd26ddddfbbdb47712866861386f'
+    )) {
+        if ($src.Contains($obsolete)) { throw "obsolete execution override remains: $obsolete" }
     }
-    # NOTE: '[PASS]' in a -like pattern is a wildcard CHARACTER CLASS
-    # (matches one of P/A/S), not the literal text -- StartsWith avoids that.
-    $passCount = @($lines | Where-Object { $_.StartsWith('[PASS]') }).Count
-    $lines += ''
-    $lines += "K5 execution preflight: $passCount/$($names.Count) PASS"
-    return $lines
-}
-
-function New-K8TestRun {
-    [pscustomobject]@{ RunId = 'k8shakedown-rangea-test'; SequenceId = 'k8shakedown-seq-test'; ToolingHead = ('0' * 40) }
-}
-
-Assert-K8Test 'Assert-K8ExecutionOverridePreflightAcceptance: exit 0 passes through, no override record written' {
-    $run = New-K8TestRun
-    $result = [pscustomobject]@{ ExitCode = 0; Output = (New-K8SyntheticPreflightLines -WorktreeOk $true) }
-    Assert-K8ExecutionOverridePreflightAcceptance -Run $run -Argv @('python', 'study01_preflight.py') -CommandResult $result
-    if (Test-Path -LiteralPath (Get-K8ExecutionOverrideAcceptancePath -RunId $run.RunId)) {
-        throw 'an override-acceptance record was written for an exit-0 (no-override-needed) result'
-    }
-}
-
-Assert-K8Test 'Assert-K8ExecutionOverridePreflightAcceptance: the REAL K8-S2 override shape (12/13 PASS, sole FAIL=worktree git usable at the authorized commit) is accepted and retained' {
-    $run = New-K8TestRun
-    $result = [pscustomobject]@{ ExitCode = 1; Output = (New-K8SyntheticPreflightLines -WorktreeOk $false) }
-    Assert-K8ExecutionOverridePreflightAcceptance -Run $run -Argv @('python', 'study01_preflight.py') -CommandResult $result
-    $recordPath = Get-K8ExecutionOverrideAcceptancePath -RunId $run.RunId
-    if (-not (Test-Path -LiteralPath $recordPath)) { throw 'no override-acceptance control-plane record was written' }
-    $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
-    if ($record.failed_check_name -ne 'worktree git usable') { throw "record failed_check_name = '$($record.failed_check_name)'" }
-    if ($record.observed_worktree_head -ne '16ec5a00d99efd26ddddfbbdb47712866861386f') { throw "record observed_worktree_head = '$($record.observed_worktree_head)'" }
-    if ($record.frozen_candidate_pin -ne '80e550ffeab8daa6583590add490433a0305bb53') { throw "record frozen_candidate_pin = '$($record.frozen_candidate_pin)'" }
-    if ($record.total_checks -ne 13 -or $record.pass_count -ne 12) { throw "record total_checks/pass_count = $($record.total_checks)/$($record.pass_count)" }
-    if ($record.schema -ne 'k8shakedown-execution-override-acceptance/1') { throw "unexpected schema '$($record.schema)'" }
-    Remove-Item -LiteralPath $recordPath -Force
-}
-
-Assert-K8Test 'Assert-K8ExecutionOverridePreflightAcceptance: exit 1 with ALL 13 PASS (no failing check at all) is fail-closed' {
-    $run = New-K8TestRun
-    $result = [pscustomobject]@{ ExitCode = 1; Output = (New-K8SyntheticPreflightLines -WorktreeOk $true) }
-    $threw = $false
-    try { Assert-K8ExecutionOverridePreflightAcceptance -Run $run -Argv @('python') -CommandResult $result }
-    catch { $threw = $true; if ($_.Exception.Message -notmatch 'expected exactly 1 FAIL') { throw "wrong rejection reason: $($_.Exception.Message)" } }
-    if (-not $threw) { throw 'exit 1 with zero failing checks was incorrectly accepted as an override' }
-    if (Test-Path -LiteralPath (Get-K8ExecutionOverrideAcceptancePath -RunId $run.RunId)) { throw 'a record was written for a REFUSED override' }
-}
-
-Assert-K8Test 'Assert-K8ExecutionOverridePreflightAcceptance: a second, unrelated failing check alongside worktree git usable is fail-closed' {
-    $run = New-K8TestRun
-    $lines = New-K8SyntheticPreflightLines -WorktreeOk $false
-    $lines = $lines -replace [regex]::Escape('[PASS] sender asset: ok'), '[FAIL] sender asset: ok'
-    $lines = $lines -replace '^K5 execution preflight: \d+/13 PASS$', 'K5 execution preflight: 11/13 PASS'
-    $result = [pscustomobject]@{ ExitCode = 1; Output = $lines }
-    $threw = $false
-    try { Assert-K8ExecutionOverridePreflightAcceptance -Run $run -Argv @('python') -CommandResult $result }
-    catch { $threw = $true; if ($_.Exception.Message -notmatch 'expected exactly 1 FAIL') { throw "wrong rejection reason: $($_.Exception.Message)" } }
-    if (-not $threw) { throw 'a second unrelated failure alongside worktree git usable was incorrectly accepted' }
-}
-
-Assert-K8Test 'Assert-K8ExecutionOverridePreflightAcceptance: the single failure being a DIFFERENT check (not worktree git usable) is fail-closed' {
-    $run = New-K8TestRun
-    $lines = @(
-        '[FAIL] canonical shell: shell probe reported ''5.1''; PowerShell 7 is required'
-    ) + @(1..12 | ForEach-Object { "[PASS] check-$_`: ok" })
-    $lines += ''
-    $lines += 'K5 execution preflight: 12/13 PASS'
-    $result = [pscustomobject]@{ ExitCode = 1; Output = $lines }
-    $threw = $false
-    try { Assert-K8ExecutionOverridePreflightAcceptance -Run $run -Argv @('python') -CommandResult $result }
-    catch { $threw = $true; if ($_.Exception.Message -notmatch "not 'worktree git usable'") { throw "wrong rejection reason: $($_.Exception.Message)" } }
-    if (-not $threw) { throw 'a lone failure on a check other than worktree git usable was incorrectly accepted' }
-}
-
-Assert-K8Test 'Assert-K8ExecutionOverridePreflightAcceptance: worktree HEAD not at the authorized override commit is fail-closed (a real, unrelated drift must still STOP)' {
-    $run = New-K8TestRun
-    $result = [pscustomobject]@{ ExitCode = 1; Output = (New-K8SyntheticPreflightLines -WorktreeOk $false -WorktreeDetail 'worktree is at 1111111111111111111111111111111111111111, frozen baseline is 80e550ffeab8daa6583590add490433a0305bb53') }
-    $threw = $false
-    try { Assert-K8ExecutionOverridePreflightAcceptance -Run $run -Argv @('python') -CommandResult $result }
-    catch { $threw = $true; if ($_.Exception.Message -notmatch 'is not the authorized K8-S2 override commit') { throw "wrong rejection reason: $($_.Exception.Message)" } }
-    if (-not $threw) { throw 'a worktree HEAD other than the authorized override commit was incorrectly accepted' }
-}
-
-Assert-K8Test 'Assert-K8ExecutionOverridePreflightAcceptance: a frozen baseline that does not match Study01/README.md''s own candidate pin is fail-closed' {
-    $run = New-K8TestRun
-    $result = [pscustomobject]@{ ExitCode = 1; Output = (New-K8SyntheticPreflightLines -WorktreeOk $false -WorktreeDetail 'worktree is at 16ec5a00d99efd26ddddfbbdb47712866861386f, frozen baseline is 2222222222222222222222222222222222222222') }
-    $threw = $false
-    try { Assert-K8ExecutionOverridePreflightAcceptance -Run $run -Argv @('python') -CommandResult $result }
-    catch { $threw = $true; if ($_.Exception.Message -notmatch "does not equal Study01/README.md's own candidate RangeGen pin") { throw "wrong rejection reason: $($_.Exception.Message)" } }
-    if (-not $threw) { throw 'a frozen baseline not matching the real candidate pin was incorrectly accepted' }
-}
-
-Assert-K8Test 'Assert-K8ExecutionOverridePreflightAcceptance: a garbled/missing summary line is fail-closed, never silently trusted' {
-    $run = New-K8TestRun
-    $lines = @(New-K8SyntheticPreflightLines -WorktreeOk $false) | Where-Object { $_ -notmatch '^K5 execution preflight:' }
-    $result = [pscustomobject]@{ ExitCode = 1; Output = $lines }
-    $threw = $false
-    try { Assert-K8ExecutionOverridePreflightAcceptance -Run $run -Argv @('python') -CommandResult $result }
-    catch { $threw = $true; if ($_.Exception.Message -notmatch 'no ''K5 execution preflight') { throw "wrong rejection reason: $($_.Exception.Message)" } }
-    if (-not $threw) { throw 'a missing summary line was incorrectly accepted' }
-}
-
-Assert-K8Test 'Assert-K8ExecutionOverridePreflightAcceptance: RangeGenCommit drifting away from the authorized override commit is fail-closed, even with an otherwise-matching preflight shape' {
-    & (Get-Module K8ShakedownCommon) { $script:K8Shakedown.RangeGenCommit = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }
-    try {
-        $run = New-K8TestRun
-        $result = [pscustomobject]@{ ExitCode = 1; Output = (New-K8SyntheticPreflightLines -WorktreeOk $false) }
-        $threw = $false
-        try { Assert-K8ExecutionOverridePreflightAcceptance -Run $run -Argv @('python') -CommandResult $result }
-        catch { $threw = $true; if ($_.Exception.Message -notmatch 'configured RangeGenCommit') { throw "wrong rejection reason: $($_.Exception.Message)" } }
-        if (-not $threw) { throw 'a drifted RangeGenCommit was incorrectly accepted' }
-    }
-    finally { Import-Module $F20CommonPath -Force }
-}
-
-Assert-K8Test 'F-20 contract row: accepted_exit_codes is (0, 1), not an unconditional blanket accept' {
     $row = Get-K8CommandContractRow -StepId 'F-20'
     $accepted = @(Get-K8RowAcceptedExitCodes -Row $row)
-    if (($accepted -join ',') -ne '0,1') { throw "F-20 accepted_exit_codes = ($($accepted -join ',')), expected (0, 1)" }
+    if (($accepted -join ',') -ne '0') { throw "F-20 accepted_exit_codes = ($($accepted -join ',')), expected only 0" }
 }
-
 Assert-K8Test 'Pinned sender asset SHA-256 matches c2-dnp3-sender-procedure.md' {
     $senderDoc = Get-Content $SenderProcedureDoc -Raw
     $common = Get-Content (Join-Path $ToolsDir 'K8ShakedownCommon.psm1') -Raw
@@ -7686,12 +7501,12 @@ function New-K8RangeCPackagingFixture {
     }
     ($obs | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath (Join-Path $evidence 'validate.observation.json') -Encoding utf8NoBOM
 
-    $head = '0378f8a32701b481e030f3db3d5f66ea471a4675'
+    $head = '1d0fa75725078100e9da2e8492ca977ba8e89d95'
     $env = @{
         schema = 'k8shakedown-range-c-environment/1'
         run_id = 'k8shakedown-rangec-test'; sequence_id = 'k8shakedown-seq-test'; range = 'c'
         gated = $false
-        validator_source = @{ repo_url='https://example.invalid/a'; pinned_tag='v0.13.0'; pinned_commit=$head }
+        validator_source = @{ repo_url='https://example.invalid/a'; pinned_tag='v0.13.1'; pinned_commit=$head }
         worktree = @{
             source     = @{ path='S'; head=$head; clean=$true;  observed_utc='2026-09-07T00:00:00.0000000Z' }
             disposable = @{ path='D'; head=$head; clean=$false; observed_utc='2026-09-07T00:00:01.0000000Z' }
@@ -7758,7 +7573,7 @@ Assert-K8Test 'Range C: every environment/versions.json field is rendered from a
 
         if ($v['versions']['pydantic'] -ne '2.12.5') { throw 'pydantic was not rendered from the environment record' }
         if ($v['versions']['pyyaml'] -ne '6.0.3') { throw 'pyyaml was not rendered from the environment record' }
-        if ($v['worktree_head'] -ne '0378f8a32701b481e030f3db3d5f66ea471a4675') { throw 'worktree_head is wrong' }
+        if ($v['worktree_head'] -ne '1d0fa75725078100e9da2e8492ca977ba8e89d95') { throw 'worktree_head is wrong' }
         if ($v['worktree_clean'] -ne $false) { throw 'worktree_clean is not the observed disposable-worktree state' }
 
         $verified = Invoke-K8RangeCPackage -Fixture $f -Command 'verify'

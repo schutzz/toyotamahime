@@ -173,10 +173,10 @@ Assert-K8PinnedCommit -WorktreePath $rangeGenDir -ExpectedCommit $C.RangeGenComm
 # --- 4. Amenonuboco Range C validator checkout (pinned tag/commit) ---
 
 Write-K8ShakedownLog -Level STEP -Message '--- 4. Amenonuboco Range C validator checkout ---'
-$rangeCDir = Join-Path $ShakedownRoot 'amenonuboco-v0.13.0'
+$rangeCDir = Join-Path $ShakedownRoot 'amenonuboco-v0.13.1'
 # C-55: the same exploration as C-54, for the Range C validator worktree.
 if ((Test-Path (Join-Path $rangeCDir '.git')) -and ((Get-K8ContractedNativeText -StepId 'C-55' -FilePath 'git' -ArgumentList @('-C', $rangeCDir, 'rev-parse', 'HEAD')) -eq $C.RangeCCommit)) {
-    Write-K8ShakedownLog -Message "amenonuboco-v0.13.0 already at pinned commit $($C.RangeCCommit); skipping checkout."
+    Write-K8ShakedownLog -Message "amenonuboco-v0.13.1 already at pinned commit $($C.RangeCCommit); skipping checkout."
 }
 else {
     if (Test-Path $rangeCDir) {
@@ -185,11 +185,11 @@ else {
     }
     Invoke-K8ShakedownCommand -StepId 'C-53' -FilePath 'git' -ArgumentList @('clone', '--branch', $C.RangeCTag, '--depth=1', $C.AmenonubocoUrl, $rangeCDir)
 }
-Assert-K8PinnedCommit -WorktreePath $rangeCDir -ExpectedCommit $C.RangeCCommit -Label 'amenonuboco-v0.13.0'
+Assert-K8PinnedCommit -WorktreePath $rangeCDir -ExpectedCommit $C.RangeCCommit -Label 'amenonuboco-v0.13.1'
 
-# --- 5. Range C dependency install (cp932-safe) ---
+# --- 5. Range C dependency install ---
 
-Write-K8ShakedownLog -Level STEP -Message '--- 5. Range C dependency install (locale-safe) ---'
+Write-K8ShakedownLog -Level STEP -Message '--- 5. Range C dependency install ---'
 Install-K8RangeCDependencies -RequirementsPath (Join-Path $rangeCDir 'requirements.txt')
 
 # --- 6. tcpdump capture helper, pinned by digest ---
