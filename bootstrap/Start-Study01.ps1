@@ -199,6 +199,16 @@
     available post-clone (step 3a below) -- scientific/K8 behavior
     established through v14 above is otherwise unchanged by this note.
 
+    v15 publishes the exact K8-S2-qualified candidate lineage. The
+    substantive post-v14 work was already present when that candidate ran
+    its accepted A/B/C sequence: G7 contemporaneous-evidence support, the
+    C-9 attestation lifecycle closure, C-8 governing-source re-derivation,
+    package-fixture isolation, and execution-dependency reconciliation.
+    Their accepted reviews record no unauthorized scientific, scoring,
+    expected-result, claim, protocol, or Range A/B/C semantic change. This
+    v15 release-prep commit itself changes only the immutable bootstrap
+    self-reference and current package/publication documentation.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -221,7 +231,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v14` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v15` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -246,7 +256,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v14',
+    [string] $Ref = 'k8-bootstrap-v15',
 
     # Additional attempt-ID inventory root(s) to check before allocating,
     # besides $AttemptRoot -- see this file's own "Post-v14 change" note
