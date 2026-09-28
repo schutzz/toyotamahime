@@ -122,6 +122,37 @@ The export step is bound the same way, through the retained `execution_run_root`
 
 This correction changes no frozen event, selector, window, evidence schema path, or scoring rule. It fixes only which component records these facts, and requires no Protocol Amendment.  `hashes.sha256` and `down -v --remove-orphans` remain governed by the evidence schema and Range derivation procedure.  Helpers must be removed before range teardown.
 
+### 5.2 Formal K8-3 correction basis — literal pcap decode verification command
+
+Line 101's "decoded verification" had no literal command anywhere in this document: an operator had to synthesize a `tshark` invocation from outside knowledge to check the exported Ground Truth and Sensor pcaps against the frozen selector in [Freeze Decision Table](./freeze-decision-table.md) §3. Formal K8-3 attempt `k8-repro-20260928-001` did this and guessed the Application Layer Function Code field as `dnp3.al_func` (underscore-joined, matching the flattened Elasticsearch field name `dnp3_dnp3_al_func` used by the Collector query in [K6 R-OBS-05 Exact Collector Query Contract](./k6-r-obs-05-collector-query-contract.md)). That guess is wrong for the raw `tshark` CLI: confirmed against the exact frozen `log_structurer` image (`debian:bullseye-slim` base, `tshark` 3.4.16, per [C2 image inventory](./c2-dnp3-image-inventory.md)) with `tshark -G fields`, the registered dissector field is dot-joined, `dnp3.al.func`. `Invoke-K8Step.ps1` correctly recorded the guessed command as a failed step (exit 1), and the attempt was closed `Failed` without repair or retry, per the no-repair-in-place rule — every other Range A step in that attempt (provisioning through the Collector and Rule queries) had already passed.
+
+This is an executable-transcription gap, not a semantic one: it fixes only which literal command performs an already-required check, using the field names the frozen apparatus itself actually exposes. It changes no frozen event, selector, window, filter, evidence schema path, or scoring rule. `k8-repro-20260928-001`'s retained evidence and steps.jsonl are unmodified by this correction; the command below was verified only in a non-formal diagnostic environment (the same run's already-provisioned, already-exported Range A artifacts, examined after the attempt was closed `Failed`), not as new formal K8-3 evidence.
+
+Run each of the following exactly once per run, after both stages' `stop-export` above, against the retained pcap named in each command. `<log-structurer-container>` is `docker compose -p <run-id> -f <range-a-or-b-compose.yml> ps -q log_structurer` — the frozen `log_structurer` image is the one whose `tshark` build these field names are confirmed against; do not substitute a host-installed `tshark`, which may register different field names for a different dissector version.
+
+```powershell
+$logStructurer = docker compose -p <run-id> -f <range-a-or-b-compose.yml> ps -q log_structurer
+docker cp <run-evidence>/ground-truth/independent-capture/c2-original-path.pcap "${logStructurer}:/tmp/c2-original-path.pcap"
+docker cp <run-evidence>/sensor-input/mirror-capture/c2-mirror-sensor.pcap "${logStructurer}:/tmp/c2-mirror-sensor.pcap"
+
+# Fields, in output order: frame number, frame time, source/destination IP,
+# TCP destination port, DNP3 Application Layer Function Code (dnp3.al.func --
+# 5 is Direct Operate), DNP3 link source/destination address (dnp3.src / dnp3.dst).
+$filter = 'ip.src==10.1.20.11 and ip.dst==10.1.10.10 and tcp.dstport==20000 and dnp3.al.func==5 and dnp3.src==1024 and dnp3.dst==1'
+
+$groundTruthDecode = docker exec $logStructurer sh -lc "tshark -r /tmp/c2-original-path.pcap -Y `"$filter`" -T fields -e frame.number -e frame.time -e ip.src -e ip.dst -e tcp.dstport -e dnp3.al.func -e dnp3.src -e dnp3.dst"
+if ($LASTEXITCODE -ne 0) { throw 'ground-truth pcap decode failed' }
+$groundTruthDecode | Out-File -FilePath (Join-Path <run-evidence> 'ground-truth/independent-capture/decoded-verification.txt') -Encoding utf8
+if ([string]::IsNullOrWhiteSpace(($groundTruthDecode -join ''))) { throw 'ground-truth pcap: no frame matched the frozen selector' }
+
+$sensorDecode = docker exec $logStructurer sh -lc "tshark -r /tmp/c2-mirror-sensor.pcap -Y `"$filter`" -T fields -e frame.number -e frame.time -e ip.src -e ip.dst -e tcp.dstport -e dnp3.al.func -e dnp3.src -e dnp3.dst"
+if ($LASTEXITCODE -ne 0) { throw 'sensor pcap decode failed' }
+$sensorDecode | Out-File -FilePath (Join-Path <run-evidence> 'sensor-input/mirror-capture/decoded-verification.txt') -Encoding utf8
+if ([string]::IsNullOrWhiteSpace(($sensorDecode -join ''))) { throw 'sensor pcap: no frame matched the frozen selector' }
+```
+
+**Pass condition:** both `$groundTruthDecode` and `$sensorDecode` are non-empty and contain exactly one line each (this event is sent with `--repeat 1`; more than one matching line is itself a deviation to record, not a pass). Each line's `frame.time` must fall inside `[T0 - 5 s, T0 + 15 s]`. A non-zero `tshark` exit code, or a line that does not carry every one of `10.1.20.11`, `10.1.10.10`, `20000`, `5`, `1024`, `1`, fails the stage; do not substitute the Collector or Rule query result for this pcap-level check, and do not silently retype the filter with a different field name.
+
 ## 6. Failures and retry
 
 An unresolved helper start, export failure, missing pcap, capture-placement ambiguity, or incomplete event-window coverage forbids a Ground Truth substitute.  Preserve the run's metadata and deviations; never overwrite evidence or reuse its project.  Retry equals a fresh run ID and fresh Compose project only.
