@@ -283,6 +283,8 @@ Expected, not forced: Ground Truth Pass; Sensor and Collector Fail; rule output 
 
 Range C is **never provisioned**. `docker compose up` is not part of this step in any form.
 
+**This section is the sole execution authority for formal Range C.** Execute exactly the four steps below, in order, and nothing else. Do not provision or start the range. Do not run `docker compose`, capture, sender, or any other runtime command for Range C unless a step below explicitly instructs you to. A command that appears in a linked protocol document — including `platform/cli.py provision` in `protocol/c2-dnp3-range-derivation.md` §4 — is reference/explanatory material only for formal Range C; it is not authorized here unless this section explicitly imports it, and none of the steps below does. Executing any additional command outside this four-step procedure invalidates the formal Range C execution: close the attempt as `Failed` per §7, do not retry it in place. (Formal K8-3 attempt `k8-repro-20260928-003` did exactly this — ran §4's `provision` command, which is not one of the four steps below — and was correctly closed `Failed` for it.)
+
 1. Create a disposable worktree from the `v0.13.1` checkout, detached at `1d0fa75`, and confirm it is clean **before** placing anything into it.
 2. Derive the negative manifest from the pinned base manifest by the substitution recorded in `experiments/range-c-negative-manifest/` — a segment required by `observability_contract.required_segments` while `instrumentation.exclude` removes it. Preserve the base manifest's own line terminators; the original base is CRLF in the worktree.
 3. Run only `python platform/cli.py validate manifests/power-grid-reference.range-c-negative.yaml`.
