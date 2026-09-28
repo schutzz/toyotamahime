@@ -209,6 +209,25 @@
     v15 release-prep commit itself changes only the immutable bootstrap
     self-reference and current package/publication documentation.
 
+    v16 makes the already-landed Range A DNP3 decode-verification repair
+    reproducible through the standard bootstrap path. Formal K8-3 attempt
+    k8-repro-20260928-001 found that
+    studies/study-01-negative-result/protocol/c2-dnp3-capture-procedure.md
+    gave no literal tshark command for the Range A/B post-capture pcap
+    decode-verification step, and was correctly closed Failed when an
+    operator-synthesized command used an invalid field name
+    (dnp3.al_func instead of the apparatus's actual dnp3.al.func). The
+    fix (commit c408db6) adds a literal, tested decode command and
+    explicit pass condition (protocol/c2-dnp3-capture-procedure.md
+    Sec5.2); a repair-session process incident encountered while landing
+    that fix is recorded separately
+    (docs/k8-repro-20260928-001-repair-incident.md, commit 4098ef0). No
+    frozen event, selector, window, filter, evidence schema, scoring
+    rule, sender/capture semantics, Range B/C semantics, or K4/K8
+    acceptance criteria changed. This v16 release-prep commit itself
+    changes only the immutable bootstrap self-reference and README/
+    PROVENANCE documentation.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -231,7 +250,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v15` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v16` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -256,7 +275,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v15',
+    [string] $Ref = 'k8-bootstrap-v16',
 
     # Additional attempt-ID inventory root(s) to check before allocating,
     # besides $AttemptRoot -- see this file's own "Post-v14 change" note
