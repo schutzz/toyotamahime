@@ -140,6 +140,8 @@ python platform/cli.py provision manifests/power-grid-reference.range-c-negative
   -o <static-validation-workspace>/power-grid-reference.range-c-negative.docker-compose.yml
 ```
 
+**Formal K8-3 Range C does not execute this `provision` command.** `Study01/README.md` §5.3 is the execution authority for formal Range C, and its four-step validation-only procedure — `validate` only, never `provision` — must be followed exactly. The block above is retained as historical/reference material documenting the pre-K4 static-derivation check in §6, not as an authorized step of a formal attempt. Formal K8-3 attempt `k8-repro-20260928-003` ran this line and was correctly closed `Failed` for it.
+
 The pinned v0.12.0 baseline may provision this static contradiction; retain that as the preserved pre-K4 behavior only. Do not call `docker compose up` for Range C. After K4 is separately version-pinned, its `validate` command must reject the same segment-level observation precondition/blind spot before provisioning. The concrete DNP3 event is not a static-validator input.
 
 The path retargeting uses a string replacement against the fixed patch’s current filename. This is a known maintenance limitation, not a second patch mechanism: it was executed successfully against the fixed baseline during the pre-freeze check in §6. It does not add a freeze blocker or change the Range C semantic condition. A later maintenance improvement must not silently substitute a different negative-manifest meaning.
