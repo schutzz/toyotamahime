@@ -974,6 +974,14 @@ if (-not $SkipRunbook) {
         }
     }
 
+    Invoke-Check -Layer 'Runbook' -Check 'formal action inventory is complete and every retained-output/input-origin edge is connected' -Body {
+        $Completeness = Join-Path $PSScriptRoot 'Test-ExecutionCompleteness.ps1'
+        $Output = & $Completeness 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0 -or $Output -notmatch 'EXECUTION COMPLETENESS: PASS .*GAP=0; disconnected=0') {
+            throw "formal execution completeness failed:`n$Output"
+        }
+    }
+
     function New-K8RunbookChildScript {
         param(
             [Parameter(Mandatory)] [string] $AttemptRoot,

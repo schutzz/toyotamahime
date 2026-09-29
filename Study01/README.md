@@ -68,7 +68,7 @@ python -m pytest tests -q
 Pop-Location
 ```
 
-106 tests should pass. If they do not, stop and record the failure; do not continue. This exact count is machine-checked, not just documented here: `Study01/tools/Test-Study01Packaging.ps1`'s packaging certification runs this same check against this repository's own shipped test suite before every bootstrap release and fails certification if the actual collected/passed count and this paragraph's stated count disagree, so a future apparatus change that adds or removes tests cannot ship without this paragraph being updated in the same commit. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (106 passed):
+113 tests should pass. If they do not, stop and record the failure; do not continue. This exact count is machine-checked, not just documented here: `Study01/tools/Test-Study01Packaging.ps1`'s packaging certification runs this same check against this repository's own shipped test suite before every bootstrap release and fails certification if the actual collected/passed count and this paragraph's stated count disagree, so a future apparatus change that adds or removes tests cannot ship without this paragraph being updated in the same commit. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (113 passed):
 
 <!-- k8-test:id=apparatus-check-via-harness mode=exec cwd=Study01 -->
 ```powershell
@@ -88,9 +88,9 @@ This section adds an **optional harness** that automates the bookkeeping around 
 
 <!-- k8-test:id=bootstrap-fetch-verify-run mode=parse cwd=repo-root -->
 ```powershell
-$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v18/bootstrap/Start-Study01.ps1'
+$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v19/bootstrap/Start-Study01.ps1'
 $Dest     = Join-Path $env:TEMP 'Start-Study01.ps1'
-$Expected = '14b98967945b6ca23e656fc4ddb04e96a0712368a4dd1758f639680643b3680e'
+$Expected = 'b24de084e34c94812f49ce767f51448a940116a40dafad52e8a18c4e82beff5d'
 
 Invoke-WebRequest -Uri $Url -OutFile $Dest
 $Actual = (Get-FileHash -Path $Dest -Algorithm SHA256).Hash.ToLower()
@@ -101,7 +101,7 @@ if ($Actual -ne $Expected) {
 & $Dest
 ```
 
-The tag `k8-bootstrap-v18` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. `Start-Study01.ps1` also checks out that same tag by default when it clones Toyotamahime (its `-Ref` parameter defaults to `k8-bootstrap-v18`), so the commit you fetched this script from and the commit your attempt actually reproduces are the same one, even if `main` has moved on by the time you run this. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
+The tag `k8-bootstrap-v19` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. `Start-Study01.ps1` also checks out that same tag by default when it clones Toyotamahime (its `-Ref` parameter defaults to `k8-bootstrap-v19`), so the commit you fetched this script from and the commit your attempt actually reproduces are the same one, even if `main` has moved on by the time you run this. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
 
 **What it executes and where it writes.** `Start-Study01.ps1` creates a new attempt directory under `C:\K8\attempts\<attempt-id>\` (override with `-AttemptRoot`), starts a transcript there, clones `https://github.com/schutzz/toyotamahime` into it, records the exact clone `HEAD`, and captures a small environment record. It writes only under `-AttemptRoot`; it does not touch anything outside it, and it does not send anything over the network beyond the clone itself.
 
@@ -235,6 +235,20 @@ The canonical procedures are in `protocol/`, and they are the authority — this
 
 This fixes only where the evidence root sits relative to the attempt directory; the tree schema beneath it (`main-runs/`, `static-validations/`, and everything under a run or validation ID) is unchanged and is defined in `protocol/evidence-schema.md`. If you are not using the harness, place the same tree wherever you track attempt evidence — the schema, not this base path, is what the apparatus and the protocol documents depend on.
 
+### 5.0 Formal action binding
+
+The machine-readable formal action inventory is [`docs/k8-formal-actions.json`](./docs/k8-formal-actions.json). Before release, `tools/Test-ExecutionCompleteness.ps1` requires every operational action to name its authority, executable mechanism, input origin, retained output, and connected predecessor. Human scientific judgments are separately typed and are never counted as executable actions.
+
+For Range A/B, establish these values once in the PowerShell process that runs the steps. Replace only the two ID literals; every later path is derived from the attempt context rather than retyped:
+
+<!-- k8-test:id=formal-range-ab-context mode=parse cwd=Study01 -->
+```powershell
+$Range = 'A' # use 'B' for the separate Range B run
+$RunId = 'k8-range-a-YYYYMMDD-001'
+$RunEvidence = Join-Path $env:K8_ATTEMPT_DIR "evidence\main-runs\range-$($Range.ToLowerInvariant())\$RunId"
+$Compose = Join-Path $env:K8_ATTEMPT_DIR "work\$RunId\power-grid-reference.range-$($Range.ToLowerInvariant()).docker-compose.yml"
+```
+
 ### 5.1 Range A — the observation-valid control
 
 1. Choose a fresh run ID. Use it as the Compose project name, the run-evidence directory name, and nowhere else. Never reuse one.
@@ -249,6 +263,18 @@ python studies/study-01-negative-result/scripts/study01_evidence_tree.py `
 
    Do not hand-build this tree from a directory listing. The wrapper calls the same definition the preflight gate checks against, so the two cannot disagree; it creates **eight** directories, including the two nested capture-export destinations `ground-truth/independent-capture/` and `sensor-input/mirror-capture/` that the capture procedure writes into. A formal attempt that hand-built the six top-level ones was stopped by the gate at 12/13.
 4. Provision, establish readiness, resolve the capture contexts, and start the capture helpers before the event window opens — `protocol/c2-dnp3-capture-procedure.md`.
+
+   After provisioning, run the qualified readiness and image-inventory mechanics through the formal attempt lifecycle:
+
+   <!-- k8-test:id=formal-readiness-inventory mode=parse cwd=Study01 -->
+   ```powershell
+   .\tools\Invoke-K8Step.ps1 -Description 'Compose and application readiness' -Command {
+     python studies/study-01-negative-result/scripts/study01_formal_actions.py readiness --run-id $RunId --compose $Compose --run-evidence $RunEvidence
+   }
+   .\tools\Invoke-K8Step.ps1 -Description 'exact runtime image inventory' -Command {
+     python studies/study-01-negative-result/scripts/study01_formal_actions.py image-inventory --run-id $RunId --compose $Compose --run-evidence $RunEvidence
+   }
+   ```
 5. Place and hash the sender asset, then invoke it **exactly once** through `study01_sender.py` — `protocol/c2-dnp3-sender-procedure.md`. The invocation defines T0, and the frozen window is `[T0 − 5 s, T0 + 15 s]`.
 6. Cover the window, stop and export both captures, then decode both pcaps against the frozen selector using the literal command in `protocol/c2-dnp3-capture-procedure.md` §5.2 — do not synthesize a `tshark` field list from memory; a prior formal attempt (`k8-repro-20260928-001`) guessed the wrong field name here and was closed `Failed` for it.
 7. Query the Collector and Rule stages using the literal commands in [`protocol/c2-dnp3-collector-rule-query-procedure.md`](./studies/study-01-negative-result/protocol/c2-dnp3-collector-rule-query-procedure.md) — do not synthesize an Elasticsearch query from memory; a prior formal attempt (`k8-repro-20260929-001`) found no literal command published for this step and closed `Failed` rather than invent one.
@@ -265,6 +291,33 @@ python studies/study-01-negative-result/scripts/study01_evidence_tree.py `
 8. Retain the runtime contract record, image inventory, environment, and deviations; tear down.
 9. `study01_collect.py validate-evidence`, then `finalize-evidence`, then `verify-integrity`.
 10. Score offline with `study01_score.py`. See §6.2 first — derive the scoring input from **your** evidence before you look at the expected values.
+
+    These mechanics are literal and connected; none authors a scientific verdict:
+
+    <!-- k8-test:id=formal-runtime-finalize-score mode=parse cwd=Study01 -->
+    ```powershell
+    .\tools\Invoke-K8Step.ps1 -Description 'runtime-contract mechanical observation' -Command {
+      python studies/study-01-negative-result/scripts/study01_formal_actions.py runtime-observation --range $Range --run-id $RunId --compose $Compose --run-evidence $RunEvidence
+    }
+    # Author metadata.md and deviations.md from retained evidence here. This is intentional human judgment.
+    $FinalizeSnapshot = Join-Path $env:K8_ATTEMPT_DIR "records\finalize-identity-$RunId.json"
+    .\tools\Invoke-K8Step.ps1 -Description 'validate finalize and verify evidence' -Command {
+      python studies/study-01-negative-result/scripts/study01_formal_actions.py finalize --run-evidence $RunEvidence --finalize-snapshot $FinalizeSnapshot
+    }
+    $ScoringInput = Join-Path $env:K8_ATTEMPT_DIR "records\scoring-input-$RunId.json"
+    $ScoreOutput = Join-Path $env:K8_ATTEMPT_DIR "records\score-$RunId.json"
+    $ScoringValidation = Join-Path $env:K8_ATTEMPT_DIR "records\scoring-validation-$RunId.json"
+    .\tools\Invoke-K8Step.ps1 -Description 'create blank scoring-input shape' -Command {
+      python studies/study-01-negative-result/scripts/study01_formal_actions.py scoring-template --range $Range --run-evidence $RunEvidence --output $ScoringInput
+    }
+    # Replace only the explicit placeholders from this run's evidence and add each required derivation; do not open expected/.
+    .\tools\Invoke-K8Step.ps1 -Description 'validate operator-authored scoring-input shape' -Command {
+      python studies/study-01-negative-result/scripts/study01_formal_actions.py validate-scoring --range $Range --run-evidence $RunEvidence --input $ScoringInput --finalize-snapshot $FinalizeSnapshot --validation-report $ScoringValidation
+    }
+    .\tools\Invoke-K8Step.ps1 -Description 'run frozen scorer' -Command {
+      python studies/study-01-negative-result/scripts/study01_formal_actions.py score --range $Range --run-evidence $RunEvidence --input $ScoringInput --finalize-snapshot $FinalizeSnapshot --output $ScoreOutput
+    }
+    ```
 
 Expected, not forced: Ground Truth / Sensor / Collector Pass, runtime contract Pass, rule output `Alert`, classification `Valid detection result`.
 
@@ -288,6 +341,15 @@ Additionally, Range B must capture and retain the R-OBS-05 unrelated-flow livene
 
 Its `resolve` / `start` / `stop-export` commands are in `protocol/c2-dnp3-capture-procedure.md` §7, run with `--stage robs05-liveness` in the same order and window as the other two stages.
 
+After all three captures are exported and the target Collector/Rule queries complete, execute the frozen R-OBS-05 mapping, query, decode, and exact correlation mechanically:
+
+<!-- k8-test:id=formal-robs05-observation mode=parse cwd=Study01 -->
+```powershell
+.\tools\Invoke-K8Step.ps1 -Description 'Range B R-OBS-05 mechanical observation' -Command {
+  python studies/study-01-negative-result/scripts/study01_formal_actions.py r-obs-05 --run-id $RunId --compose $Compose --run-evidence $RunEvidence
+}
+```
+
 Expected, not forced: Ground Truth Pass; Sensor and Collector Fail; rule output `No alert`; R-OBS-05 Pass; runtime contract Fail; classification `Invalid negative result`.
 
 ### 5.3 Range C — static validation only
@@ -300,6 +362,27 @@ Range C is **never provisioned**. `docker compose up` is not part of this step i
 2. Derive the negative manifest from the pinned base manifest by the substitution recorded in `experiments/range-c-negative-manifest/` — a segment required by `observability_contract.required_segments` while `instrumentation.exclude` removes it. Preserve the base manifest's own line terminators; the original base is CRLF in the worktree.
 3. Run only `python platform/cli.py validate manifests/power-grid-reference.range-c-negative.yaml`.
 4. Retain the derived manifest, the derivation, the command, stdout, stderr, the exit code, and tool versions as raw bytes without newline translation.
+
+The following is the complete formal mechanism. The first command performs exactly steps 1–4 and invokes the validator exactly once. The three narrative files remain human-authored. The promoted packager then copies the retained bytes into the formal package and verifies them; its original Shakedown invocation still refuses this path unless `--formal-attempt-dir` binds all inputs and outputs to the current formal attempt.
+
+<!-- k8-test:id=formal-range-c-observe-package mode=parse cwd=Study01 -->
+```powershell
+$ValidationId = 'k8-range-c-YYYYMMDD-001'
+$RangeCSource = Join-Path $env:K8_ATTEMPT_DIR 'amenonuboco-v0.13.1'
+$Producer = Join-Path $env:K8_ATTEMPT_DIR "range-c-producer\$ValidationId"
+$HumanDir = Join-Path $env:K8_ATTEMPT_DIR "range-c-human\$ValidationId"
+$Destination = Join-Path $env:K8_ATTEMPT_DIR "evidence\static-validations\range-c\$ValidationId"
+.\tools\Invoke-K8Step.ps1 -Description 'Range C single validator observation' -ExpectedExitCode 0 -Command {
+  python studies/study-01-negative-result/scripts/study01_range_c.py --source $RangeCSource --attempt-dir $env:K8_ATTEMPT_DIR --validation-id $ValidationId
+}
+# Author metadata.md, deviations.md, and validation-command.md under $HumanDir from retained observations.
+.\tools\Invoke-K8Step.ps1 -Description 'Range C formal package' -Command {
+  python ..\shakedown\tools\k8_rangec_formal_package.py build --formal-attempt-dir $env:K8_ATTEMPT_DIR --run-evidence "$Producer\run-evidence" --run-records "$Producer\run-records" --human-dir $HumanDir --destination $Destination --validation-id $ValidationId
+}
+.\tools\Invoke-K8Step.ps1 -Description 'Range C formal package verification' -Command {
+  python ..\shakedown\tools\k8_rangec_formal_package.py verify --run-evidence "$Producer\run-evidence" --run-records "$Producer\run-records" --destination $Destination
+}
+```
 
 Expected, not forced: exit `1`, empty stdout, and a stderr naming `observability_contract.required_segments` and `sub_a_l2_lan`.
 

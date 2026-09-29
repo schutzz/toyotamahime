@@ -213,8 +213,38 @@ def assert_candidate_citation_coverage(candidates: dict, deviations_text: str) -
 
 
 def build(run_evidence: Path, run_records: Path, destination: Path,
-          validation_id: str, human_dir: Path) -> dict:
-    assert_not_canonical_evidence_path(destination)
+          validation_id: str, human_dir: Path, formal_attempt_dir: Path | None = None) -> dict:
+    # K8-S2-AUTHORIZATION-BLOCKER-RESOLUTION.md SS2.4 promotes this exact
+    # mechanism for formal K8-3.  The default remains the original Shakedown
+    # fail-closed boundary.  Only an explicit formal-attempt invocation may
+    # place bytes under the formal attempt's canonical evidence path.
+    formal_attempt = formal_attempt_dir is not None
+    if not formal_attempt:
+        assert_not_canonical_evidence_path(destination)
+    else:
+        attempt = formal_attempt_dir.resolve()
+        if not (attempt / "attempt.json").is_file():
+            raise PackagingError(f"formal attempt binding is missing attempt.json: {attempt}")
+        producer = attempt / "range-c-producer" / validation_id
+        expected_destination = attempt / "evidence" / "static-validations" / "range-c" / validation_id
+        expected_human = attempt / "range-c-human" / validation_id
+        expected = {
+            "run-evidence": producer / "run-evidence",
+            "run-records": producer / "run-records",
+            "human-dir": expected_human,
+            "destination": expected_destination,
+        }
+        actual = {
+            "run-evidence": run_evidence,
+            "run-records": run_records,
+            "human-dir": human_dir,
+            "destination": destination,
+        }
+        mismatches = [name for name in expected if actual[name].resolve() != expected[name].resolve()]
+        if mismatches:
+            raise PackagingError(
+                "formal Range C paths are not bound to the declared current attempt: "
+                + ", ".join(mismatches))
     if destination.exists() and any(destination.iterdir()):
         raise PackagingError(
             f"{destination} already exists and is not empty. A previous attempt is never "
@@ -284,9 +314,11 @@ def build(run_evidence: Path, run_records: Path, destination: Path,
     return {
         "validation_id": validation_id,
         "destination": str(destination),
-        "evidentiary_status": "NON-EVIDENTIARY qualification artifact (K8-S2 Shakedown). "
-                              "This is not formal K8 evidence and is not placed under the "
-                              "canonical formal evidence path.",
+        "evidentiary_status": (
+            "FORMAL K8-3 attempt evidence" if formal_attempt else
+            "NON-EVIDENTIARY qualification artifact (K8-S2 Shakedown). "
+            "This is not formal K8 evidence and is not placed under the canonical formal evidence path."
+        ),
         "covered_files": len(files),
         "environment_versions": versions_json["versions"],
         "candidates_surfaced": len(candidates.get("candidates") or []),
@@ -359,7 +391,8 @@ def verify(destination: Path, run_evidence: Path, run_records: Path) -> list:
 
 def cmd_build(args):
     result = build(args.run_evidence.resolve(), args.run_records.resolve(),
-                   args.destination.resolve(), args.validation_id, args.human_dir.resolve())
+                   args.destination.resolve(), args.validation_id, args.human_dir.resolve(),
+                   formal_attempt_dir=args.formal_attempt_dir)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
@@ -370,8 +403,7 @@ def cmd_verify(args):
         for p in problems:
             print(f"FAIL  {p}", file=sys.stderr)
         raise SystemExit(1)
-    print("Range C formal-shape package verification: PASS "
-          "(a NON-EVIDENTIARY qualification artifact, not formal K8 evidence)")
+    print("Range C package verification: PASS (shape, retained bytes, and integrity)")
 
 
 def main(argv=None):
@@ -385,6 +417,8 @@ def main(argv=None):
         if name == "build":
             p.add_argument("--validation-id", required=True)
             p.add_argument("--human-dir", type=Path, required=True)
+            p.add_argument("--formal-attempt-dir", type=Path,
+                           help="bind packaging to this current formal attempt directory; never use for Shakedown output")
         p.set_defaults(func=fn)
     args = parser.parse_args(argv)
     try:
