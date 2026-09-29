@@ -253,6 +253,31 @@
     self-reference and the two files carrying the execution-authority
     clarification.
 
+    v18 closes an executable-transcription gap found by formal K8-3
+    attempt k8-repro-20260929-001. Range A completed provisioning,
+    capture, sender invocation, and pcap decode verification, then found
+    that freeze-decision-table.md Sec3 and evidence-schema.md Sec3 fix the
+    frozen Collector (ot-logs-dnp3-*) and Rule (ot-signals-zone-violation-*)
+    target-event selectors and required retained artifacts, but no
+    document published a literal, executable query -- the same class of
+    gap the v16 pcap-decode-command fix and the v17 Range C
+    execution-authority clarification each closed once already.
+    k8-repro-20260929-001 closed FAILED / CLOSED, unrepaired, rather than
+    synthesizing a query from outside knowledge. The fix promotes the
+    already-qualified shakedown/tools/collector-query.template.json and
+    rule-query.template.json -- byte-for-byte, now under
+    Study01/studies/study-01-negative-result/scripts/study01/frozen/ --
+    and the docker-exec-curl-into-the-elasticsearch-container mechanism
+    shakedown/tools/K8ShakedownCommon.psm1's Invoke-K8ElasticsearchRequest
+    already used, into a new formal scripts/study01_query.py (`collector`
+    / `rule` subcommands) and
+    protocol/c2-dnp3-collector-rule-query-procedure.md, referenced from
+    README Sec5.1's new step 7. No frozen event, selector, window, index
+    pattern, evidence schema path, scoring rule, Range B/C semantics, or
+    K4/K8 acceptance criteria changed. This v18 release-prep commit itself
+    changes only the immutable bootstrap self-reference and the files
+    carrying this transcription fix.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -275,7 +300,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v17` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v18` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -300,7 +325,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v17',
+    [string] $Ref = 'k8-bootstrap-v18',
 
     # Additional attempt-ID inventory root(s) to check before allocating,
     # besides $AttemptRoot -- see this file's own "Post-v14 change" note
