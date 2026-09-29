@@ -68,7 +68,7 @@ python -m pytest tests -q
 Pop-Location
 ```
 
-99 tests should pass. If they do not, stop and record the failure; do not continue. This exact count is machine-checked, not just documented here: `Study01/tools/Test-Study01Packaging.ps1`'s packaging certification runs this same check against this repository's own shipped test suite before every bootstrap release and fails certification if the actual collected/passed count and this paragraph's stated count disagree, so a future apparatus change that adds or removes tests cannot ship without this paragraph being updated in the same commit. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (99 passed):
+106 tests should pass. If they do not, stop and record the failure; do not continue. This exact count is machine-checked, not just documented here: `Study01/tools/Test-Study01Packaging.ps1`'s packaging certification runs this same check against this repository's own shipped test suite before every bootstrap release and fails certification if the actual collected/passed count and this paragraph's stated count disagree, so a future apparatus change that adds or removes tests cannot ship without this paragraph being updated in the same commit. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (106 passed):
 
 <!-- k8-test:id=apparatus-check-via-harness mode=exec cwd=Study01 -->
 ```powershell
@@ -88,9 +88,9 @@ This section adds an **optional harness** that automates the bookkeeping around 
 
 <!-- k8-test:id=bootstrap-fetch-verify-run mode=parse cwd=repo-root -->
 ```powershell
-$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v17/bootstrap/Start-Study01.ps1'
+$Url      = 'https://raw.githubusercontent.com/schutzz/toyotamahime/k8-bootstrap-v18/bootstrap/Start-Study01.ps1'
 $Dest     = Join-Path $env:TEMP 'Start-Study01.ps1'
-$Expected = 'd00b2cd294f39395e70132e058089127631ddfa58c0c0bd61ded52c7858641c7'
+$Expected = '14b98967945b6ca23e656fc4ddb04e96a0712368a4dd1758f639680643b3680e'
 
 Invoke-WebRequest -Uri $Url -OutFile $Dest
 $Actual = (Get-FileHash -Path $Dest -Algorithm SHA256).Hash.ToLower()
@@ -101,7 +101,7 @@ if ($Actual -ne $Expected) {
 & $Dest
 ```
 
-The tag `k8-bootstrap-v17` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. `Start-Study01.ps1` also checks out that same tag by default when it clones Toyotamahime (its `-Ref` parameter defaults to `k8-bootstrap-v17`), so the commit you fetched this script from and the commit your attempt actually reproduces are the same one, even if `main` has moved on by the time you run this. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
+The tag `k8-bootstrap-v18` points at a specific commit in this repository's history, the same way §4.1 pins Amenonuboco by tag rather than by a moving branch. `Start-Study01.ps1` also checks out that same tag by default when it clones Toyotamahime (its `-Ref` parameter defaults to `k8-bootstrap-v18`), so the commit you fetched this script from and the commit your attempt actually reproduces are the same one, even if `main` has moved on by the time you run this. If you would rather read the script before running it, it is right there in the repository you are about to clone: [`bootstrap/Start-Study01.ps1`](../bootstrap/Start-Study01.ps1).
 
 **What it executes and where it writes.** `Start-Study01.ps1` creates a new attempt directory under `C:\K8\attempts\<attempt-id>\` (override with `-AttemptRoot`), starts a transcript there, clones `https://github.com/schutzz/toyotamahime` into it, records the exact clone `HEAD`, and captures a small environment record. It writes only under `-AttemptRoot`; it does not touch anything outside it, and it does not send anything over the network beyond the clone itself.
 
@@ -250,10 +250,21 @@ python studies/study-01-negative-result/scripts/study01_evidence_tree.py `
    Do not hand-build this tree from a directory listing. The wrapper calls the same definition the preflight gate checks against, so the two cannot disagree; it creates **eight** directories, including the two nested capture-export destinations `ground-truth/independent-capture/` and `sensor-input/mirror-capture/` that the capture procedure writes into. A formal attempt that hand-built the six top-level ones was stopped by the gate at 12/13.
 4. Provision, establish readiness, resolve the capture contexts, and start the capture helpers before the event window opens — `protocol/c2-dnp3-capture-procedure.md`.
 5. Place and hash the sender asset, then invoke it **exactly once** through `study01_sender.py` — `protocol/c2-dnp3-sender-procedure.md`. The invocation defines T0, and the frozen window is `[T0 − 5 s, T0 + 15 s]`.
-6. Cover the window, stop and export both captures, then decode both pcaps against the frozen selector using the literal command in `protocol/c2-dnp3-capture-procedure.md` §5.2 — do not synthesize a `tshark` field list from memory; a prior formal attempt (`k8-repro-20260928-001`) guessed the wrong field name here and was closed `Failed` for it. Retain the Collector and Rule queries with their responses and mappings.
-7. Retain the runtime contract record, image inventory, environment, and deviations; tear down.
-8. `study01_collect.py validate-evidence`, then `finalize-evidence`, then `verify-integrity`.
-9. Score offline with `study01_score.py`. See §6.2 first — derive the scoring input from **your** evidence before you look at the expected values.
+6. Cover the window, stop and export both captures, then decode both pcaps against the frozen selector using the literal command in `protocol/c2-dnp3-capture-procedure.md` §5.2 — do not synthesize a `tshark` field list from memory; a prior formal attempt (`k8-repro-20260928-001`) guessed the wrong field name here and was closed `Failed` for it.
+7. Query the Collector and Rule stages using the literal commands in [`protocol/c2-dnp3-collector-rule-query-procedure.md`](./studies/study-01-negative-result/protocol/c2-dnp3-collector-rule-query-procedure.md) — do not synthesize an Elasticsearch query from memory; a prior formal attempt (`k8-repro-20260929-001`) found no literal command published for this step and closed `Failed` rather than invent one.
+
+   <!-- k8-test:id=collector-rule-query mode=parse cwd=Study01 -->
+   ```powershell
+   python studies/study-01-negative-result/scripts/study01_query.py collector `
+     --run-id <run-id> --run-evidence <run-evidence> --compose <run-workspace>/power-grid-reference.<range>.docker-compose.yml
+   python studies/study-01-negative-result/scripts/study01_query.py rule `
+     --run-id <run-id> --run-evidence <run-evidence> --compose <run-workspace>/power-grid-reference.<range>.docker-compose.yml
+   ```
+
+   Retain the Collector and Rule queries with their requests and raw responses, as this command already does.
+8. Retain the runtime contract record, image inventory, environment, and deviations; tear down.
+9. `study01_collect.py validate-evidence`, then `finalize-evidence`, then `verify-integrity`.
+10. Score offline with `study01_score.py`. See §6.2 first — derive the scoring input from **your** evidence before you look at the expected values.
 
 Expected, not forced: Ground Truth / Sensor / Collector Pass, runtime contract Pass, rule output `Alert`, classification `Valid detection result`.
 

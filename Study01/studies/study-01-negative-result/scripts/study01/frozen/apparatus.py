@@ -3,6 +3,9 @@
 Apparatus constants used by the Docker-free execution preflight.  They carry
 no scoring semantics; ``semantics.py`` remains the sole scoring transcription.
 """
+from pathlib import Path
+
+_FROZEN_DIR = Path(__file__).parent
 
 # c2-dnp3-range-derivation.md §1
 AMENONUBOCO_COMMIT = "80e550ffeab8daa6583590add490433a0305bb53"
@@ -84,6 +87,23 @@ CAPTURE_CONTAINER_PATHS = tuple(s["container_pcap"] for s in CAPTURE_STAGES.valu
 # c2-dnp3-sender-procedure.md §3.2.  `T0` defines the frozen event window, so it
 # is retained as its own primary artifact rather than only as metadata prose.
 T0_ARTIFACT = "metadata-t0.txt"
+
+# freeze-decision-table.md §3: "record T0 ... and query the event window
+# [T0 - 5 seconds, T0 + 15 seconds]". These two bounds are the same frozen
+# pre-trigger guard and settle bound used by the capture stages; the Collector
+# and Rule queries share them rather than defining a second copy.
+PRE_TRIGGER_GUARD_SECONDS = 5
+SETTLE_WINDOW_SECONDS = 15
+
+# c2-dnp3-collector-rule-query-procedure.md; selectors transcribed unchanged
+# from freeze-decision-table.md §3. The request bodies are frozen constants
+# (query semantics are not a runtime choice), copied byte-for-byte from the
+# already-qualified shakedown/tools/*.template.json this fix promotes into
+# the formal package -- see that document's "Formal K8-3 correction basis".
+COLLECTOR_INDEX_PATTERN = "ot-logs-dnp3-*"
+RULE_INDEX_PATTERN = "ot-signals-zone-violation-*"
+COLLECTOR_QUERY_TEMPLATE = _FROZEN_DIR / "collector-query.template.json"
+RULE_QUERY_TEMPLATE = _FROZEN_DIR / "rule-query.template.json"
 
 # Every in-container path the canonical procedures pass through the host shell.
 # A host shell that rewrites any of them cannot execute a Pilot or Main run.
