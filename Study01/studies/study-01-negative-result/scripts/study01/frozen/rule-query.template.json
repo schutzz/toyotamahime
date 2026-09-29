@@ -1,0 +1,25 @@
+{
+  "size": 10000,
+  "track_total_hits": true,
+  "sort": [
+    {"@timestamp": {"order": "asc"}}
+  ],
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "range": {
+            "@timestamp": {
+              "gte": "<WINDOW_START>",
+              "lte": "<WINDOW_END>"
+            }
+          }
+        },
+        {"term": {"signal.keyword": "signal-1-zone-violation"}},
+        {"term": {"src_ip.keyword": "10.1.20.11"}},
+        {"term": {"dst_ip.keyword": "10.1.10.10"}},
+        {"terms": {"source_dnp3_doc_id.keyword": "<COLLECTOR_HIT_IDS_JSON>"}}
+      ]
+    }
+  }
+}
