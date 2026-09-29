@@ -228,6 +228,31 @@
     changes only the immutable bootstrap self-reference and README/
     PROVENANCE documentation.
 
+    v17 closes an execution-authority gap found by formal K8-3 attempt
+    k8-repro-20260928-003. Range A and Range B both completed and scored
+    an exact match against expected/, then Range C failed because the
+    operator executed protocol/c2-dnp3-range-derivation.md Sec4's
+    `provision` command -- retained there as historical/reference
+    material from the pre-K4 static-derivation check, not an authorized
+    formal step. Study01/README.md Sec5.3's four-step procedure
+    (`validate` only, never `provision`) was already the actual
+    execution authority, but nothing said so explicitly, leaving room to
+    read the linked protocol document's runnable command as a
+    prerequisite. Study01/README.md Sec5.3 now states plainly that it is
+    the sole execution authority for formal Range C, names its four
+    steps as exhaustive, and says explicitly that commands in linked
+    protocol documents -- naming c2-dnp3-range-derivation.md Sec4's
+    `provision` line -- are reference material only unless Sec5.3 itself
+    imports them; that document gets a matching warning next to the
+    `provision` command itself, without deleting or altering it (still
+    needed for its historical/pre-K4 purpose). No change to the Range C
+    validator, its expected result, protocol scientific semantics, Range
+    A/B, the scorer, evidence schema, or Gate K8 criteria.
+    k8-repro-20260928-003 remains FAILED / CLOSED, unrepaired. This v17
+    release-prep commit itself changes only the immutable bootstrap
+    self-reference and the two files carrying the execution-authority
+    clarification.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -250,7 +275,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v16` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v17` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -275,7 +300,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v16',
+    [string] $Ref = 'k8-bootstrap-v17',
 
     # Additional attempt-ID inventory root(s) to check before allocating,
     # besides $AttemptRoot -- see this file's own "Post-v14 change" note
