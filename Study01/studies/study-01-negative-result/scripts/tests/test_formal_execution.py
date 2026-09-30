@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from argparse import Namespace
 from pathlib import Path
 
@@ -161,6 +162,196 @@ class FormalExecutionTests(unittest.TestCase):
                                root / "evidence" / "static-validations" / "range-c" / "v",
                                "v", root / "range-c-human" / "v",
                                formal_attempt_dir=root)
+
+
+class ImageInventoryServiceResolutionTests(unittest.TestCase):
+    """K8-3 diagnostic continuation regression (2026-09-30): fixed condition observed in
+    formal attempt k8-repro-20260930-001. `docker compose images --format json` on
+    Docker Compose v5.4.0 carries no "Service" key at all, and the underscore-containing
+    service name "es_enrich_refresher" (and any other underscore-containing service, e.g.
+    "wan_router", "cc_ups") could never match the old ContainerName-token fallback, because
+    that fallback destroyed underscores (via .replace("_","-")) before comparing them
+    against the un-mangled service name. `docker compose ps --format json` reliably
+    carries both "Name" and "Service"; image_inventory() now resolves ContainerName ->
+    Service from that instead of pattern-matching the container name string."""
+
+    def _run_stub(self, config_services, images_rows, ps_rows, image_inspect_by_ref):
+        def fake_run(argv, *, text=True, check=True):
+            if argv[:2] == ["docker", "compose"] and "config" in argv:
+                stdout = "\n".join(config_services)
+            elif argv[:2] == ["docker", "compose"] and "images" in argv:
+                stdout = json.dumps(images_rows)
+            elif argv[:2] == ["docker", "compose"] and "ps" in argv:
+                stdout = json.dumps(ps_rows)
+            elif argv[:2] == ["docker", "image"]:
+                ref = argv[3]
+                stdout = json.dumps([image_inspect_by_ref[ref]])
+            else:
+                raise AssertionError(f"unexpected command in test stub: {argv!r}")
+            return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+        return fake_run
+
+    def _project_fixture(self):
+        project = "k8-range-a-20260930-001"
+        # Real shape observed in k8-repro-20260930-001's retained compose-images.json:
+        # no "Service" key anywhere, ContainerName is the only correlation key available.
+        images_rows = [
+            {"ID": "sha256:" + "1" * 64, "ContainerName": f"{project}-elasticsearch-1",
+             "Repository": "docker.elastic.co/elasticsearch/elasticsearch", "Tag": "8.12.0"},
+            {"ID": "sha256:" + "2" * 64, "ContainerName": f"{project}-cc_ups-1",
+             "Repository": "ghcr.io/schutzz/amenonuboco-power-grid-python-tools", "Tag": ""},
+            {"ID": "sha256:" + "3" * 64, "ContainerName": f"{project}-wan_router-1",
+             "Repository": "ghcr.io/schutzz/amenonuboco-network-tools", "Tag": ""},
+            {"ID": "sha256:" + "4" * 64, "ContainerName": f"{project}-es_enrich_refresher-1",
+             "Repository": "curlimages/curl", "Tag": "latest"},
+        ]
+        ps_rows = [
+            {"Name": row["ContainerName"], "Service": row["ContainerName"][len(project) + 1:-2]}
+            for row in images_rows
+        ]
+        image_inspect_by_ref = {}
+        for row in images_rows:
+            ref = row["ID"]
+            image_inspect_by_ref[ref] = {"Id": ref, "RepoDigests": []}
+        config_services = [row["Service"] for row in ps_rows]
+        return project, config_services, images_rows, ps_rows, image_inspect_by_ref
+
+    def test_underscore_service_names_resolve_via_ps_service_field(self):
+        project, config_services, images_rows, ps_rows, inspect_by_ref = self._project_fixture()
+        self.assertIn("es_enrich_refresher", config_services)  # fixture matches the observed failure
+        with tempfile.TemporaryDirectory() as d:
+            run_evidence = Path(d) / "run-evidence"
+            (run_evidence / "environment").mkdir(parents=True)
+            a = Namespace(run_id=project, compose=Path("compose.yml"), run_evidence=run_evidence)
+            fake_run = self._run_stub(config_services, images_rows, ps_rows, inspect_by_ref)
+            with unittest.mock.patch.object(formal, "run", side_effect=fake_run):
+                formal.image_inventory(a)
+            written = json.loads((run_evidence / "environment" / "image-inventory.json").read_text(encoding="utf-8"))
+            resolved_services = sorted(row["service"] for row in written["services"])
+            self.assertEqual(resolved_services, sorted(config_services))
+            es_row = next(row for row in written["services"] if row["service"] == "es_enrich_refresher")
+            self.assertEqual(es_row["resolved_reference"], "sha256:" + "4" * 64)
+
+    def test_zero_matching_rows_still_fails_closed(self):
+        project, config_services, images_rows, ps_rows, inspect_by_ref = self._project_fixture()
+        # Drop the ps row that would let "es_enrich_refresher" resolve at all.
+        ps_rows = [r for r in ps_rows if r["Service"] != "es_enrich_refresher"]
+        with tempfile.TemporaryDirectory() as d:
+            run_evidence = Path(d) / "run-evidence"
+            (run_evidence / "environment").mkdir(parents=True)
+            a = Namespace(run_id=project, compose=Path("compose.yml"), run_evidence=run_evidence)
+            fake_run = self._run_stub(config_services, images_rows, ps_rows, inspect_by_ref)
+            with unittest.mock.patch.object(formal, "run", side_effect=fake_run):
+                with self.assertRaisesRegex(RuntimeError, "got 0"):
+                    formal.image_inventory(a)
+
+    def test_multiple_matching_rows_still_fails_closed(self):
+        project, config_services, images_rows, ps_rows, inspect_by_ref = self._project_fixture()
+        # A second images row that also maps to "es_enrich_refresher" via ps must not be
+        # silently accepted -- exactly one row is required, never a "first match wins".
+        duplicate = dict(images_rows[-1]); duplicate["ID"] = "sha256:" + "5" * 64
+        duplicate["ContainerName"] = f"{project}-es_enrich_refresher-2"
+        images_rows = images_rows + [duplicate]
+        ps_rows = ps_rows + [{"Name": duplicate["ContainerName"], "Service": "es_enrich_refresher"}]
+        inspect_by_ref[duplicate["ID"]] = {"Id": duplicate["ID"], "RepoDigests": []}
+        with tempfile.TemporaryDirectory() as d:
+            run_evidence = Path(d) / "run-evidence"
+            (run_evidence / "environment").mkdir(parents=True)
+            a = Namespace(run_id=project, compose=Path("compose.yml"), run_evidence=run_evidence)
+            fake_run = self._run_stub(config_services, images_rows, ps_rows, inspect_by_ref)
+            with unittest.mock.patch.object(formal, "run", side_effect=fake_run):
+                with self.assertRaisesRegex(RuntimeError, "got 2"):
+                    formal.image_inventory(a)
+
+
+class RuntimeObservationUnrelatedMirrorFilterTests(unittest.TestCase):
+    """K8-3 diagnostic continuation cross-check (2026-09-30, one-time bounded
+    review of docs/k8-formal-actions.json): runtime_observation()'s Range B
+    branch previously re-queried the FAULT interface itself under the
+    misleading name "unrelated-mirror-filters.txt" and asserted nothing --
+    c2-dnp3-range-derivation.md §3 requires verifying that an UNRELATED
+    observed-segment mirror filter remains available. The qualified
+    Shakedown mechanism (Assert-K8UnrelatedMirrorFilter) enumerates every
+    OTHER interface (excluding lo and the fault interface) and fails closed
+    if none retains a mirred egress mirror filter; this was an
+    INDEPENDENT_EQUIVALENCE_UNTESTED gap now closed to match."""
+
+    ROUTER = "router-cid"
+    ZONE = "zone-cid"
+    IFACE = "eth5"
+
+    def _seed_required_evidence(self, run_evidence, range_="B"):
+        rel = ["ground-truth/independent-capture/capture-lifecycle.json",
+               "sensor-input/mirror-capture/capture-lifecycle.json",
+               "collector-output/collector-response.json", "rule-output/rule-response.json"]
+        if range_ == "B": rel += ["contract-output/r-obs-05-mapping-gate.json", "contract-output/r-obs-05-correlation.json"]
+        for r in rel:
+            p = run_evidence / r
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("{}", encoding="utf-8")
+
+    def _run_stub(self, link_show_lines, filters_by_iface):
+        def fake_run(argv, *, text=True, check=True):
+            if argv[:4] == ["docker", "compose", "-p", "k8-range-b-1"]:
+                stdout = json.dumps([{"Service": "wan_router"}])
+            elif argv[:3] == ["docker", "exec", self.ROUTER] and argv[3:6] == ["sh", "-lc", "ip -o -4 addr show"]:
+                stdout = f"5: {self.IFACE}    inet 10.1.20.254/24 scope global {self.IFACE}\\       valid_lft forever preferred_lft forever"
+            elif argv[:4] == ["docker", "exec", self.ROUTER, "tc"] and argv[4:7] == ["qdisc", "show", "dev"]:
+                stdout = "qdisc noqueue 0: root refcnt 2"
+            elif argv[:4] == ["docker", "exec", self.ROUTER, "ip"] and argv[4:] == ["-o", "link", "show"]:
+                stdout = "\n".join(link_show_lines)
+            elif argv[:4] == ["docker", "exec", self.ROUTER, "tc"] and argv[4:6] == ["filter", "show"]:
+                other = argv[argv.index("dev") + 1]
+                stdout = filters_by_iface.get(other, "")
+            elif argv[:2] == ["docker", "inspect"]:
+                stdout = "true"
+            else:
+                raise AssertionError(f"unexpected command in test stub: {argv!r}")
+            return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+        return fake_run
+
+    def _resolve_container_stub(self):
+        def fake_resolve(run_id, compose, service="elasticsearch"):
+            return {"wan_router": self.ROUTER, "zone_detector": self.ZONE}[service]
+        return fake_resolve
+
+    def test_unrelated_interface_with_mirror_filter_passes_and_excludes_fault_interface(self):
+        link_lines = [f"5: {self.IFACE}:    <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500",
+                      "1: lo:    <LOOPBACK,UP,LOWER_UP> mtu 65536",
+                      "8: eth7:    <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500"]
+        # Real iproute2 tc output for a MIRROR (not redirect) action names the
+        # target device inside the parenthetical, then repeats the action
+        # class word right after "Egress": "Egress Mirror to device X".
+        filters = {"eth7": "filter parent ffff: protocol all pref 1 matchall\n\taction order 1: mirred (Egress Mirror to device eth3) pipe"}
+        with tempfile.TemporaryDirectory() as d:
+            run_evidence = Path(d) / "run-evidence"; run_evidence.mkdir()
+            self._seed_required_evidence(run_evidence)
+            a = Namespace(run_id="k8-range-b-1", compose=Path("compose.yml"), run_evidence=run_evidence, range="B")
+            with unittest.mock.patch.object(formal, "run", side_effect=self._run_stub(link_lines, filters)), \
+                 unittest.mock.patch.object(formal, "resolve_container", side_effect=self._resolve_container_stub()):
+                formal.runtime_observation(a)
+            written = json.loads((run_evidence / "contract-output" / "unrelated-mirror-filters.json").read_text(encoding="utf-8"))
+            self.assertEqual(written["fault_interface"], self.IFACE)
+            probed_ifaces = [row["interface"] for row in written["probed"]]
+            self.assertNotIn(self.IFACE, probed_ifaces)  # the fault interface itself must be excluded
+            self.assertNotIn("lo", probed_ifaces)
+            self.assertIn("eth7", probed_ifaces)
+            nontriviality = json.loads((run_evidence / "contract-output" / "range-b-nontriviality.json").read_text(encoding="utf-8"))
+            self.assertTrue(nontriviality["unrelated_mirror_filter_found"])
+
+    def test_no_unrelated_interface_with_mirror_filter_fails_closed(self):
+        link_lines = [f"5: {self.IFACE}:    <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500",
+                      "1: lo:    <LOOPBACK,UP,LOWER_UP> mtu 65536",
+                      "8: eth7:    <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500"]
+        filters = {"eth7": "filter parent ffff: protocol all pref 1 matchall\naction drop"}  # no mirred egress mirror anywhere
+        with tempfile.TemporaryDirectory() as d:
+            run_evidence = Path(d) / "run-evidence"; run_evidence.mkdir()
+            self._seed_required_evidence(run_evidence)
+            a = Namespace(run_id="k8-range-b-1", compose=Path("compose.yml"), run_evidence=run_evidence, range="B")
+            with unittest.mock.patch.object(formal, "run", side_effect=self._run_stub(link_lines, filters)), \
+                 unittest.mock.patch.object(formal, "resolve_container", side_effect=self._resolve_container_stub()):
+                with self.assertRaisesRegex(RuntimeError, "no unrelated gateway interface retained a mirred egress mirror filter"):
+                    formal.runtime_observation(a)
 
 
 if __name__ == "__main__": unittest.main()

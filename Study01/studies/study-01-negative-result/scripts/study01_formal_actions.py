@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import time
@@ -164,11 +165,24 @@ def image_inventory(a):
     raw=run(["docker","compose","-p",a.run_id,"-f",str(a.compose),"images","--format","json"]).stdout
     (a.run_evidence/"environment"/"compose-images.json").write_text(raw,encoding="utf-8")
     image_rows=json_values(raw)
+    # Some Compose versions omit "Service" from `images --format json` rows (observed:
+    # Docker Compose v5.4.0 emits ID/ContainerName/Repository/Tag/... but no Service key
+    # at all). The prior fallback matched a service name as a literal token of
+    # ContainerName.replace("_","-").split("-"), which can never succeed for any service
+    # whose own name contains an underscore (e.g. "es_enrich_refresher", "wan_router"): the
+    # replace() call destroys that same underscore before the split, so the un-mangled
+    # `service` string can never equal any resulting token. `docker compose ps --format
+    # json` reliably carries both "Name" and "Service" (already relied on above in
+    # readiness()); resolve ContainerName -> Service from that instead of pattern-matching
+    # the container name string.
+    ps_raw=run(["docker","compose","-p",a.run_id,"-f",str(a.compose),"ps","--all","--format","json"]).stdout
+    (a.run_evidence/"environment"/"compose-ps-for-image-inventory.json").write_text(ps_raw,encoding="utf-8")
+    name_to_service={str(r["Name"]):str(r["Service"]) for r in json_values(ps_raw) if r.get("Name") and r.get("Service")}
     rows = []
     for service in services:
         matches=[r for r in image_rows if r.get("Service")==service]
         if not matches:
-            matches=[r for r in image_rows if service in str(r.get("ContainerName","")).replace("_","-").split("-")]
+            matches=[r for r in image_rows if name_to_service.get(str(r.get("ContainerName","")))==service]
         if len(matches)!=1: raise RuntimeError(f"expected exactly one compose image row for {service}, got {len(matches)}")
         row=matches[0]; ref=row.get("ID") or (f"{row.get('Repository')}:{row.get('Tag')}" if row.get("Repository") and row.get("Tag") else None)
         if not ref: raise RuntimeError(f"image reference/ID missing for {service}")
@@ -273,13 +287,37 @@ def runtime_observation(a):
         if len(matches)!=1: raise RuntimeError(f"Range B gateway interface resolution returned {len(matches)} matches")
         iface=matches[0]
         qdisc=run(["docker","exec",router,"tc","qdisc","show","dev",iface]).stdout
-        filters=run(["docker","exec",router,"tc","filter","show","dev",iface,"parent","ffff:"]).stdout
         write_text(root/"contract-output"/"qdisc-post-fault.txt",qdisc)
-        write_text(root/"contract-output"/"unrelated-mirror-filters.txt",filters)
+        # c2-dnp3-range-derivation.md §3 requires verifying that an UNRELATED
+        # observed-segment mirror filter remains available -- i.e. on an
+        # interface other than the one whose ingress qdisc was just deleted.
+        # Re-querying `iface` itself here (as a prior version of this
+        # function did, under the misleading name "unrelated-mirror-
+        # filters.txt") checks the fault interface, not an unrelated one, and
+        # asserts nothing. Enumerate every other interface instead, exactly
+        # as the qualified Shakedown mechanism (Assert-K8UnrelatedMirrorFilter)
+        # does: anchored regex on "ip -o link show", skip lo and the fault
+        # interface, and require at least one match for a mirred egress
+        # mirror filter.
+        links=run(["docker","exec",router,"ip","-o","link","show"]).stdout
+        unrelated_filters=[]
+        found=False
+        for line in links.splitlines():
+            m=re.match(r"^\d+:\s+([^:@]+)", line)
+            if not m: continue
+            other=m.group(1)
+            if other in ("lo", iface): continue
+            probe=run(["docker","exec",router,"tc","filter","show","dev",other,"parent","ffff:"],check=False).stdout
+            unrelated_filters.append({"interface":other,"filter_output":probe})
+            if re.search(r"mirred\s+.*egress\s+mirror", probe, re.IGNORECASE): found=True
+        write_json(root/"contract-output"/"unrelated-mirror-filters.json",{"fault_interface":iface,"probed":unrelated_filters})
+        write_text(root/"contract-output"/"unrelated-mirror-filters.txt",
+                   "\n".join(f"### {row['interface']}\n{row['filter_output']}" for row in unrelated_filters))
+        if not found: raise RuntimeError("no unrelated gateway interface retained a mirred egress mirror filter")
         zone=resolve_container(a.run_id,a.compose,"zone_detector")
         zone_running=run(["docker","inspect","--format","{{.State.Running}}",zone]).stdout.strip()
         write_json(root/"contract-output"/"range-b-nontriviality.json",{"gateway_interface":iface,"qdisc_output":qdisc,
-                   "filter_output":filters,"zone_detector_container":zone,"zone_detector_running":zone_running})
+                   "unrelated_mirror_filter_found":found,"zone_detector_container":zone,"zone_detector_running":zone_running})
         if zone_running != "true": raise RuntimeError("zone_detector is not running")
     rows = []
     for rel in required:

@@ -68,7 +68,7 @@ python -m pytest tests -q
 Pop-Location
 ```
 
-117 tests should pass. If they do not, stop and record the failure; do not continue. This exact count is machine-checked, not just documented here: `Study01/tools/Test-Study01Packaging.ps1`'s packaging certification runs this same check against this repository's own shipped test suite before every bootstrap release and fails certification if the actual collected/passed count and this paragraph's stated count disagree, so a future apparatus change that adds or removes tests cannot ship without this paragraph being updated in the same commit. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (117 passed):
+122 tests should pass. If they do not, stop and record the failure; do not continue. This exact count is machine-checked, not just documented here: `Study01/tools/Test-Study01Packaging.ps1`'s packaging certification runs this same check against this repository's own shipped test suite before every bootstrap release and fails certification if the actual collected/passed count and this paragraph's stated count disagree, so a future apparatus change that adds or removes tests cannot ship without this paragraph being updated in the same commit. If you started this attempt from §3.2's bootstrap, run this through `Invoke-K8Step.ps1` instead of typing it directly, so the exit code and failure are recorded automatically. This form stays at `Study01/` throughout (`.\tools\...` needs that), passing pytest the full path to `tests/` instead of changing directory into it — confirmed to produce the identical result (122 passed):
 
 <!-- k8-test:id=apparatus-check-via-harness mode=exec cwd=Study01 -->
 ```powershell
@@ -246,8 +246,11 @@ For Range A/B, establish these values once in the PowerShell process that runs t
 $Range = 'A' # use 'B' for the separate Range B run
 $RunId = 'k8-range-a-YYYYMMDD-001'
 $RunEvidence = Join-Path $env:K8_ATTEMPT_DIR "evidence\main-runs\range-$($Range.ToLowerInvariant())\$RunId"
-$Compose = Join-Path $env:K8_ATTEMPT_DIR "work\$RunId\power-grid-reference.range-$($Range.ToLowerInvariant()).docker-compose.yml"
+$Worktree = Join-Path $env:K8_ATTEMPT_DIR 'amenonuboco-gen'
+$Compose = Join-Path $Worktree "manifests\power-grid-reference.range-$($Range.ToLowerInvariant()).docker-compose.yml"
 ```
+
+`$Compose` MUST resolve to a path exactly one level below `$Worktree` (here, `manifests\`) — never to a path outside `$Worktree` entirely. §2.1 explains why this is load-bearing: the generator emits build contexts as `../protocol-images/<protocol>`, resolved relative to the generated Compose file's own directory, so that directory must be a direct child of the worktree root or the build context does not exist. A K8-3 formal attempt observed this exact class of failure when a path formula placed `$Compose` outside the worktree entirely; the execution preflight's own "run workspace placement" check (§2.3) is what would catch a wrong placement before any container starts.
 
 ### 5.1 Range A — the observation-valid control
 
