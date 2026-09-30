@@ -96,6 +96,43 @@ def load_json(path: Path, what: str):
         raise PackagingError(f"{what} at {path} is not valid JSON: {exc}") from exc
 
 
+def verify_producer_binding(run_evidence: Path, run_records: Path) -> list[str]:
+    """Verify the authoritative typed records and their evidence mirrors."""
+    problems = []
+    if run_evidence.parent != run_records.parent:
+        return ["run-evidence and run-records do not share one producer root"]
+    producer = run_records.parent
+    manifest = producer / "producer-records.sha256"
+    names = ("range-c-environment.json", "deviation-candidates.json")
+    expected = {f"run-records/{n}" for n in names} | {f"run-evidence/{n}" for n in names}
+    if not manifest.is_file():
+        return [f"producer integrity manifest missing: {manifest}"]
+    covered = {}
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        digest, sep, rel = line.partition("  ")
+        if not sep or rel in covered:
+            problems.append(f"malformed/duplicate producer manifest entry: {line!r}")
+        else:
+            covered[rel] = digest
+    if set(covered) != expected:
+        problems.append(f"producer manifest closed-world mismatch: expected {sorted(expected)}, got {sorted(covered)}")
+    for rel, digest in covered.items():
+        path = producer / Path(rel)
+        if not path.is_file(): problems.append(f"producer manifest path missing: {rel}")
+        elif sha256_file(path) != digest: problems.append(f"producer record digest mismatch: {rel}")
+    for name in names:
+        authoritative, mirror = run_records/name, run_evidence/name
+        if authoritative.is_file() and mirror.is_file() and authoritative.read_bytes() != mirror.read_bytes():
+            problems.append(f"producer authoritative/mirror byte mismatch: {name}")
+    return problems
+
+
+def require_producer_binding(run_evidence: Path, run_records: Path) -> None:
+    problems = verify_producer_binding(run_evidence, run_records)
+    if problems:
+        raise PackagingError("producer record integrity binding failed: " + "; ".join(problems))
+
+
 def assert_not_canonical_evidence_path(destination: Path) -> None:
     """Refuse the formal-evidence path outright.
 
@@ -251,6 +288,7 @@ def build(run_evidence: Path, run_records: Path, destination: Path,
             f"overwritten or cleaned up automatically; retained records are not deleted "
             f"to make a retry succeed.")
 
+    require_producer_binding(run_evidence, run_records)
     observation = load_json(run_evidence / "validate.observation.json", "the C-4 observation")
     environment = load_json(run_records / "range-c-environment.json", "the environment record")
     candidates = load_json(run_records / "deviation-candidates.json", "the candidate record")
@@ -327,7 +365,7 @@ def build(run_evidence: Path, run_records: Path, destination: Path,
 
 def verify(destination: Path, run_evidence: Path, run_records: Path) -> list:
     """Checks the placed package. Returns problems; empty means it holds."""
-    problems = []
+    problems = verify_producer_binding(run_evidence, run_records)
     for entry in REQUIRED_ENTRIES:
         if not (destination / entry).exists():
             problems.append(f"required entry missing: {entry}")

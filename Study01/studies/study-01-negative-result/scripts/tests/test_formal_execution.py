@@ -1,5 +1,8 @@
 import importlib.util
+import copy
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -7,6 +10,7 @@ from pathlib import Path
 
 
 SCRIPTS = Path(__file__).parents[1]
+if str(SCRIPTS) not in sys.path: sys.path.insert(0,str(SCRIPTS))
 
 
 def load(name, path):
@@ -18,9 +22,71 @@ def load(name, path):
 
 formal = load("study01_formal_actions", SCRIPTS / "study01_formal_actions.py")
 packager = load("k8_rangec_formal_package", Path(__file__).parents[5] / "shakedown" / "tools" / "k8_rangec_formal_package.py")
+producer = load("study01_range_c", SCRIPTS / "study01_range_c.py")
+REPO = Path(__file__).parents[5]
 
 
 class FormalExecutionTests(unittest.TestCase):
+    def range_c_records(self, root):
+        producer_root=root/"range-c-producer"/"v"; records=producer_root/"run-records"; evidence=producer_root/"run-evidence"
+        records.mkdir(parents=True); evidence.mkdir()
+        environment={"schema":"k8shakedown-range-c-environment/1","worktree":{"source":{"head":"a"*40},"disposable":{"head":"b"*40,"clean":True}},
+                     "validator_source":{"pinned_commit":"b"*40},"versions":[{"name":n,"status":"succeeded","value":n+"-v"} for n in ("git","python","pydantic","pyyaml")]}
+        observation={"observations":[{"argv":["python","platform/cli.py"],"exit_code":1,"stdout":{"bytes":0},"stderr":{"bytes":4}}]}
+        candidates=producer.deviation_candidates(observation,environment,"2026-01-01T00:00:00+00:00")
+        candidate_record={"schema":"k8shakedown-deviation-candidates/1","range":"c","generated_utc":"2026-01-01T00:00:00+00:00","candidates":candidates}
+        producer.dump(records/"range-c-environment.json",environment); producer.dump(records/"deviation-candidates.json",candidate_record)
+        producer.bind_producer_records(producer_root,records,evidence)
+        return producer_root,records,evidence,environment,observation,candidate_record
+
+    def test_range_c_candidate_transcription_and_human_boundary(self):
+        with tempfile.TemporaryDirectory() as d:
+            _,_,_,_,_,record=self.range_c_records(Path(d))
+            multi=[c for c in record["candidates"] if c["class"]=="multi-valued-acceptance"]
+            self.assertEqual(len(multi),1); self.assertRegex(multi[0]["candidate_id"],r"^dc-\d{3}$")
+            forbidden={"judgment","disposition","verdict","accepted","is_deviation","none","no_impact"}
+            self.assertFalse(forbidden & set(multi[0]))
+            with self.assertRaises(packager.PackagingError): packager.assert_candidate_citation_coverage(record,"human text without id")
+            packager.assert_candidate_citation_coverage(record,f"reviewed {multi[0]['candidate_id']}")
+            self.assertNotIn("expected/",(SCRIPTS/"study01_range_c.py").read_text(encoding="utf-8"))
+
+    def test_range_c_producer_integrity_binding_and_mutation_rejection(self):
+        for target in ("range-c-environment.json","deviation-candidates.json"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as d:
+                _,records,evidence,_,_,_=self.range_c_records(Path(d))
+                self.assertEqual(packager.verify_producer_binding(evidence,records),[])
+                (records/target).write_text("{}\n",encoding="utf-8")
+                self.assertTrue(packager.verify_producer_binding(evidence,records))
+                with self.assertRaises(packager.PackagingError): packager.require_producer_binding(evidence,records)
+                self.assertTrue(any("producer record" in p for p in packager.verify(Path(d)/"package",evidence,records)))
+
+    def test_packager_uses_retained_environment_facts(self):
+        with tempfile.TemporaryDirectory() as d:
+            _,records,evidence,environment,observation,_=self.range_c_records(Path(d))
+            retained=packager.load_json(records/"range-c-environment.json","environment")
+            rendered=packager.render_versions_json(retained,observation)
+            self.assertEqual(rendered["versions"]["python"],"python-v")
+            self.assertEqual(packager.verify_producer_binding(evidence,records),[])
+
+    def test_teardown_ordering_range_specific_regression(self):
+        inventory_path=REPO/"Study01"/"docs"/"k8-formal-actions.json"; inventory=json.loads(inventory_path.read_text(encoding="utf-8"))
+        checker=REPO/"Study01"/"tools"/"Test-ExecutionCompleteness.ps1"
+        def check(value):
+            with tempfile.TemporaryDirectory() as d:
+                p=Path(d)/"inventory.json"; p.write_text(json.dumps(value),encoding="utf-8")
+                return subprocess.run(["pwsh","-NoProfile","-File",str(checker),"-InventoryPath",str(p)],capture_output=True,text=True)
+        valid=check(inventory); self.assertEqual(valid.returncode,0,valid.stdout+valid.stderr)
+        premature=copy.deepcopy(inventory)
+        teardown=next(a for a in premature["actions"] if a["action_id"]=="A15-teardown")
+        teardown["depends_on"]=["A09-capture-stop-export"]; teardown["input_origin"]=["range-ab:pcaps"]
+        failed=check(premature); self.assertNotEqual(failed.returncode,0)
+        self.assertIn("A/A15-teardown",failed.stdout+failed.stderr); self.assertIn("B/A15-teardown",failed.stdout+failed.stderr)
+        # The valid A graph must not inherit either Range-B-only prerequisite.
+        sender=next(a for a in inventory["actions"] if a["action_id"]=="A08-sender-t0")
+        runtime=next(a for a in inventory["actions"] if a["action_id"]=="A12-runtime-observation")
+        self.assertNotIn("B02-robs05-capture-start",sender["depends_on"])
+        self.assertNotIn("B03-robs05-observation",runtime["depends_on"])
+
     def test_log_structurer_canary_error_is_fail_closed(self):
         self.assertFalse(formal.log_structurer_ready(True, True, 3, "target selector matched"))
         self.assertTrue(formal.log_structurer_ready(True, True, 3, None))

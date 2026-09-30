@@ -1,9 +1,9 @@
 [CmdletBinding()]
-param()
+param([string] $InventoryPath = '')
 $ErrorActionPreference = 'Stop'
 $Study01 = Split-Path $PSScriptRoot -Parent
 $Repo = Split-Path $Study01 -Parent
-$InventoryPath = Join-Path $Study01 'docs\k8-formal-actions.json'
+if (-not $InventoryPath) { $InventoryPath = Join-Path $Study01 'docs\k8-formal-actions.json' }
 $Inventory = Get-Content -LiteralPath $InventoryPath -Raw | ConvertFrom-Json -Depth 20
 $ReadmeText = Get-Content -LiteralPath (Join-Path $Study01 'README.md') -Raw
 if ($Inventory.schema -ne 'k8-formal-action-inventory/1') { throw "unexpected inventory schema: $($Inventory.schema)" }
@@ -114,6 +114,24 @@ foreach ($range in @('A','B','C')) {
     }
     foreach ($a in $rangeActions) {
         if (-not $rangeReachable.Contains([string]$a.action_id)) { $Gaps.Add("$range/$($a.action_id): unreachable in range-specific graph") }
+    }
+    if ($range -in @('A','B')) {
+        $ancestors = [System.Collections.Generic.HashSet[string]]::new()
+        $pending = [System.Collections.Generic.Queue[string]]::new()
+        $pending.Enqueue('A15-teardown')
+        while ($pending.Count) {
+            $id = $pending.Dequeue(); $node = $ById[$id]
+            $deps = @(if ($node.PSObject.Properties['depends_on']) { @($node.depends_on) } else { @() })
+            if ($node.PSObject.Properties['conditional_dependencies'] -and $node.conditional_dependencies.PSObject.Properties[$range]) {
+                $deps += @($node.conditional_dependencies.$range)
+            }
+            foreach ($dep in $deps) { if ($ancestors.Add([string]$dep)) { $pending.Enqueue([string]$dep) } }
+        }
+        $requiredBeforeTeardown = @('A10-target-decode','A11-collector-rule','A12-runtime-observation')
+        if ($range -eq 'B') { $requiredBeforeTeardown += @('B03-robs05-observation') }
+        foreach ($required in $requiredBeforeTeardown) {
+            if (-not $ancestors.Contains($required)) { $Gaps.Add("$range/A15-teardown: may precede required runtime action $required") }
+        }
     }
 }
 $Executable = @($Actions | Where-Object classification -eq 'EXECUTABLE').Count
