@@ -30,18 +30,21 @@ def candidate(candidate_id, kind, source, fact, reason, artifacts, observed_utc)
             "related_artifacts":[{"kind":"run-local","path":p} for p in artifacts]}
 
 
-def deviation_candidates(observation, environment, observed_utc):
+def deviation_candidates(observation, environment, accepted_exits, observed_utc):
+    accepted_exits=tuple(accepted_exits)
     obs=observation["observations"][0]; result=[]
     if obs["exit_code"] == 0 and obs["stderr"]["bytes"] > 0:
         result.append(candidate("dc-001","internal-inconsistency",{"record":"validate.observation.json","field":"observations[0]"},
             f"exit_code = 0 was retained alongside {obs['stderr']['bytes']} byte(s) on stderr.",
             "Two retained facts of the same observation cannot both hold: exit 0 reports no rejection while stderr is non-empty.",
             ["validate.observation.json","validate.stderr.txt"],observed_utc))
-    next_id=f"dc-{len(result)+1:03d}"
-    result.append(candidate(next_id,"multi-valued-acceptance",{"record":"validate.observation.json","field":"observations[0].exit_code"},
-        f"The validator exited {obs['exit_code']}; this call site declares accepted exits [0, 1].",
-        "The call site declares more than one accepted exit code, so which occurred is decision-relevant; neither outcome is judged here.",
-        ["validate.observation.json","validate.stdout.txt"],observed_utc))
+    if len(accepted_exits) > 1:
+        next_id=f"dc-{len(result)+1:03d}"
+        declared=", ".join(str(value) for value in accepted_exits)
+        result.append(candidate(next_id,"multi-valued-acceptance",{"record":"validate.observation.json","field":"observations[0].exit_code"},
+            f"The validator exited {obs['exit_code']}; this call site declares accepted exits [{declared}].",
+            "The call site declares more than one accepted exit code, so which occurred is decision-relevant; neither outcome is judged here.",
+            ["validate.observation.json","validate.stdout.txt"],observed_utc))
     for entry in environment["versions"]:
         if entry["status"] != "succeeded":
             result.append(candidate(f"dc-{len(result)+1:03d}","incomplete-observation",
@@ -95,7 +98,7 @@ def observe(a):
     proc=run(argv,cwd=disposable,check=False,text=False)
     (evidence/"validate.stdout.txt").write_bytes(proc.stdout)
     (evidence/"validate.stderr.txt").write_bytes(proc.stderr)
-    if proc.returncode not in (0,1): raise RuntimeError(f"validator apparatus failure: exit {proc.returncode}")
+    if proc.returncode not in ACCEPTED_EXITS: raise RuntimeError(f"validator apparatus failure: exit {proc.returncode}")
     obs={"schema":"k8-command-observation/1","observations":[{"argv":argv,"exit_code":proc.returncode,
          "timestamp_utc":started,"stdout":{"path":"validate.stdout.txt","bytes":len(proc.stdout),"sha256":sha(evidence/"validate.stdout.txt")},
          "stderr":{"path":"validate.stderr.txt","bytes":len(proc.stderr),"sha256":sha(evidence/"validate.stderr.txt")}}]}
@@ -108,7 +111,7 @@ def observe(a):
          "validator_source":{"pinned_commit":PIN},"worktree":{"source":{"head":head,"clean":True},"disposable":{"head":PIN,"clean":clean}},
          "versions":versions,"observed_utc":started}
     dump(records/"range-c-environment.json",env)
-    candidates=deviation_candidates(obs,env,started)
+    candidates=deviation_candidates(obs,env,ACCEPTED_EXITS,started)
     dump(records/"deviation-candidates.json",{"schema":"k8shakedown-deviation-candidates/1","attempt_id":attempt_id,
          "validation_id":a.validation_id,"range":"c","generated_utc":started,
          "note":"Machine-surfaced candidates only; whether a candidate is a deviation and any declaration of None are human judgments in deviations.md.",

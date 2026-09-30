@@ -33,7 +33,7 @@ class FormalExecutionTests(unittest.TestCase):
         environment={"schema":"k8shakedown-range-c-environment/1","worktree":{"source":{"head":"a"*40},"disposable":{"head":"b"*40,"clean":True}},
                      "validator_source":{"pinned_commit":"b"*40},"versions":[{"name":n,"status":"succeeded","value":n+"-v"} for n in ("git","python","pydantic","pyyaml")]}
         observation={"observations":[{"argv":["python","platform/cli.py"],"exit_code":1,"stdout":{"bytes":0},"stderr":{"bytes":4}}]}
-        candidates=producer.deviation_candidates(observation,environment,"2026-01-01T00:00:00+00:00")
+        candidates=producer.deviation_candidates(observation,environment,producer.ACCEPTED_EXITS,"2026-01-01T00:00:00+00:00")
         candidate_record={"schema":"k8shakedown-deviation-candidates/1","range":"c","generated_utc":"2026-01-01T00:00:00+00:00","candidates":candidates}
         producer.dump(records/"range-c-environment.json",environment); producer.dump(records/"deviation-candidates.json",candidate_record)
         producer.bind_producer_records(producer_root,records,evidence)
@@ -49,6 +49,20 @@ class FormalExecutionTests(unittest.TestCase):
             with self.assertRaises(packager.PackagingError): packager.assert_candidate_citation_coverage(record,"human text without id")
             packager.assert_candidate_citation_coverage(record,f"reviewed {multi[0]['candidate_id']}")
             self.assertNotIn("expected/",(SCRIPTS/"study01_range_c.py").read_text(encoding="utf-8"))
+            # The same supplied domain controls cardinality and rendered fact.
+            _,_,_,environment,observation,_=self.range_c_records(Path(d)/"second")
+            single=producer.deviation_candidates(observation,environment,(1,),"2026-01-01T00:00:00+00:00")
+            self.assertFalse(any(c["class"]=="multi-valued-acceptance" for c in single))
+            supplied=producer.deviation_candidates(observation,environment,(1,7),"2026-01-01T00:00:00+00:00")
+            rendered=next(c for c in supplied if c["class"]=="multi-valued-acceptance")
+            self.assertIn("accepted exits [1, 7]",rendered["observed_fact"])
+            # Existing ordering remains: inconsistency, multi-valued, incomplete.
+            inconsistent=copy.deepcopy(observation); inconsistent["observations"][0]["exit_code"]=0
+            incomplete=copy.deepcopy(environment); incomplete["versions"][0]["status"]="unavailable"
+            ordered=producer.deviation_candidates(inconsistent,incomplete,(0,1),"2026-01-01T00:00:00+00:00")
+            self.assertEqual([c["class"] for c in ordered[:3]],
+                             ["internal-inconsistency","multi-valued-acceptance","incomplete-observation"])
+            self.assertEqual([c["candidate_id"] for c in ordered[:3]],["dc-001","dc-002","dc-003"])
 
     def test_range_c_producer_integrity_binding_and_mutation_rejection(self):
         for target in ("range-c-environment.json","deviation-candidates.json"):
