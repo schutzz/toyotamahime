@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 
 from .evidence_io import write_text
@@ -250,3 +251,123 @@ def validate(record, t0=None, context=None):
         if context.get("normalized_interface") != record["interface"]:
             raise CaptureLifecycleError("capture device is not the one the interface resolution selected")
     return record
+
+
+# ----------------------------------------------------------------------
+# Formal K8-3 correction basis -- structural pre-trigger guard.
+#
+# Attempt `k8-repro-20261001-001` ran every pre-trigger step correctly and in
+# the frozen order, but the real wall-clock time that elapsed between the
+# sensor stage's listening confirmation and T0 was too short: the retained
+# `listening-check` completion landed *after* `T0 - 5 s`, which `validate()`
+# above (correctly) rejects once T0 is known. That is not a scientific
+# defect -- the event, selector, scoring, and window are untouched -- it is
+# an executable-procedure gap: nothing in the execution path *enforced*
+# `listening confirmation <= T0 - 5 s` before T0 was taken, so satisfying it
+# depended on an operator's or an agent's incidental pacing between steps.
+#
+# The functions below close that gap the same way every other primary fact
+# in this module is proven: from retained evidence and the wall clock, never
+# from a fixed sleep. `study01_sender.py` calls `ensure_pre_trigger_guard`
+# immediately before it records T0 (see that script), so `listening
+# confirmation <= T0 - 5 s` becomes structural rather than incidental, for
+# every required stage, for both Range A and Range B.
+# ----------------------------------------------------------------------
+
+
+def required_stages_for_run(run_evidence):
+    """Which capture stages this run must already have a lifecycle record for,
+    determined mechanically from the run's own retained evidence -- never
+    guessed, and never a second place that encodes "this run is Range B".
+
+    `apparatus.CAPTURE_STAGES` (ground-truth, sensor) are mandatory for every
+    run: `study01_collect.validate` already requires both of them for every
+    Range A and Range B run. An `apparatus.AUXILIARY_CAPTURE_STAGES` stage
+    (currently only `robs05-liveness`) is additionally required only when its
+    own lifecycle record already exists under this run's evidence tree:
+    `c2-dnp3-range-derivation.md` §3 requires Range B to `resolve` and `start`
+    that stage before the trigger, exactly like the two mandatory stages, so
+    its presence at sender-invocation time is itself this run's own evidence
+    of which range it is.
+    """
+    required = list(apparatus.CAPTURE_STAGES)
+    for stage, spec in apparatus.AUXILIARY_CAPTURE_STAGES.items():
+        if (run_evidence / spec["lifecycle"]).is_file():
+            required.append(stage)
+    return required
+
+
+def _parse_rfc3339(value):
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError) as exc:
+        raise CaptureLifecycleError("listening-check timestamp is not RFC3339") from exc
+
+
+def latest_listening_confirmed_at(run_evidence, stages):
+    """The latest (slowest) `listening-check` completion instant across every
+    required stage, read from each stage's own retained lifecycle record.
+
+    Fails closed -- never proceeds on a guess -- when a required stage has no
+    lifecycle record, no retained `listening-check` step, a non-zero or
+    non-integer exit code on that step, output that does not confirm the
+    helper was listening on its recorded interface, or a `completed_at` that
+    is missing or not parseable as RFC3339. The caller must not record T0
+    unless every required stage's listening confirmation is proven.
+    """
+    latest = None
+    for stage in stages:
+        spec = apparatus.ALL_CAPTURE_STAGES[stage]
+        path = run_evidence / spec["lifecycle"]
+        if not path.is_file():
+            raise CaptureLifecycleError(
+                f"no capture-lifecycle record for required stage '{stage}'; do not trigger")
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CaptureLifecycleError(
+                f"capture-lifecycle record for stage '{stage}' is unreadable: {exc}") from exc
+        steps = record.get("steps") if isinstance(record, dict) else None
+        if not isinstance(steps, list):
+            raise CaptureLifecycleError(f"capture-lifecycle record for stage '{stage}' has no steps")
+        listening = next((s for s in steps if isinstance(s, dict) and s.get("step") == "listening-check"), None)
+        if listening is None:
+            raise CaptureLifecycleError(f"stage '{stage}' has no retained listening-check; do not trigger")
+        if type(listening.get("exit_code")) is not int or listening["exit_code"] != 0:
+            raise CaptureLifecycleError(f"stage '{stage}' listening-check did not succeed; do not trigger")
+        output = listening.get("output")
+        if not isinstance(output, str):
+            raise CaptureLifecycleError(f"stage '{stage}' listening-check output was not retained")
+        interface = record.get("interface")
+        if not isinstance(interface, str) or not interface or f"listening on {interface}" not in output:
+            raise CaptureLifecycleError(
+                f"stage '{stage}' retained output does not confirm the helper was listening")
+        completed_at = _parse_rfc3339(listening.get("completed_at", ""))
+        if latest is None or completed_at > latest:
+            latest = completed_at
+    return latest
+
+
+def ensure_pre_trigger_guard(run_evidence, stages, *, guard=WINDOW_LEAD, now=None, sleep=None):
+    """Block, if necessary, until every required stage's listening
+    confirmation is at least `guard` (frozen at 5 s, `WINDOW_LEAD`) old.
+
+    This makes `listening confirmation <= T0 - 5 s` (capture procedure §5.1)
+    structural: the caller records T0 only after this returns, so T0 - guard
+    cannot land before the proven listening instant. The wait, if any, is
+    computed once from the retained evidence and the wall clock -- never a
+    fixed sleep -- and is skipped entirely when enough real time has already
+    elapsed (e.g. from directory preparation, `docker cp`, and hash
+    verification having taken longer than `guard` on their own).
+
+    `now` and `sleep` are injectable only for tests; production callers use
+    the real wall clock.
+    """
+    now = now or (lambda: datetime.now(timezone.utc))
+    sleep = sleep or time.sleep
+    target = latest_listening_confirmed_at(run_evidence, stages) + guard
+    while True:
+        remaining = (target - now()).total_seconds()
+        if remaining <= 0:
+            return
+        sleep(remaining)

@@ -9,6 +9,15 @@ It records only what is established at send time -- the exit code and the single
 invocation.  It does not accept or record whether the event was seen on the
 wire: that correlation does not exist until after the send and the settle
 window, and the Ground Truth stage derives it from the retained pcap.
+
+Formal K8-3 correction basis (post-`k8-repro-20261001-001`): immediately
+before T0 is recorded, this script blocks, if necessary, until every required
+capture stage's retained `listening-check` is proven at least
+`capture_lifecycle.WINDOW_LEAD` (5 s) old -- see
+`capture_lifecycle.ensure_pre_trigger_guard`. This makes "listening
+confirmation <= T0 - 5 s" (capture procedure §5.1) a structural property of
+this execution path rather than something that depends on an operator's or an
+agent's incidental pacing between the preceding steps.
 """
 import argparse
 import json
@@ -17,6 +26,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from study01 import capture_lifecycle as lifecycle
 from study01.evidence_io import write_text
 from study01.frozen import apparatus
 from study01.procedure_conformance import SCHEMA_VERSION, ProcedureConformanceError, validate
@@ -55,6 +65,13 @@ def main():
             raise ProcedureConformanceError("sender record already exists; retry requires a fresh run ID")
         if t0_record.exists():
             raise ProcedureConformanceError("T0 already recorded for this run; retry requires a fresh run ID")
+        # Structural pre-trigger guard: block, if necessary, until every
+        # required stage's listening-check is proven old enough that T0 - 5s
+        # cannot land before it. Fails closed (raises) on a missing or
+        # unproven lifecycle record for any required stage -- it never
+        # proceeds on a guess about which stages this run requires or
+        # whether they are actually listening.
+        lifecycle.ensure_pre_trigger_guard(root, lifecycle.required_stages_for_run(root))
         # T0 is the frozen event window's origin, so it is taken here, immediately
         # before the invocation, and retained as its own primary artifact rather
         # than being transcribed into metadata prose afterwards.
@@ -78,7 +95,7 @@ def main():
         sys.stdout.write(completed.stdout)
         if completed.returncode:
             p.error("sender failed; this retained Invalid run must close and retry requires a fresh run ID")
-    except (OSError, ProcedureConformanceError) as exc:
+    except (OSError, ProcedureConformanceError, lifecycle.CaptureLifecycleError) as exc:
         p.error(str(exc))
 
 

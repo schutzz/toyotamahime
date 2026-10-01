@@ -278,6 +278,48 @@
     changes only the immutable bootstrap self-reference and the files
     carrying this transcription fix.
 
+    v19-v23 were packaging-only pin bumps and release-prep commits (clean
+    package certification and release-binding fixes); none touched frozen
+    apparatus or scientific semantics, so none added its own changelog note
+    here -- see the K8-S2 authorization applicability reviews for those
+    HEADs, following the same convention as the v6/v7 note above.
+
+    v24 closes an executable-procedure gap found by formal K8-3 attempt
+    k8-repro-20261001-001. Range A completed provisioning, capture resolve
+    and start, sender placement and hash verification, and the sender
+    invocation itself, then failed at evidence finalize: the sensor stage's
+    retained listening-check completion landed after the frozen window's
+    `T0 - 5 s` start, so capture_lifecycle.validate() (correctly) rejected
+    it. Investigation found this was not a scientific defect -- the event,
+    selector, window, and scoring were untouched -- but a gap in the
+    *executable* procedure: nothing between capture `start` and the sender
+    invocation enforced "listening confirmation <= T0 - 5 s"; satisfying it
+    depended on an operator's or an agent's incidental pacing across the
+    intervening steps. The fix adds
+    `study01.capture_lifecycle.required_stages_for_run`,
+    `latest_listening_confirmed_at`, and `ensure_pre_trigger_guard`, and
+    wires the last of these into `study01_sender.py` immediately before it
+    records `T0`: the sender execution path now blocks, if necessary, until
+    every required stage's retained listening confirmation is proven at
+    least 5 s old, computed once from retained evidence and the wall clock
+    (never a fixed sleep), and fails closed -- refusing to record `T0` --
+    rather than guess, if any required stage's lifecycle record is missing,
+    incomplete, or malformed. Required stages are determined mechanically
+    from the run's own evidence tree, matching the already-published
+    `docs/k8-formal-actions.json` dependency graph for `A08-sender-t0`
+    (`ground-truth`, `sensor`, and -- only when that run has already started
+    it -- the Range-B-only `robs05-liveness` stage): `ground-truth` and
+    `sensor` are unconditionally required, and `robs05-liveness` becomes
+    required exactly when its own lifecycle record already exists, which
+    Range B's protocol already requires before the trigger. No frozen event,
+    selector, window, filter, evidence schema path, scoring rule, Range A/B/C
+    semantic, or expected result changed; `k8-repro-20261001-001` remains
+    FAILED / CLOSED, unrepaired, per the no-repair-in-place rule. This v24
+    release-prep commit changes only the immutable bootstrap self-reference,
+    `study01/capture_lifecycle.py`, `study01_sender.py`, their focused
+    regression tests, and the two protocol documents' minimal cross-reference
+    to this corrected precondition.
+
     It does not run the reproduction itself. After a successful clone and
     environment capture, it prints where to go next (Study01/README.md)
     and leaves the transcript running so the manual reproduction that
@@ -300,7 +342,7 @@
 
 .PARAMETER Ref
     Branch/tag/commit to check out after cloning. Defaults to this
-    script's own release tag, `k8-bootstrap-v23` -- the same tag pinned
+    script's own release tag, `k8-bootstrap-v24` -- the same tag pinned
     in Study01/README.md Sec3.2 for fetching this file, and the exact
     commit that was package-certified before that tag was created. Pass
     an explicit value only if you have a specific, disclosed reason to
@@ -325,7 +367,7 @@ param(
 
     [string] $RepoUrl = 'https://github.com/schutzz/toyotamahime',
 
-    [string] $Ref = 'k8-bootstrap-v23',
+    [string] $Ref = 'k8-bootstrap-v24',
 
     # Additional attempt-ID inventory root(s) to check before allocating,
     # besides $AttemptRoot -- see this file's own "Post-v14 change" note

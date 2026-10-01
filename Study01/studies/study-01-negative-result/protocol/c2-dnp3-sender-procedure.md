@@ -98,6 +98,8 @@ if ($LASTEXITCODE -ne 0) { throw "sender failed; retained Invalid run requires a
 
 Record the container ID, directory-preparation command/exit code, placement command/exit code, verified in-container canonical asset SHA-256, invocation command, `T0`, and exit code in `<run-evidence>/metadata.md`. The fixed order is directory preparation → `docker cp` → in-container hash verification → `T0` → exactly-one invocation through `study01_sender.py`. That executable path writes both `ground-truth/sender-record.txt` and the structured `ground-truth/procedure-conformance.json`, and the structured record carries only send-time facts (see §3.1b). It refuses a pre-existing record or sender record, so no same-run sender reinvocation is executable through the canonical path; a failed invocation closes a retained Invalid run and requires a fresh run ID. `docker cp` is the only placement mechanism; no untracked host bind mount or ad hoc `/tmp` copy is permitted for Pilot or Main runs.
 
+**Formal K8-3 correction basis (post-`k8-repro-20261001-001`).** The capture procedure's `listening confirmation <= T0 - 5 s` precondition (see [capture procedure §5.1](./c2-dnp3-capture-procedure.md)) is guaranteed automatically by this sender execution path: before `T0` is taken, `study01_sender.py` waits, if necessary, on the retained capture-lifecycle evidence for every required stage. No separate operator or automation wait is required or permitted to satisfy it.
+
 ## 4. Sender predicate and failure handling
 
 The sender stage passes only when all of the following are retained:

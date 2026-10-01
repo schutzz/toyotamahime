@@ -47,6 +47,41 @@ def lifecycle_record(run_id, stage, interface=None, pcap_sha=None, t0=T0_FIXTURE
                                   else "true" if s=="window-end-liveness-check" else "ok")})
   return rec
 
+def ready_capture_fixtures(root, stages=("ground-truth", "sensor"), seconds_ago=30):
+  """Write a minimal, already-listening capture-lifecycle.json for each stage.
+
+  Mirrors the two-step shape `study01_capture.py start()` actually produces
+  (``start`` + ``listening-check``) with the listening confirmation
+  `seconds_ago` in the real past -- comfortably past the 5 s pre-trigger
+  guard `study01_sender.py` now enforces -- so tests exercising the sender's
+  invocation boundary do not need to sleep or fake the clock.
+  """
+  from datetime import datetime, timedelta, timezone
+  from study01.evidence_io import write_text
+  from study01.frozen import apparatus as ap
+  done = (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+  for stage in stages:
+    spec = ap.ALL_CAPTURE_STAGES[stage]
+    interface = spec["interface"] or "eth3"
+    record = {
+      "schema_version": 1, "run_id": root.name, "execution_run_root": str(root),
+      "stage": stage, "helper_name": f"{root.name}-{stage}-capture",
+      "helper_image": ap.CAPTURE_IMAGE, "helper_container_id": "abc123",
+      "namespace_service": spec["service"], "namespace_container_id": "def456",
+      "interface": interface, "filter": spec["filter"], "container_pcap": spec["container_pcap"],
+      "artifact": spec["artifact"], "pcap_sha256": None,
+      "steps": [
+        {"step": "start", "argv": ["docker"], "timestamp": done, "completed_at": done,
+         "exit_code": 0, "output": "abc123"},
+        {"step": "listening-check", "argv": ["docker"], "timestamp": done, "completed_at": done,
+         "exit_code": 0, "output": f"tcpdump: listening on {interface}"},
+      ],
+    }
+    path = root / spec["lifecycle"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text(path, json.dumps(record, indent=2))
+
+
 def context_record(run_id, stage, interface="eth3", container="def456"):
   from study01 import capture_context as cc
   from study01.frozen import apparatus as ap
@@ -106,6 +141,7 @@ class Phase1Tests(unittest.TestCase):
  def test_2e_sender_execution_path_rejects_same_run_second_invocation(self):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d)/"fresh-run"; (root/"ground-truth").mkdir(parents=True)
+   ready_capture_fixtures(root)
    command=[sys.executable, str(ROOT/"study01_sender.py"), "--run-id", "fresh-run", "--run-evidence", str(root), "--", sys.executable, "-c", "import sys; sys.exit(2)"]
    first=subprocess.run(command, capture_output=True, text=True)
    self.assertNotEqual(first.returncode, 0)
@@ -117,6 +153,7 @@ class Phase1Tests(unittest.TestCase):
  def test_2f_sender_execution_path_normal_allows_scoring(self):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d)/"fresh-run"; (root/"ground-truth").mkdir(parents=True)
+   ready_capture_fixtures(root)
    command=[sys.executable, str(ROOT/"study01_sender.py"), "--run-id", "fresh-run", "--run-evidence", str(root), "--", sys.executable, "-c", "print('sent')"]
    self.assertEqual(subprocess.run(command, capture_output=True, text=True).returncode, 0)
    procedure=json.loads((root/"ground-truth"/"procedure-conformance.json").read_text())
@@ -133,6 +170,7 @@ class Phase1Tests(unittest.TestCase):
   """The wrapper takes no observation argument and records none."""
   with tempfile.TemporaryDirectory() as d:
    root=Path(d)/"fresh-run"; (root/"ground-truth").mkdir(parents=True)
+   ready_capture_fixtures(root)
    ok=subprocess.run([sys.executable, str(ROOT/"study01_sender.py"), "--run-id", "fresh-run",
                       "--run-evidence", str(root), "--", sys.executable, "-c", "print('sent')"],
                      capture_output=True, text=True)
@@ -145,6 +183,7 @@ class Phase1Tests(unittest.TestCase):
   """exit 2 still closes the run and still blocks a same-run second invocation."""
   with tempfile.TemporaryDirectory() as d:
    root=Path(d)/"fresh-run"; (root/"ground-truth").mkdir(parents=True)
+   ready_capture_fixtures(root)
    cmd=[sys.executable, str(ROOT/"study01_sender.py"), "--run-id", "fresh-run",
         "--run-evidence", str(root), "--", sys.executable, "-c", "import sys; sys.exit(2)"]
    first=subprocess.run(cmd, capture_output=True, text=True)
@@ -775,6 +814,7 @@ class RetentionTests(unittest.TestCase):
   from study01.frozen import apparatus as ap
   with tempfile.TemporaryDirectory() as d:
    root=Path(d)/"fresh-run"; (root/"ground-truth").mkdir(parents=True)
+   ready_capture_fixtures(root)
    cmd=[sys.executable,str(ROOT/"study01_sender.py"),"--run-id","fresh-run","--run-evidence",str(root),
         "--",sys.executable,"-c","print('sent')"]
    self.assertEqual(subprocess.run(cmd,capture_output=True,text=True).returncode,0)
