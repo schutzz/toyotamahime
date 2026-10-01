@@ -8,7 +8,7 @@ Study 01 uses **[Amenonuboco](https://github.com/schutzz/ot-range-amenonuboco)**
 
 | Directory | Study | State |
 | --- | --- | --- |
-| [`Study01/`](./Study01/) | **Negative-result validity in an OT/ICS cyber range.** One frozen DNP3 event, an observation-valid range and a fault-injected one, and a static contract-violation manifest. | claims frozen; reproduction kit published |
+| [`Study01/`](./Study01/) | **Negative-result validity in an OT/ICS cyber range.** One frozen DNP3 event, an observation-valid range and a fault-injected one, and a static contract-violation manifest. | claims frozen; formal publication candidate (RC1) |
 | [`Study02/`](./Study02/) | planned — will extend the question to a second protocol and to the gaps Study 01 could not close | placeholder only; not part of Study 01 or its reproduction |
 
 ## Where to start
@@ -18,6 +18,14 @@ Study 01 uses **[Amenonuboco](https://github.com/schutzz/ot-range-amenonuboco)**
 **If you want to know what Study 01 concluded** without running it → [`Study01/claims/claim-wording.md`](./Study01/claims/claim-wording.md). It states nine claims: six things the study establishes and three it explicitly does not. The negative ones are part of the claim, not disclaimers appended to it.
 
 **If you want the judgment and artifact references behind a specific conclusion** → the four hypothesis judgments in [`Study01/claims/`](./Study01/claims/), each naming the artifacts it read. The accepted runs' evidence trees are deliberately not published — they are the outputs you are asked to reproduce — so the judgments cite artifacts you regenerate rather than ones you can open here.
+
+## Study 01 publication identity
+
+Study 01 is being prepared as a versioned public research artifact. The reproduction entrypoint is [`Study01/README.md`](./Study01/README.md).
+
+The reproduction accepted at Gate K8 is anchored to the immutable Toyotamahime tag [`k8-bootstrap-v24`](https://github.com/schutzz/toyotamahime/releases/tag/k8-bootstrap-v24), peeled commit `ca978ad59065785f2036c7eed24911d22967a3a2`. The final public release identity `study-01-v1.0` has **not** been issued at this RC stage; no final tag, release date, or DOI is claimed here.
+
+Kakuriyo remains the private canonical research source, with the full evidence, failed and non-accepted attempts, reviews, and Gate records. Toyotamahime is the selected public export containing the protocol, apparatus, expected results, frozen claims and limitations, reproduction runbook, and provenance needed to understand and reproduce the study.
 
 ## What this repository is not
 

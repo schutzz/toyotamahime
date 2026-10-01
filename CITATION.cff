@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use Study 01, please cite this research artifact."
+type: software
+title: "Study 01: Negative-result validity in an OT/ICS cyber range"
+authors:
+  - family-names: Terayama
+    given-names: Daichi
+    alias: schutzz
+repository-code: "https://github.com/schutzz/toyotamahime"
+license: Apache-2.0
+abstract: >-
+  A public research and reproduction artifact for evaluating when a negative
+  detection result from an OT/ICS cyber range is interpretable. Study 01
+  includes the frozen protocol and apparatus, expected comparison targets,
+  claims and limitations, a reproduction runbook, and provenance.
+keywords:
+  - cyber range
+  - reproducibility
+  - experimental validity
+  - negative detection result
+  - OT security
+  - ICS security
+version: 1.0.0
