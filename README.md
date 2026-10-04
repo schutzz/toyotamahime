@@ -8,7 +8,7 @@ Study 01 uses **[Amenonuboco](https://github.com/schutzz/ot-range-amenonuboco)**
 
 | Directory | Study | State |
 | --- | --- | --- |
-| [`Study01/`](./Study01/) | **Negative-result validity in an OT/ICS cyber range.** One frozen DNP3 event, an observation-valid range and a fault-injected one, and a static contract-violation manifest. | claims frozen; final publication candidate (RC2) |
+| [`Study01/`](./Study01/) | **Negative-result validity in an OT/ICS cyber range.** One frozen DNP3 event, an observation-valid range and a fault-injected one, and a static contract-violation manifest. | claims frozen; versioned Study 01 v1.0 release artifact |
 | [`Study02/`](./Study02/) | planned — will extend the question to a second protocol and to the gaps Study 01 could not close | placeholder only; not part of Study 01 or its reproduction |
 
 ## Where to start
@@ -21,11 +21,9 @@ Study 01 uses **[Amenonuboco](https://github.com/schutzz/ot-range-amenonuboco)**
 
 ## Study 01 publication identity
 
-Study 01 is being prepared as the versioned public research artifact `study-01-v1.0`, version `1.0.0`. The reproduction entrypoint remains [`Study01/README.md`](./Study01/README.md).
+Study 01 is the versioned public research artifact identified by version `1.0.0`, release tag `study-01-v1.0`, publication date `2026-10-04`, and DOI `10.5281/zenodo.23136351`. The reproduction entrypoint is [`Study01/README.md`](./Study01/README.md).
 
 The reproduction accepted at Gate K8 remains anchored to the immutable Toyotamahime tag [`k8-bootstrap-v24`](https://github.com/schutzz/toyotamahime/releases/tag/k8-bootstrap-v24), peeled commit `ca978ad59065785f2036c7eed24911d22967a3a2`.
-
-DOI `10.5281/zenodo.23136351` is reserved for the forthcoming final Study 01 v1.0 release. At this RC2 stage, the Zenodo record is not yet published and the intended final tag `study-01-v1.0` has not been created. The publication date selected for that forthcoming release is 2026-10-04.
 
 Kakuriyo remains the private canonical research source, with the full evidence, failed and non-accepted attempts, reviews, and Gate records. Toyotamahime is the selected public export containing the protocol, apparatus, expected results, frozen claims and limitations, reproduction runbook, and provenance needed to understand and reproduce the study.
 
